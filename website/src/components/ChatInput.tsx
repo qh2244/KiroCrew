@@ -62,8 +62,9 @@ import {
   formatToken,
   tokenRangeAt,
   pruneBlocks,
-  nextSeq,
+  nextSeqIn,
   findTokenRanges,
+  splitDuplicateMarkers,
 } from '../utils/pasteTokens'
 import type { SendMode } from '../pages/chat/ChatSettings'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -325,6 +326,11 @@ function measuredContentHeight(el: HTMLTextAreaElement): number {
   // path at the same width, and an off-screen node carrying a real placeholder
   // attribute would answer accessibility and test queries meant for the live one.
   twin.value = el.value || el.placeholder || ''
+  // A placeholder the stylesheet holds to one line must be MEASURED on one line;
+  // the copied `whiteSpace` above is the element's, which still wraps.
+  if (!el.value && el.placeholder && getComputedStyle(el, '::placeholder').whiteSpace === 'nowrap') {
+    twin.style.whiteSpace = 'nowrap'
+  }
   return twin.scrollHeight
 }
 
@@ -473,6 +479,8 @@ interface ChatInputProps {
   onUploadFiles?: (files: File[]) => void
   /** Whether file actions are in progress */
   uploading?: boolean
+  /** Abort the upload in flight; turns the upload spinner into a cancel control */
+  onCancelUpload?: () => void
   /** Pending file paths (images + non-images) for preview strip */
   pendingFiles?: string[]
   /** Pending folder references for the preview strip: RELATIVE paths with trailing slash, derived from `@rel/` composer tokens (a path reference handed to the agent, not an upload) */
@@ -529,8 +537,33 @@ interface ChatInputProps {
    * backend's served default), not a pin. The chip then carries the same
    * ` · default` marker and explanatory tooltip the agent chip uses for its
    * inherited case, so a served model does not read as something the user
-   * chose. A pinned chip has nothing to explain. */
+   * chose. A pinned chip has nothing to explain. Yields to
+   * `modelIsJevRouted` below, which describes the same unpinned slot more
+   * specifically. */
   modelIsInheritedDefault?: boolean
+  /**
+   * True when THIS turn's model is Jev's to pick: the slot names no model
+   * (`auto`, or the empty string a freshly dispatched slot carries) and the Jev
+   * preview is on, so `model.route` puts the turn in a tier and runs it on that
+   * tier's model.
+   *
+   * The chip then names the POLICY (`Auto (Jev)`) in place of `modelName`, rather
+   * than an id with a marker beside it. A routed session's model changes from turn
+   * to turn, so naming one makes a chip that reads like a pin and is stale by the
+   * next reply; the model a given turn actually ran on is on that turn's routing
+   * receipt, which is per-turn and cannot go stale. It is also the exact label the
+   * picker highlights for this slot (`jevRouteShownModel`), so the chip and the
+   * open menu say the same word for the same choice.
+   *
+   * Hosts compute it from the SAME `jevRouteOffered()` the picker's row is drawn
+   * from (`lib/jevRoute.ts`) against the slot's raw `model`, which is what the
+   * routing gate reads. One condition, so the chip cannot say Auto for a turn that
+   * routed, nor Auto (Jev) for one that did not.
+   *
+   * Wins over `modelIsInheritedDefault`: both describe a slot that pinned nothing,
+   * and this one names WHO picks instead, which is the more specific fact and the
+   * one that costs money. */
+  modelIsJevRouted?: boolean
   /**
    * Picker openers (agent, model, project, and `onSessionControlClick` below).
    * Each hands the host the chip's click-time rect AND the chip element itself:
@@ -644,6 +677,13 @@ interface ChatInputProps {
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
   followUpSourceKey?: string | null
+  /** Labels whose follow-up dispatch is outstanding. Only a host that actually
+   *  dispatches a chip passes this. */
+  followUpPendingOptions?: ReadonlySet<string> | null
+  /** Labels whose click the dispatch would refuse; this is what dims. */
+  followUpRefusedOptions?: ReadonlySet<string> | null
+  /** Detail of the last failed chip dispatch, or null when none failed. */
+  followUpError?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
@@ -653,8 +693,12 @@ interface ChatInputProps {
    *  behaviour, and it is what keeps a very large paste off the main thread.
    *  Cmd/Ctrl+Shift+V still forces one raw paste when this is off. */
   showFullPastes?: boolean
-  /** Opt into the first Lexical composer migration slice. Defaults off so the
-   *  established textarea path remains the production fallback until parity is complete. */
+  /** Render the Lexical composer (inline paste pills). Every product surface
+   *  passes this; the default stays off so a bare <ChatInput> — and the textarea
+   *  path that remains the lazy-load FAILURE fallback — keep their contract.
+   *  `test/chatInputHosts.lexicalComposer.test.ts` holds that line: every
+   *  product mount must name the prop, so a new host cannot fall back to the
+   *  textarea by omission. */
   lexicalComposer?: boolean
   /** Optional knowledge chip rendered above the input */
   knowledgeChip?: React.ReactNode
@@ -894,7 +938,7 @@ const noopVoiceControl = () => {}
 
 function ChatInput({
   aboveComposer,
-  value,
+  value: hostValue,
   onChange,
   onSend,
   canSteer,
@@ -907,6 +951,7 @@ function ChatInput({
   onScreenshot,
   onUploadFiles,
   uploading = false,
+  onCancelUpload,
   pendingFiles = [],
   pendingDirs = [],
   resizedInfo,
@@ -922,6 +967,7 @@ function ChatInput({
   agentLabel,
   agentIsInheritedDefault,
   modelIsInheritedDefault,
+  modelIsJevRouted,
   agentSource,
   modelName,
   onAgentClick,
@@ -968,7 +1014,10 @@ function ChatInput({
   quickSend,
   followUpLayout,
   followUpSourceKey,
-  pasteBlocks = [],
+  followUpPendingOptions,
+  followUpRefusedOptions,
+  followUpError,
+  pasteBlocks: hostPasteBlocks = [],
   onPasteBlocksChange,
   showFullPastes = false,
   lexicalComposer = false,
@@ -982,6 +1031,23 @@ function ChatInput({
   connected = true,
   onOptimizeResult,
 }: ChatInputProps) {
+  // Canonicalise the host's value + paste blocks BEFORE either composer is
+  // chosen, so the textarea path (touch devices, chunk-load fallback) is held to
+  // the same contract as the Lexical one: every marker names its own block and
+  // no two blocks share a seq. A persisted draft can violate both (the same
+  // marker twice, or two records carrying one seq), and a marker resolves by seq
+  // alone — `expandAll` would then send one block for both and the textarea's
+  // id-keyed pill removal would drop a twin. `splitDuplicateMarkers` returns the
+  // SAME references when nothing changed; a rewrite is handed back to the host
+  // through the ordinary onChange / onPasteBlocksChange, after which the props
+  // are canonical and this is a no-op.
+  const canonical = useMemo(() => splitDuplicateMarkers(hostValue, hostPasteBlocks), [hostPasteBlocks, hostValue])
+  const value = canonical.text
+  const pasteBlocks = canonical.blocks
+  useEffect(() => {
+    if (value !== hostValue) onChange(value)
+    if (pasteBlocks !== hostPasteBlocks) onPasteBlocksChange?.(pasteBlocks)
+  }, [hostPasteBlocks, hostValue, onChange, onPasteBlocksChange, pasteBlocks, value])
   // Dictation state comes from the Composer root's Voice atom (mounted by the
   // root beside this input), not from host-wired props: one hook, the same
   // values the atom computes for every surface, and a host cannot forget to
@@ -1300,6 +1366,15 @@ function ChatInput({
     composerAnchorRef.current = lexicalControlRef.current?.getRootElement() ?? null
     setLexicalControlRevision(value => value + 1)
   }, [])
+  const markLexicalLoadFailed = useCallback(() => {
+    setLexicalLoadFailed(true)
+  }, [])
+  const pendingSlot = autoFocusKey ?? slotId
+  // Whole-value actions need the Lexical control to create their undo entry.
+  // Gate those actions during the one-time lazy mount instead of queuing stale
+  // text across a slot/value change. Host-side writes in that pre-mount window
+  // remain the accepted initial-state edge described by ControlledValuePlugin.
+  const composerReady = !lexicalComposer || lexicalLoadFailed || lexicalControlRevision > 0
   // Attribute the Lexical editor's own growth to the composer (see
   // composerResize.ts). The textarea path attributes inside `applyHeight`, which
   // the contenteditable never runs — its box grows through CSS min/max-height as
@@ -1350,6 +1425,16 @@ function ChatInput({
     () => lexicalComposer && !lexicalLoadFailed ? lexicalControlRef.current : textareaControl,
     [lexicalComposer, lexicalLoadFailed, textareaControl],
   )
+  const replaceLexicalText = useCallback((text: string) => {
+    if (!lexicalComposer || lexicalLoadFailed) return false
+    const control = lexicalControlRef.current
+    if (!control?.replaceText) return false
+    control.replaceText(text)
+    return true
+  }, [lexicalComposer, lexicalLoadFailed])
+  const replaceInSlot = useCallback((text: string) => {
+    if (!replaceLexicalText(text)) onChange(text)
+  }, [onChange, replaceLexicalText])
   // Publish the live caret so ChatPage's dictation handler can splice a
   // transcript in at the cursor instead of appending. Written on every caret
   // move (typing, click, selection); the value persists through blur (clicking
@@ -1592,6 +1677,10 @@ function ChatInput({
    */
   const fireComposer = useCallback((alternate?: unknown) => {
     if (disabled) return
+    // Enter from the Lexical composer routes directly here, so keep this guard
+    // identical to the Send button and textarea keydown path: offline drafts
+    // must remain untouched regardless of which composer is active.
+    if (!connected) return
     // A batch dictation is still transcribing: block the send so the pending
     // transcript isn't left behind. Otherwise Enter/Send fires the current draft
     // BEFORE the transcript lands, orphaning the dictation into the emptied
@@ -1606,7 +1695,7 @@ function ChatInput({
     // ignore the only explicit instruction on the send.
     if (steerNow && onSteer) onSteer(steerAuto && !flip ? { auto: true } : undefined)
     else onSend()
-  }, [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, steerAuto, onSteer, onSend])
+  }, [disabled, connected, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, steerAuto, onSteer, onSend])
   const sendFollowUp = useCallback((text?: string, sourceKeyAtClick?: string | null) => {
     if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
   }, [disabled, onFollowUpSend])
@@ -1682,7 +1771,7 @@ function ChatInput({
     setPlusOpen(false)
     let nextValue = '/'
     if (sigil === '/') {
-      onChange(nextValue)
+      replaceInSlot(nextValue)
       setSlashMenuOpen(true); setFilePickerOpen(false); setSkillPickerOpen(false)
     } else {
       // Append at the end, exactly as the base textarea path always has —
@@ -1691,7 +1780,7 @@ function ChatInput({
       // behavior must not change.
       const sep = value === '' || /\s$/.test(value) ? '' : ' '
       nextValue = value + sep + sigil
-      onChange(nextValue)
+      replaceInSlot(nextValue)
       setSlashMenuOpen(false)
       if (sigil === '@') { setFilePickerOpen(true); setFileQuery(''); setSkillPickerOpen(false) }
       else { setSkillPickerOpen(true); setSkillQuery(''); setFilePickerOpen(false) }
@@ -1829,9 +1918,9 @@ function ChatInput({
   const applyPickedToken = useCallback((tokenRe: RegExp, token: string) => {
     const selection = composerControl()?.getSelection()
     const next = replaceTokenAtCaret(value, selection?.start ?? value.length, tokenRe, token)
-    onChange(next.value)
+    replaceInSlot(next.value)
     requestAnimationFrame(() => composerControl()?.setSelection(next.caret, next.caret, { focus: true }))
-  }, [value, onChange, composerControl])
+  }, [value, replaceInSlot, composerControl])
   const chatMessages = useAppSelector(s => s.chat.messages)
   /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
    *  this is the raw stored value and is not what the composer renders at. */
@@ -1902,10 +1991,11 @@ function ChatInput({
   /**
    * Typing intent is an implicit expand.
    *
-   * Every programmatic route to the composer resolves through the textarea
-   * (`queryComposer` finds `textarea[data-composer-input]`; the `/` shortcut and
-   * the autoFocusKey effect call `inputRef.current?.focus()`), and a collapsed
-   * composer has no textarea -- so without this, `/`, quote-to-compose, a widget
+   * Every programmatic route to the composer resolves through the editable
+   * element (`queryComposer` finds `[data-composer-input]` — the textarea or the
+   * Lexical root; the `/` shortcut and the autoFocusKey effect call the
+   * composer control's `focus()`), and a collapsed composer has no editable
+   * element -- so without this, `/`, quote-to-compose, a widget
    * send and post-create focus all silently do nothing, and a pre-fill lands in a
    * draft the user cannot see. Review named this correctly against the ghost
    * precedent this collapse otherwise inherits: the ghost is transient and the app
@@ -1998,6 +2088,43 @@ function ChatInput({
         <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.collapse_composer')}</div>
         <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.collapse_composer_desc')}</div>
       </div>
+    </button>
+  ) : null
+  /**
+   * The exit from an upload in flight, and the reason it REPLACES the attach
+   * control rather than sitting beside it.
+   *
+   * The bottom icon row is already at `max-two-buttons-per-row`: two blocking
+   * findings drove Sketch off it and into an overflow precisely to keep it at
+   * two (see `collapseMenuRow` above), so a third sibling here would regrow the
+   * row the same rule just shrank, on the narrowest viewport, in both layouts.
+   *
+   * Replacing costs nothing, because the attach control is already inert while
+   * `uploading`: its `htmlFor` is dropped and the pointer branch is `disabled`.
+   * So the slot holds no action to displace, and the thing the user is already
+   * looking at while they wait becomes the thing they press to stop.
+   *
+   * The spinner is kept, but BEHIND the glyph rather than as a second icon.
+   * A 9px X inside an 18px spinner read to a blind reviewer as "a 'lines'
+   * icon, the kind that usually means a menu", and they said they would press
+   * it to find out what it was, which discards minutes of a 512 MB upload with
+   * no undo. So the X carries the meaning at a legible size with a destructive
+   * hover tint, and the liveness is a faint ring that cannot be mistaken for
+   * the glyph. The tint matters on the pointer path for a second reason: this
+   * slot was inert mid-upload on main, so a click that used to do nothing now
+   * ends the transfer, and the control has to stop reading as the attach
+   * button's spot doing attach things.
+   */
+  const uploadCancelControl = uploading && onCancelUpload ? (
+    <button
+      type="button"
+      onClick={onCancelUpload}
+      className="relative w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none text-muted hover:text-danger hover:bg-danger/10"
+      aria-label={i18nT('components.chatInput.cancel_upload')}
+      title={i18nT('components.chatInput.cancel_upload')}
+    >
+      <Loader2 size={28} strokeWidth={1.5} className="animate-spin absolute inset-0 m-auto opacity-30" />
+      <X size={16} strokeWidth={2.5} />
     </button>
   ) : null
   /**
@@ -2413,10 +2540,7 @@ function ChatInput({
 
   const setTextUndoable = useCallback((text: string) => {
     if (lexicalComposer && !lexicalLoadFailed) {
-      valueFromUserRef.current = true
-      onChange(text)
-      requestAnimationFrame(() => composerControl()?.setSelection(text.length, text.length, { focus: true }))
-      return
+      return replaceInSlot(text)
     }
     const el = inputRef.current
     if (!el) { onChange(text); return }
@@ -2447,7 +2571,7 @@ function ChatInput({
     requestAnimationFrame(() => {
       if (el && document.activeElement === el) el.setSelectionRange(text.length, text.length)
     })
-  }, [onChange, lexicalComposer, lexicalLoadFailed, composerControl])
+  }, [onChange, lexicalComposer, lexicalLoadFailed, replaceInSlot])
 
   const optimizeMutation = useMutation({
     onMutate: () => { setOptimizeError('') },
@@ -2806,7 +2930,7 @@ function ChatInput({
     // the disabled-state on the Optimize button (line ~1734).
     if (promptOptimizer && e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
       e.preventDefault()
-      if (connected) optimizePrompt()
+      if (connected && composerReady) optimizePrompt()
       return
     }
     // Mode: enter-ctrl-newline — Ctrl/Cmd+Enter inserts newline, Enter sends
@@ -2908,7 +3032,7 @@ function ChatInput({
       }
       e.preventDefault()
     }
-  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer])
+  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer, composerReady])
 
   /** Intercept clipboard paste — files go to upload path, big text gets collapsed into a token. */
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -2954,7 +3078,7 @@ function ChatInput({
     // for one; the paste then falls through to the plain-insert path below.
     if (onPasteBlocksChange && !forceRaw && !showFullPastes && shouldCollapsePaste(cleaned)) {
       e.preventDefault()
-      const block: PasteBlock = { id: makePasteId(), seq: nextSeq(pasteBlocks), lines: countLines(cleaned), content: cleaned }
+      const block: PasteBlock = { id: makePasteId(), seq: nextSeqIn(value, pasteBlocks), lines: countLines(cleaned), content: cleaned }
       const token = formatToken(block)
       // Surround the token with newlines so the chip lives on its own line —
       // long-form pasted content rarely flows with typed text around it.
@@ -3225,6 +3349,13 @@ function ChatInput({
   /** "Is a transcription in flight at all" — see the `voiceTranscribeActive` prop
    *  doc. Falls back to the gated flag so the prop stays optional. */
   const transcribeInFlight = voiceTranscribeActive ?? voiceTranscribing
+  /** Whether the composer may say "Transcribing". False while the speech model is
+   *  still fetching or loading: the status strip directly above already names that
+   *  stage, and a placeholder asserting transcription under a line that reads
+   *  "Downloading the speech model: 40%" tells the user two different things about
+   *  the same wait. The strip is the single source of truth for it, so the
+   *  placeholder falls through to its default instead. */
+  const transcribingIsHonest = transcribeInFlight && !voiceDownload
   /** Another composer holds the microphone. Blocks STARTING here exactly like a
    *  foreign transcription does, but it is not transcription — nothing of this
    *  composer's is in flight — so it gets its own label and icon, never the
@@ -3494,6 +3625,20 @@ function ChatInput({
   const voiceModePlaceholder = voiceModeAvailable && !voiceHoldMode && !composerHasDraft && !placeholder
     ? i18nT('components.chatInput.send_a_message_or_tap_the_mic_for_voice')
     : ''
+  const activePlaceholder = !connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : transcribingIsHonest ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder
+  // The sigil hint is a label and may be cut to one line. Every other
+  // placeholder here is a sentence the user needs whole, so it still wraps —
+  // including a caller's own `placeholder`, which `resolvedPlaceholder` carries.
+  const placeholderIsHint = !placeholder && activePlaceholder === resolvedPlaceholder
+  // Re-measure when the PLACEHOLDER swaps at an unchanged value: an empty composer
+  // measures its placeholder, and the value effect's deps cannot see it. The caret
+  // is NOT followed here — a placeholder only shows over an empty box, so there is
+  // no line of the user's to keep in view, and this effect also runs on a
+  // parent-driven value change, where snapping is what the seeded-prompt rule forbids.
+  useEffect(() => {
+    const el = inputRef.current
+    if (el && !dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current, false)
+  }, [activePlaceholder, manualHeight, prefillHint])
   /** Combined height of every strip currently stacked above the textarea,
    *  MEASURED rather than predicted from the strips' Tailwind classes. The
    *  manual-resize floor and the transient height adjustment below both work off
@@ -3546,7 +3691,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} refusedOptions={followUpRefusedOptions} error={followUpError} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
@@ -3870,7 +4015,7 @@ function ChatInput({
         <SketchDialog open={sketchOpen} onOpenChange={setSketchOpen} onInsert={onUploadFiles} returnFocusRef={composerAnchorRef} />
       )}
 
-      {typedCommandMenus && <SlashCommandMenu input={value} anchorRef={composerAnchorRef} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
+      {typedCommandMenus && <SlashCommandMenu input={value} anchorRef={composerAnchorRef} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { replaceInSlot(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
 
       {onFileSelect && (
         <FilePickerMenu
@@ -4002,6 +4147,18 @@ function ChatInput({
         animate={{ opacity: 1, height: 'auto' }}
         exit={{ opacity: 0, height: 0 }}
         transition={{ type: 'spring', damping: 26, stiffness: 280, mass: 0.7 }}
+        // The halo lives on THIS element, not on the bordered wrapper inside it:
+        // this element clips its content for the height:0 exit, and a child's
+        // box-shadow is content, so a halo drawn one level down is cut at the
+        // edge. An element's own shadow is outside its overflow clip. Radius
+        // mirrors the wrapper's so the halo hugs the same corners. With an
+        // approval box attached above, the wrapper has no top radius and the
+        // approval glow already lights the pair, so the halo stands down.
+        // Incognito and temporary modes paint the wrapper's border warn / aim
+        // at all times; the focus halo takes the same color there so the one
+        // control lights up in one color instead of an accent ring around a
+        // warn or aim edge.
+        className={hasApproval ? undefined : `composer-halo rounded-2xl${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`}
         style={{ overflow: 'hidden' }}
       >{/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
@@ -4067,7 +4224,7 @@ function ChatInput({
           />
         )}
 
-        {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-yellow-400" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
+        {optimizing && <span className="optimize-overlay absolute inset-0 flex items-center justify-center backdrop-blur-md pointer-events-none z-10 rounded-2xl"><span className="optimize-overlay-pill inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium text-text"><Sparkles size={15} className="text-accent animate-pulse shrink-0" /> {i18nT('components.chatInput.optimizing_prompt')}</span></span>}
         {/* The textarea fallback is seamless for typing (draft intact), but the
             failure itself must be user-visible, not only a console line: the
             person who opted into the editor should know they are no longer in
@@ -4084,7 +4241,7 @@ function ChatInput({
         )}
         <div className={`relative ${showDictation || voiceHoldMode ? 'sr-only' : ''} ${manualHeight !== null ? 'flex-1 min-h-0 flex flex-col' : ''}`}>
         {lexicalComposer && !lexicalLoadFailed ? (
-          <ComposerLoadBoundary onError={() => setLexicalLoadFailed(true)}>
+          <ComposerLoadBoundary onError={markLexicalLoadFailed}>
             <Suspense fallback={
               <div
                 role="status"
@@ -4098,6 +4255,7 @@ function ChatInput({
               <LexicalComposerInput
                 value={value}
                 blocks={pasteBlocks}
+                historyKey={pendingSlot}
                 onChange={handleLexicalChange}
                 onBlocksChange={onPasteBlocksChange}
                 showFullPastes={showFullPastes}
@@ -4108,7 +4266,8 @@ function ChatInput({
                 onSelectionChange={publishLexicalSelection}
                 sentMessages={sentMessages}
                 ariaLabel={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
-                placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : voiceTranscribing ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder}
+                placeholder={activePlaceholder}
+                placeholderOneLine={placeholderIsHint}
                 disabled={disabled}
                 readOnly={optimizing}
                 sendOnEnter={sendOnEnter}
@@ -4126,9 +4285,11 @@ function ChatInput({
           spellCheck={spellCheck}
           aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
-          className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
+          // Chromium paints no `text-overflow` on a `::placeholder`, so the cut tail
+          // fades out instead, the way the app's other cut edges do.
+          className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${placeholderIsHint ? 'placeholder:whitespace-nowrap placeholder:overflow-hidden placeholder:[mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)] placeholder:[-webkit-mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)]' : ''} ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
-          placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : voiceTranscribing ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder}
+          placeholder={activePlaceholder}
           readOnly={optimizing}
           rows={1}
           value={value}
@@ -4223,7 +4384,7 @@ function ChatInput({
           <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
-                {directFilePicker ? (
+                {uploadCancelControl || (directFilePicker ? (
                   /* Association is intentionally absent while uploads disable the control. */
                   <label
                     htmlFor={uploading ? undefined : fileInputId}
@@ -4247,7 +4408,7 @@ function ChatInput({
                   >
                     {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
                   </button>
-                )}
+                ))}
                 {!directFilePicker && plusOpen && plusRect && createPortal(
                   <div
                     ref={plusMenuRef}
@@ -4319,8 +4480,9 @@ function ChatInput({
                       {typedCommandMenus && <button
                         type="button"
                         onClick={() => openTrigger('/')}
+                        disabled={!composerReady}
                         title={i18nT('components.chatInput.slash_commands')}
-                        className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
+                        className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                       >
                         <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">/</span>
                         <div className="min-w-0">
@@ -4332,8 +4494,9 @@ function ChatInput({
                         <button
                           type="button"
                           onClick={() => openTrigger('@')}
+                          disabled={!composerReady}
                           title={i18nT('components.chatInput.reference_a_file')}
-                          className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
+                          className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                         >
                           <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">@</span>
                           <div className="min-w-0">
@@ -4345,8 +4508,9 @@ function ChatInput({
                       {typedCommandMenus && <button
                         type="button"
                         onClick={() => openTrigger('$')}
+                        disabled={!composerReady}
                         title={i18nT('components.chatInput.use_a_skill')}
-                        className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
+                        className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                       >
                         <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">$</span>
                         <div className="min-w-0">
@@ -4638,13 +4802,17 @@ function ChatInput({
                     mode={effectiveBusyMode}
                     onModeChange={setBusySendMode}
                     onFire={fireComposer}
-                    disabled={disabled}
+                    // Offline mid-turn the fire half must read disabled, not sit
+                    // enabled over a `fireComposer` that swallows the press — the
+                    // rule the idle Send button and steer-only send already follow.
+                    // The caret stays live: picking steer-vs-queue is not a send.
+                    disabled={disabled || !connected}
                     altChordAvailable={sendOnEnter === 'enter'}
                     autoAvailable={jevAutoAvailable}
                   />
                   )
                 ) : (
-                  <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 disabled:opacity-30 disabled:cursor-not-allowed transition-all" onClick={fireComposer} disabled={disabled} title={i18nT('components.chatInput.queue_message')} aria-label={i18nT('components.chatInput.queue_message')}>
+                  <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 disabled:opacity-30 disabled:cursor-not-allowed transition-all" onClick={fireComposer} disabled={disabled || !connected} title={i18nT('components.chatInput.queue_message')} aria-label={i18nT('components.chatInput.queue_message')} {...offlineProps(connected, 'send', i18nT('components.chatInput.queue_message'))}>
                     <ArrowUpFromLine size={18} />
                   </button>
                 )
@@ -4687,7 +4855,7 @@ function ChatInput({
                 // still in flight — matching the re-entrancy guard in
                 // optimizePrompt(). optimizing ⊂ optimizePending, so this stays
                 // disabled on the originating session too.
-                disabled={!value.trim() || optimizePending || !connected}
+                disabled={!value.trim() || optimizePending || !connected || !composerReady}
                 aria-label={optimizePending && !optimizing ? i18nT('components.chatInput.optimize_prompt_busy_optimizing_another_chat') : i18nT('components.chatInput.optimize_prompt')}
                 title={optimizePending && !optimizing ? i18nT('components.chatInput.optimizing_another_chat_please_wait') : i18nT('components.chatInput.optimize_prompt_2', { shortcut: platformShortcut('Cmd+Shift+Enter') })}
                 {...offlineProps(connected, 'optimize', 'Optimize')}
@@ -5078,22 +5246,29 @@ function ChatInput({
               // reads exactly like a pin. A pinned chip keeps the plain hint.
               title={isRunning
                 ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsInheritedDefault
-                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                  : i18nT('components.chatInput.model_2', { name: modelName })}
+                : modelIsJevRouted
+                  ? i18nT('pages.chatPage.model_auto_jev_description')
+                  : modelIsInheritedDefault
+                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                    : i18nT('components.chatInput.model_2', { name: modelName })}
               aria-label={isRunning
                 ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsInheritedDefault
-                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                  : i18nT('components.chatInput.model_2', { name: modelName })}
+                : modelIsJevRouted
+                  ? i18nT('pages.chatPage.model_auto_jev_description')
+                  : modelIsInheritedDefault
+                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                    : i18nT('components.chatInput.model_2', { name: modelName })}
             >
               <span className="truncate max-w-[180px]">
-                {modelName}
+                {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
               </span>
-              {modelIsInheritedDefault && (
-                // Outside the truncating span: a long provider-prefixed id must
-                // ellipsize its own tail, never the marker that tells a served
-                // default apart from a pin.
+              {/* Outside the truncating span: a long provider-prefixed id must
+                  ellipsize its own tail, never the marker beside it. A routed chip
+                  takes NO marker -- its label is already the policy, and a second
+                  word next to it would be a marker on a name that is not a model.
+                  So the two unpinned states differ by KIND (a policy vs an id with
+                  a marker), not by two adjectives a reader has to tell apart. */}
+              {!modelIsJevRouted && modelIsInheritedDefault && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>

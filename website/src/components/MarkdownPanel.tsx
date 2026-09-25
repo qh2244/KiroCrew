@@ -1195,11 +1195,19 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // above is not the only entry point. Neither a source diff nor an edit buffer
   // means anything for bytes that were never decoded.
   const showBinaryCard = !!binary && !BYTE_BACKED_FILE_TYPES.has(fileType)
+  const wasBinaryCardRef = useRef(showBinaryCard)
   useEffect(() => {
-    if (!showBinaryCard) return
+    const wasShowing = wasBinaryCardRef.current
+    wasBinaryCardRef.current = showBinaryCard
+    if (!showBinaryCard) {
+      // Bytes that decoded after all: a code file's default view IS the editor and
+      // `canPreview` renders no Edit toggle for it, so a stale false strands the tab.
+      if (wasShowing) setEditing(!isMarkdown && !isRichType)
+      return
+    }
     setDiffMode(false)
     setEditing(false)
-  }, [showBinaryCard])
+  }, [showBinaryCard, isMarkdown, isRichType])
   // ── Preview-mode find (Cmd+F) ─────────────────────────────────────────────
   // Three surfaces compete for Cmd+F: the editor owns it while editing (it stops
   // propagation before anything else sees the key), and ChatPage's chat-find
@@ -2096,7 +2104,20 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       // An open annotation box owns Escape: the toolbar closes it (and hands the
       // selection back) on its own; the panel must not ALSO close or prompt.
       if (e.key === 'Escape') { if (composerOpenRef.current) return; if (fullscreen) setFullscreen(false); else guardedClose() }
-      if ((e.metaKey || e.ctrlKey) && e.key === 's' && editing && dirty) { e.preventDefault(); handleSaveRef.current() }
+      // Own the save chord whenever the editor is active, not only when dirty:
+      // the editor-local capture handler in PierreEditorImpl exists only after
+      // its lazy chunk resolves and only sees keydowns targeting its own
+      // subtree, so during the load window this document-level handler is the
+      // one place the chord can be claimed. Match case-insensitively so
+      // Caps Lock / Shift+Cmd+S also count. preventDefault stops AppKit's
+      // default (selecting the word under the cursor); only issue the write
+      // when dirty so a clean buffer does not trigger a redundant save.
+      // Bail if PierreEditorImpl's capture handler already claimed the chord
+      // (defaultPrevented) so the save fires once, not twice.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's' && editing && !e.defaultPrevented) {
+        e.preventDefault()
+        if (dirty) handleSaveRef.current()
+      }
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)

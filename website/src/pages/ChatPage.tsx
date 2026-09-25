@@ -11,16 +11,13 @@ import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
 import { KIRO_SIGN_IN_PATH } from './developer/kiroSignInLink'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { useTouchDeviceAtMount } from '../hooks/useIsTouchDevice'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { toApiDecision } from '../utils/approvalDecision'
-import { isBrowseCommand } from '../utils/browseCommand'
 import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 import { mergeRenderers, resolveRenderer, type MessageRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
 import { createTranscriptRenderers } from './chat/transcriptRenderers'
-// Re-exported so the symbol `ChatPage` exported before this extraction stays
-// importable from here; the implementation lives in `utils/browseCommand` so a
-// pure test need not pull ChatPage's module graph.
-export { isBrowseCommand }
+import { featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from './chat/transcriptRenderers'
 import { useDrawerSwipe, animateDrawer, registerDrawerTargets, takeOverDrawer, safeAreaLeft } from '../hooks/useDrawerSwipe'
 import type { ResizeInfo } from '../utils/resizeImage'
 import { useAppSelector, useAppDispatch, useAppStore, store } from '../store'
@@ -59,6 +56,7 @@ import { disposeTerminalSession, useDeleteTerminalSession } from '../components/
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
 import { triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
+import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
@@ -110,7 +108,7 @@ import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { addPendingFile, prepareSendPayload, buildRelMap, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, spliceDirTokens } from '../utils/fileTokens'
 import { makeRelative } from '../components/FilePickerMenu'
-import { type PasteBlock, expandAll as expandPasteTokens, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste } from '../utils/pasteTokens'
+import { type PasteBlock, carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft, pruneBlocks as pruneBlocksUtil, saveStoredPaste } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
 /** Map message index → displayItems index, for scroll-to-match and the turn minimap. */
 function buildMessageToDisplayIdx(items: DisplayItem[]): Map<number, number> {
@@ -255,7 +253,7 @@ import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
-import { JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
+import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
@@ -335,6 +333,7 @@ import { deriveFollowUpOptions, parseOptions } from '../app-sdk/protocol'
 import { isNoteRow } from '../lib/noteContract'
 import OverlayDrawer from '../components/OverlayDrawer'
 import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
+import { scaleContentWidth } from './chat/contentWidth'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
 import { focusComposer, focusComposerAfter, revealComposer } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
@@ -504,6 +503,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // effect reads it (mobile replaces rather than pushes a session switch), and
   // that effect is defined well above where the layout hooks start.
   const isMobile = useIsMobile()
+  // Touch devices keep the classic textarea composer until a device pass records
+  // that soft-keyboard typing (composition events on the IME latch, Enter-to-send)
+  // and the pointer-only pill reorder hold up there — see `useIsTouchDevice`.
+  const touchDevice = useTouchDeviceAtMount()
   // The mobile sessions drawer and its scrim are `fixed` overlays that autofocus
   // a search input, so a software keyboard is open whenever they are. iOS Safari
   // shrinks only the VISUAL viewport for the keyboard (`interactive-widget`
@@ -2065,6 +2068,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     handleFileSave,
     handleCapture,
     uploadFiles,
+    cancelUpload,
+    uploadCancellable,
     handleOptimizeResult,
     dragOver,
     dropTargetProps,
@@ -2157,6 +2162,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     pinExpanded,
     setPinExpanded,
     onPinCollapsedHeight,
+    scrollTranscriptBy,
     updatePinnedPrompt,
     onScrollPin,
     scrollToPinnedPrompt,
@@ -2289,8 +2295,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Read by the option handler instead of the state: two clicks landing before a
   // re-render would both see the same set and both take the append branch.
   const followUpPickedRef = useRef(followUpPicked); followUpPickedRef.current = followUpPicked
+  // Ownership of the appended suffix, not content-matching (#7616). See
+  // lib/followUpToggle (shared with ChatPane): the chips own a recorded
+  // (base, options) span, options kept as an ARRAY so a comma-bearing label is
+  // one element. Advanced SYNCHRONOUSLY in the click handler, never in a
+  // render-time state updater, so StrictMode's double-invocation cannot rebase
+  // it on stale state (the #7616 F2 defect).
+  const followUpInsertedRef = useRef<OwnedSuffix | null>(null)
+  // Any DIRECT user edit of the composer invalidates chip ownership (#7616) —
+  // the recorded span describes a chip-produced draft, so once the user types
+  // it no longer maps to the live text (even an edit-then-restore). Chip
+  // append/remove set the ref themselves and call setInput directly, bypassing
+  // this handler, so they are unaffected.
+  const clearFollowUpOwnership = useCallback(() => { followUpInsertedRef.current = null }, [])
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, activeSlot])
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, activeSlot])
   const { data: dashCfg } = useQuery<{ quick_send?: boolean; session_grid?: boolean; link_previews?: boolean; social_share_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
   // Session grid (split view) is an opt-in feature flag (Settings › Chat › Split View). Gates ⌘D, the Columns2 button, and the grid render.
   const splitFeatureEnabled = dashCfg?.session_grid === true
@@ -2579,26 +2598,30 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         const keepRefs = onScreen ? pendingSessionsRef.current : (uiSlot ? sessionRefDrafts.current[uiSlot] ?? [] : [])
         const restoredRefs = mergeSessionRefs(keepRefs, sentSessionRefs)
         const keepPastes = onScreen ? pasteBlocksRef.current : (uiSlot ? pasteDrafts.current[uiSlot] ?? [] : [])
-        const keptPasteIds = new Set(keepPastes.map(b => b.id))
         // Collapsed pastes resolve by `seq`, not id, and a paste made while the
         // composer was empty restarts at #1 — so a naive id-merge can leave two
         // blocks sharing #1, with both markers resolving to one of them and
-        // silently swapping the user's content on retry. Re-sequence the carried
-        // blocks past the kept ones and rewrite their markers in the payload text.
-        const { text: payload, blocks: carriedPastes } = remapCarriedBlocks(
-          raw,
-          activePastes.filter(x => !keptPasteIds.has(x.id)),
-          new Set(keepPastes.map(b => b.seq)),
-        )
-        const restoredPastes = [...keepPastes, ...carriedPastes]
+        // silently swapping the user's content on retry. `carryPastes` owns the
+        // rule: re-sequence the carried blocks past the kept ones and rewrite
+        // their markers in the payload text.
         const keepText = onScreen ? inputRef.current : (uiSlot ? drafts.current[uiSlot] ?? '' : '')
+        // `keepText` goes in too: a marker typed there while the send was in flight
+        // is a seq no carried block may come back under.
+        const carried = carryPastes(raw, activePastes, keepPastes, keepText)
+        // `full` keeps every token: it is the payload a retry re-sends whole.
+        const { full: payload, pastes: restoredPastes } = carried
         // Keep whatever the user typed while the create was in flight and append
         // the payload after it, without duplicating one the composer already
         // holds — a synchronously rejected create can land before React flushes
         // the clear. `mergeRecoveredDraft` owns that rule for every recovery
         // site, including the send-failure path further down.
-        const restoredText = mergeRecoveredDraft(keepText, payload)
+        const restoredText = mergeCarriedDraft(keepText, carried)
         if (onScreen && uiSlot) {
+          // Advance the refs with the state (as `inputRef.current = next` does
+          // elsewhere): a second recovery landing in the same batch reads them for
+          // its own `carryPastes` reservation, and the render-time snapshot would
+          // still lack this payload's markers and blocks.
+          inputRef.current = restoredText; pasteBlocksRef.current = restoredPastes
           setInput(restoredText); setPasteBlocks(restoredPastes); setPendingFiles(restoredFiles); setPendingSessions(restoredRefs)
           // clearPending() above already consumed the knowledge selection, so a
           // retry would otherwise go out WITHOUT the context the user picked. Slot-
@@ -2768,24 +2791,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // blocks cannot claim one `[ Paste #N ]` marker.
       const keepText = onScreenNow ? inputRef.current : (drafts.current[slot] ?? '')
       const keepPastes = onScreenNow ? pasteBlocksRef.current : (pasteDrafts.current[slot] ?? [])
-      const keptIds = new Set(keepPastes.map(b => b.id))
-      const { text: carriedText, blocks: carriedPastes } = remapCarriedBlocks(
-        typedTxt,
-        activePastes.filter(b => !keptIds.has(b.id)),
-        new Set(keepPastes.map(b => b.seq)),
-      )
-      const pastesBack = [...keepPastes, ...carriedPastes]
+      const carried = carryPastes(typedTxt, activePastes, keepPastes, keepText)
+      const pastesBack = carried.pastes
       // Same merge rule as the create-failure path above, and the separator lives
       // in `mergeRecoveredDraft` rather than in a template literal here: the blank
       // line between the kept draft and the recovered payload is message
       // structure, not copy, so it stays off the i18n gate honestly rather than by
       // exemption (same treatment as appendSessionRefLinks).
-      const textBack = mergeRecoveredDraft(keepText, carriedText)
+      const textBack = mergeCarriedDraft(keepText, carried)
       setDraft(drafts.current, slot, textBack)
       setPasteDraft(pasteDrafts.current, slot, pastesBack)
       setSessionRefDraft(sessionRefDrafts.current, slot, refsBack)
       saveDrafts()
       if (onScreenNow) {
+        // Refs advanced with the state — see the create-failure path above.
+        inputRef.current = textBack; pasteBlocksRef.current = pastesBack
         setInput(textBack); setPasteBlocks(pastesBack); setPendingSessions(refsBack)
       }
     }
@@ -3482,32 +3502,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setSessionPreviewPending(slot, norm)      // heuristic offer: card only, no open, no load
     }
   }, [messages, activeSlot, dispatch])
-  // Auto-open the Browser panel when the agent starts browsing. The signal is the
-  // agent's own shell call: browsing is `playwright-cli` commands, so a shell
-  // tool_call whose preview invokes it is the start of a browse. Open/focus the tab
-  // only at the START (new slot, or after a >90s gap), NOT on every command, so it
-  // cannot steal focus from a tab the user switched to mid-browse.
-  const browseOpenedRef = useRef<{ key: string | null; ts: number }>({ key: null, ts: 0 })
-  useEffect(() => {
-    const onTool = (e: Event) => {
-      const d = (e as CustomEvent<{ slot?: string; is_shell?: boolean; input_preview?: string }>).detail
-      if (!d?.is_shell) return
-      if (!isBrowseCommand(d.input_preview)) return
-      const key = d.slot ?? null
-      // Only auto-open when the browsing session IS the one on screen. A background
-      // session's commands must not open another session's panel.
-      if (!key || key !== activeSlotRef.current) return
-      const now = Date.now()
-      const prev = browseOpenedRef.current
-      if (prev.key !== key || now - prev.ts > 90_000) {
-        dispatch(openActivityPanel())
-        tabsCtlRef.current.openView('browser')
-      }
-      browseOpenedRef.current = { key, ts: now }
-    }
-    window.addEventListener('kirocrew-tool-call', onTool)
-    return () => window.removeEventListener('kirocrew-tool-call', onTool)
-  }, [dispatch])
   // Reachability: declare open chat slots to the Electron main process so the
   // agent command channel polls for them (see listPanelIds) even before the Browser
   // tab is ever opened — this is what makes the built-in browser the default for a
@@ -4163,6 +4157,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const openKiroSignIn = useCallback(() => {
     navigate(KIRO_SIGN_IN_PATH)
   }, [navigate])
+  // The non-inference exit for a feature request the plan could not afford
+  // (#13342) is decided per row in the shared row set, from the row alone: the
+  // user row the header's "Request a Feature" action sent carries the flow's
+  // stamp in its `meta`, so the form is offered on that turn's own refusal,
+  // while a usage limit in an ordinary chat, or after the user typed on in
+  // this one, keeps today's card. The card withholds Resume on that refusal
+  // because a retry replays the rejection; the composer must not urge it
+  // beneath the same card, so its Resume and "press Resume" hint yield too
+  // (same rule, same row).
+  const featureRequestRefused = featureRequestRefusalIsNewest(messages)
+  // Same rule for a session start that failed twice in a row: the card has
+  // withheld Resume (a third press re-runs the same start, and the server
+  // refuses it with `session_start_repeat`) and names the remedy, so the
+  // composer must not urge the press beneath it. Typing still works and is
+  // what resets the count.
+  const sessionStartRepeated = sessionStartRepeatIsNewest(messages)
 
   const handleContinue = useCallback(() => {
     if (!activeSlot || continuing || !continuable) return
@@ -5262,8 +5272,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     [renderedDisplayItems],
   )
 
-  const navigateToTurn = useCallback((displayIndex: number) => {
-    navToDisplayIndex(displayIndex, { behavior: 'smooth', align: 'start', offset: -24 })
+  const navigateToTurn = useCallback((displayIndex: number, opts?: { instant?: boolean }) => {
+    // instant: used by the minimap's drag-scrub — a smooth glide would lag the
+    // pointer and queue easings on every marker crossing.
+    navToDisplayIndex(displayIndex, { behavior: opts?.instant ? 'auto' : 'smooth', align: 'start', offset: -24 })
   }, [navToDisplayIndex])
 
   // The transcript renders the deferred `renderedTranscript` snapshot; while a
@@ -5714,7 +5726,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock className="lucide-inline" /> {cronLabel}</span>}
                 {/* Same session wiring as the assistant branch. Without it `resolveSessionChip`
                     refuses at its first guard and a `/chat?sid=` link gains `target="_blank"`. */}
-                <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} messageTs={m.ts} softBreaks /></MessageErrorBoundary></div>
+                <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} messageTs={m.ts} softBreaks /></MessageErrorBoundary></div>
                 {/* No `font-mono`: a formatted date is prose, and Tailwind's
                     `font-mono` pins `var(--mono)` — a token the Font Family
                     setting never writes, so it overrode the user's choice and
@@ -6577,6 +6589,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
          attribute carries a guarantee about a case it cannot affect. */
       data-owns-swipe={embedded ? undefined : 'left right'}
       className="flex flex-1 min-h-0 h-full overflow-hidden relative"
+      /* Published here, not on the chat pane, because the side panel (Activity,
+         Browser, SideChat's composer and follow-up chips) is this element's
+         child and the chat pane's SIBLING. Anything that reads the setting via
+         `var(--mc-message-font-size, 14px)` from inside the panel would
+         otherwise silently take the fallback and look right at the default
+         only. Content width stays on the pane: it is a column geometry, and the
+         panel has its own. */
+      style={{ '--mc-message-font-size': `${chatConfig.messageFontSize}px` } as React.CSSProperties}
     >
       <AnimatePresence>
         {isMobile && drawerMounted && (
@@ -6726,7 +6746,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
       {/* Chat pane */}
       {embedMode !== 'sessions' && (
-      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': CONTENT_WIDTH[chatConfig.contentWidth].messages, '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } as React.CSSProperties}>
+      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).messages, '--mc-input-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).input } as React.CSSProperties}>
         {snipFrame && (
           <SnipOverlay
             frame={snipFrame}
@@ -7084,12 +7104,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   images={pinned.images}
                   bodyBeyondPreview={pinned.bodyBeyondPreview}
                   pushUp={pinned.push}
+                  liveH={pinned.liveH}
                   bannerH={pinned.bannerH}
                   expanded={pinExpanded}
                   onToggleExpanded={() => setPinExpanded(p => !p)}
                   onJump={() => scrollToPinnedPrompt(pinned.idx)}
                   cardRef={pinCardRef}
                   onCollapsedHeight={onPinCollapsedHeight}
+                  scrollTranscriptBy={scrollTranscriptBy}
                 />
               )}
             </div>
@@ -7139,10 +7161,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               scrollerRef={scrollerRef}
               onNavigate={navigateToTurn}
               // The rail maps loaded turns only; while the server holds older
-              // rows it wears an end-cap that says so and loads them (#8221).
-              earlier={slotHasMore && cursorIsForActiveSlot
-                ? { loading: loadingOlder, onLoad: handleLoadEarlier }
-                : undefined}
+              // rows its labels say "of N loaded" (#8221's disclosure).
+              windowed={slotHasMore && cursorIsForActiveSlot}
+              side={chatConfig.minimapSide}
             />
             <TranscriptScrollShell
               scrollerRef={scrollerRef}
@@ -7550,10 +7571,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 ref={composerRef}
                 slotKey={activeSlot}
                 value={input}
-                onChange={setInput}
+                onChange={v => { clearFollowUpOwnership(); setInput(v) }}
                 voice={composerVoiceOptions}
               >
               <ChatInput
+                lexicalComposer={!touchDevice}
               aboveComposer={
                 <>
                   {/* Session-control failures surface HERE, beside the chips they
@@ -7632,7 +7654,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // ChatInput calls this for the user's own edits (typing, paste, undo,
               // picker inserts), never for a parent-driven seed -- so it is the
               // signal that arms the prefill hint's expiry.
-              onChange={v => { setInput(v); setPrefillEdited(true) }}
+              onChange={v => { clearFollowUpOwnership(); setInput(v); setPrefillEdited(true) }}
               onSend={() => send()}
               canSteer={composerBusy}
               onSteer={steer}
@@ -7661,6 +7683,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onDismissHint={() => setPrefillHint(false)}
               onScreenshot={handleCapture}
               onUploadFiles={uploadFiles}
+              /* Only while a real upload is abortable. `uploading` is shared
+                 with the screenshot path, which has no request to cancel. */
+              onCancelUpload={uploadCancellable ? cancelUpload : undefined}
               /* The one collapsible composer. Opt-in rather than default so the
                  shared preference key and the window-level expand event stay
                  correct by construction -- see ChatInput's `collapsible` prop. */
@@ -7735,6 +7760,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // The served default is shown exactly when the pin alone would
               // have read `auto`; that is the inherited case the marker names.
               modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+              // The turn's model is Jev's to pick exactly when the routing gate
+              // says so: the slot names no model, and the preview is on. Reads the
+              // slot's RAW model, not `shownModel` -- that one substitutes the
+              // served id for an inheriting slot, so it is almost never `auto` and
+              // would hide every routed turn. Same `jevRouteOn` the picker's row is
+              // drawn from, so chip, menu and gate cannot disagree.
+              modelIsJevRouted={jevRouteOn && isUnpinnedModel(currentSlot?.model)}
               onAgentClick={provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
               onModelClick={(rect, trigger, composerHadFocus) => {
                 modelPickerReturnsFocusRef.current = !!composerHadFocus
@@ -7790,8 +7822,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                  the one shape `_is_interrupted` cannot see. That slot loses its
                  one-click nudge; typing anything still resumes it. Closing that
                  hole needs a persisted turn-in-flight marker (backend), not a
-                 louder button here. */
-              continuable={continuable && interrupted}
+                 louder button here.
+
+                 `featureRequestRefused` is the one case where the card and the
+                 composer would otherwise disagree (#13342): the newest row is
+                 the plan's refusal of a feature request, the card has withheld
+                 Resume because a retry replays that rejection and offered the
+                 issue form instead, and a composer beneath it saying "press
+                 Resume" would argue with the card. The composer falls back to
+                 the ordinary Send button; typing still works.
+                 `sessionStartRepeated` is the same rule for a session start
+                 that failed twice in a row: the card names the remedy and
+                 withholds Resume, so the composer falls back to Send. */
+              continuable={continuable && interrupted && !featureRequestRefused && !sessionStartRepeated}
               continueIsRecovery={interrupted}
               onContinue={handleContinue}
               continuing={continuing}
@@ -7847,6 +7890,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               quickSend={dashCfg?.quick_send}
               followUpLayout={chatConfig.followUpLayout}
               followUpSourceKey={followUpSourceKey}
+              followUpPendingOptions={planActionMutation.latchedActions}
+              followUpRefusedOptions={new Set(followUpOptions.filter(planActionMutation.isRefused))}
+              followUpError={planActionMutation.failure}
               onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
                 // Plan options (Go / Go All / Cancel) dispatch directly — no input fill.
                 // Non-protocol labels on a plan-shaped message keep the composer path:
@@ -7859,26 +7905,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 // text so it no longer matches, leave text alone — the chip
                 // still un-highlights for consistency).
                 if (followUpPickedRef.current.has(o)) {
-                  const pickedSuffix = Array.from(followUpPickedRef.current).join(', ')
                   const next = new Set(followUpPickedRef.current); next.delete(o)
-                  const remainingSuffix = Array.from(next).join(', ')
                   followUpPickedRef.current = next
-                  setInput(prev => {
-                    // Options are appended as one ordered suffix. Remove only
-                    // from that complete generated structure: searching for a
-                    // last occurrence still corrupts an earlier ", Go" if the
-                    // user has already deleted the appended ", Go" by hand.
-                    if (prev === pickedSuffix) return remainingSuffix
-                    const delimitedSuffix = ', ' + pickedSuffix
-                    if (!prev.endsWith(delimitedSuffix)) return prev
-                    const draft = prev.slice(0, -delimitedSuffix.length)
-                    return remainingSuffix ? draft + ', ' + remainingSuffix : draft
-                  })
+                  // Synchronous transform on the live draft + ownership refs
+                  // (#7616): advance both refs and set the value in the click
+                  // handler, never in a render-time updater, so StrictMode's
+                  // double-invocation cannot rebase ownership on stale state.
+                  const r = removeFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+                  followUpInsertedRef.current = r.owned
+                  inputRef.current = r.value
+                  setInput(r.value)
                   setFollowUpPicked(next)
                 } else {
                   const next = new Set(followUpPickedRef.current); next.add(o)
                   followUpPickedRef.current = next
-                  setInput(prev => prev.trim() ? prev.trimEnd() + ', ' + o : o)
+                  const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+                  followUpInsertedRef.current = r.owned
+                  inputRef.current = r.value
+                  setInput(r.value)
                   setFollowUpPicked(next)
                 }
               }}
@@ -8105,6 +8149,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               slotTitle={activeSlotTitle} chatMode={mode}
               expanded={panelMaximized}
               fillWidth={panelFillWidth}
+              extraReserveW={!isMobile && sidebarOpen ? effectiveSidebarWidth : 0}
               canDockBottom={false}
             />
           </motion.div>
@@ -8145,6 +8190,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 slotTitle={activeSlotTitle} chatMode={mode}
                 expanded={panelMaximized}
                 fillWidth={panelFillWidth}
+                extraReserveW={!isMobile && sidebarOpen ? effectiveSidebarWidth : 0}
               />
             </motion.div>
           )}

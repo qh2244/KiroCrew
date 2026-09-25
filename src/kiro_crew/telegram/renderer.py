@@ -37,8 +37,12 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import split_trailing_protocol_suffix, strip_control_comments
-from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    split_trailing_protocol_suffix,
+    strip_control_comments,
+)
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S, adoptable_reservation
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
@@ -52,7 +56,9 @@ from kiro_crew.messaging.renderer import (
     Renderer,
     _default_redactor,
     apply_options_cap,
+    count_redaction_tags,
     new_approval_nonce,
+    redaction_notice,
     session_provenance_tag,
     split_options_trailer,
 )
@@ -818,6 +824,18 @@ class TelegramApprovalDecider:
     Process-global Future registry keyed by ``session_key:request_id`` so
     concurrent turns (and users) never resolve each other's prompts. Denies by
     default when the wait elapses.
+
+    The decision window opens when the nonce is armed, not when the wait starts:
+    :meth:`arm` reserves the future and ``__call__`` adopts it. So a press lands
+    inside the window from the moment the prompt is built, including across the
+    suspension points between posting it and awaiting the decision.
+
+    It closes at the decision, at the wait's timeout, or at a :meth:`retire` /
+    :meth:`refuse_undelivered` / :meth:`discard_session` for a prompt that never
+    went out or was never awaited -- NOT when the prompt stops being visible.
+    Nothing here strips a timed-out prompt's buttons, so they stay clickable in
+    the chat indefinitely; a press on them finds no nonce and is told the approval
+    expired, which by then it has.
     """
 
     _REGISTRY: dict[str, "asyncio.Future[bool]"] = {}
@@ -825,28 +843,189 @@ class TelegramApprovalDecider:
     #: nonce does not match is refused, which is what stops a button from a previous
     #: run answering a live prompt that reuses its request id.
     _NONCES: dict[str, str] = {}
+    #: Keys a wait currently OWNS -- added when ``__call__`` takes the future and
+    #: discarded in the same ``finally`` that unregisters it. The registry holds
+    #: one future per key, so the wait that added a key is the one that clears it.
+    #: :meth:`discard_session` reads this to leave an owned window alone, since a
+    #: wait under this session key need not belong to the turn running that sweep.
+    _AWAITED: set[str] = set()
 
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
 
     @staticmethod
     def key(session_key: str, request_id: str | int) -> str:
         return f"{session_key}:{request_id}"
 
     @classmethod
-    def arm(cls, key: str, nonce: str) -> None:
-        """Record the nonce for the buttons the renderer is about to post."""
+    def arm(cls, key: str, nonce: str, *, detached: bool = False) -> None:
+        """Record the nonce for the buttons about to be posted, and OPEN the window.
+
+        Called by whatever is about to post the prompt, so it runs on the event
+        loop the wait will run on.
+
+        Reserving the future here, rather than in ``__call__``, is what keeps a
+        press inside the window while the prompt is being posted. ``TurnDriver``
+        dispatches ``PROMPT_CHOICE`` to the renderer and only then awaits the
+        decider, and the renderer suspends in between -- two thread hops for the
+        display-safety scan of the tool name and its arguments, then the send. A
+        press landing in that gap found the nonce armed but no future, so
+        ``resolve_global`` judged it a stale button and failed closed: the user was
+        told the approval had expired, and the request denied itself when the
+        window elapsed. A Trust press in that gap also failed ``is_pending`` and so
+        granted nothing, leaving the operator with neither the grant nor the tool.
+
+        Never replaces a LIVE future. A second arm for one key, or an arm that
+        follows the wait, keeps the object the waiter is blocked on; replacing it
+        would leave that waiter on a future nobody resolves. A DONE future IS
+        replaced, and that is the isolation bound: a decision left unawaited must
+        not be adoptable by the next request to reuse this key.
+
+        Off the event loop only the nonce is armed. A reservation is a promise to a
+        wait that runs on THIS loop, so without one there is no waiter to hold a
+        window open for -- and a caller that cannot await the decider cannot be
+        raced by a press. That keeps this callable as a pure nonce operation.
+
+        Pass *detached* when the wait this arms for runs OUTSIDE the turn whose
+        end-of-turn sweep would otherwise reach the key. ``__call__`` claims a key
+        as owned when it starts awaiting, which leaves the span from here to there
+        unowned -- and for a caller whose wait is in a task of its own that span
+        contains a network send, long enough for the originating turn to finish and
+        sweep the window away under the buttons. The press then resolves nothing
+        and the request denies at its own timeout on a refusal nobody made. The
+        claim is released by ``__call__``'s ``finally`` and by :meth:`retire`, so
+        every exit that ends the window also ends the claim. Ownership stays the
+        sweep's one predicate; this only lets the caller that knows its wait is
+        detached say so, rather than the sweep guessing from a request id's shape.
+        """
         cls._NONCES[key] = nonce
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reserved = adoptable_reservation(cls._REGISTRY.get(key), loop)
+        if reserved is None or reserved.done():
+            cls._REGISTRY[key] = loop.create_future()
+        if detached:
+            cls._AWAITED.add(key)
+
+    @classmethod
+    def retire(cls, key: str) -> None:
+        """Close a decision window whose prompt never went out (idempotent).
+
+        ``__call__`` retires the nonce and the reservation together with the wait
+        it ran, but a caller that ARMS then fails to post (a spawn-approval prompt
+        Telegram rejected) has no wait to run that ``finally`` -- without this both
+        would outlive the prompt that never existed, and the nonce is what
+        authorizes a press.
+
+        For a caller with somewhere else to fall through to, so no wait of its own
+        runs on this key: the spawn-approval gate falls through to Slack and the
+        dashboard. A caller whose driver WILL await the decider wants
+        :meth:`refuse_undelivered` instead, because dropping the reservation there
+        only means the wait opens a fresh window and spends the whole timeout on a
+        prompt nobody can see.
+
+        Releases a detached caller's ownership claim as well, so a window that ends
+        here cannot leave the key permanently exempt from the sweep.
+        """
+        cls._NONCES.pop(key, None)
+        cls._REGISTRY.pop(key, None)
+        cls._AWAITED.discard(key)
+
+    @classmethod
+    def refuse_undelivered(cls, key: str) -> None:
+        """Record a denial for a prompt that never reached the chat.
+
+        The prompt is unanswerable, so the only safe verdict is a refusal -- and
+        recording it on the reservation the driver is about to adopt is what makes
+        that refusal immediate. The alternative, dropping the reservation, reaches
+        the same verdict only after the wait has spent the full decision window on
+        a prompt nobody can see, and reports that elapsed wait as an expiry.
+
+        Leaves the maps alone: the adopting ``__call__`` clears both when it
+        consumes the decision, which keeps one owner for that cleanup. A key with
+        no live reservation is left untouched, so this cannot overwrite a decision
+        the user actually made.
+        """
+        reserved = cls._REGISTRY.get(key)
+        if reserved is not None and not reserved.done():
+            reserved.set_result(False)
+
+    @classmethod
+    def discard_session(cls, session_key: str) -> None:
+        """Drop *session_key*'s unawaited reservations at the end of its turn.
+
+        ``__call__`` clears its own entry in a ``finally``, and the failed-post
+        paths above clear theirs, so this covers the one case neither can: the
+        prompt went out and the turn then ended before the driver reached the
+        decider -- a cancellation, or a failure between the two. No wait ever ran,
+        so nothing else closes that window, and the nonce left behind is what
+        authorizes a press.
+
+        Skips a key a wait OWNS, which is what keeps this a sweep of unawaited
+        windows rather than of every window a session holds. Not every wait under
+        a session key belongs to the turn that runs this sweep: a spawn-approval
+        prompt is armed under the parent session key and awaited by a detached
+        task with its own window, so sweeping it would pop the future and nonce
+        while an operator still had the buttons in front of them -- their press
+        would then resolve nothing and the spawn would deny at its timeout on a
+        refusal nobody made. Ownership is the predicate rather than the shape of
+        the request id, so a wait added later is covered without being enumerated
+        here.
+
+        Drops every reservation no wait owns, whatever state its future is in. A
+        completed one no wait adopted has no reader -- ``__call__`` for that turn
+        never ran -- so keeping it retains the future and its nonce for the life of
+        the process, once per key. The nonce is the worse half: the buttons stay in
+        the chat, so a later press still matches a prompt nothing can answer. The
+        prefix carries its own ``:`` so one session key cannot match another that
+        merely starts the same way.
+        """
+        prefix = f"{session_key}:"
+        for k in [k for k in cls._REGISTRY if k.startswith(prefix) and k not in cls._AWAITED]:
+            cls._REGISTRY.pop(k, None)
+            cls._NONCES.pop(k, None)
 
     async def __call__(self, event: Any) -> bool:
+        self.last_deny_cause = ""
         k = self.key(self._session_key, getattr(event, "request_id", ""))
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        # Adopt the reservation opened when this prompt's nonce was armed. The
+        # press may ALREADY have landed, in the gap between the prompt going out
+        # and this wait starting, in which case the reservation holds the user's
+        # decision and there is nothing left to await. Minting a fresh future
+        # here would discard that decision and deny when the window elapsed.
+        reserved = adoptable_reservation(
+            TelegramApprovalDecider._REGISTRY.get(k), asyncio.get_running_loop()
+        )
+        if reserved is not None and reserved.done():
+            if reserved.cancelled() or reserved.exception() is not None:
+                # A torn-down reservation, not a decision. Open a fresh window
+                # rather than read it as consent or as a refusal.
+                reserved = None
+            else:
+                try:
+                    return bool(reserved.result())
+                finally:
+                    TelegramApprovalDecider._REGISTRY.pop(k, None)
+                    TelegramApprovalDecider._NONCES.pop(k, None)
+        fut: "asyncio.Future[bool]" = (
+            reserved if reserved is not None else asyncio.get_running_loop().create_future()
+        )
         TelegramApprovalDecider._REGISTRY[k] = fut
+        # This wait now owns the key, so the end-of-turn sweep must leave it be.
+        TelegramApprovalDecider._AWAITED.add(k)
         try:
             return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
         except asyncio.TimeoutError:
+            # Recorded for the driver, which steers the cause into the turn
+            # before it rejects, so the model hears "expired" not "denied".
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             return False  # deny-by-default on timeout
         finally:
+            TelegramApprovalDecider._AWAITED.discard(k)
             TelegramApprovalDecider._REGISTRY.pop(k, None)
             # Retire the nonce with the prompt, so a button for a request id the
             # provider later reuses cannot match a nonce that is not live.
@@ -960,6 +1139,12 @@ class TelegramRenderer(Renderer):
         self._shown = ""
         self._last_edit = 0.0
         self._seal_count = 0  # rotations so far == index into _steer_texts for chips
+        # Redaction placeholders in text that actually LANDED, tallied per
+        # delivered frame's final form (live edits supersede each other, so
+        # only sealed segments and the posted reasoning count). Feeds the
+        # post-answer notice at on_done.
+        self._redacted_creds = 0
+        self._redacted_urls = 0
         # Chip pending from the last rotation, NOT yet in _buf. It materializes
         # (prepends to the segment) only when real post-steer text arrives — so
         # an end-of-stream marker (no continuation text) never posts a chip-only
@@ -1655,6 +1840,7 @@ class TelegramRenderer(Renderer):
                         reply_to_message_id=self._consume_reply_to(),
                     )
                     if mid is not None:
+                        self._tally_redactions(text)
                         if self._stream_mid is not None:
                             # The rich message now carries this segment; drop the
                             # superseded plaintext bubble so the user sees one message.
@@ -1693,6 +1879,7 @@ class TelegramRenderer(Renderer):
                             reply_markup=keyboard,
                         )
                     if ok:
+                        self._tally_redactions(text)
                         return
                     # Both edits failed — the live message is gone (e.g. the user
                     # deleted it mid-turn). Fall through and SEND the final content so
@@ -1708,12 +1895,14 @@ class TelegramRenderer(Renderer):
                     reply_to_message_id=self._consume_reply_to(),
                 )
                 if mid is None:
-                    await self._client.send_message(
+                    mid = await self._client.send_message(
                         self._chat_id,
                         _strip_md(text),
                         reply_markup=keyboard,
                         message_thread_id=self._thread_id,
                     )
+                if mid is not None:
+                    self._tally_redactions(text)
 
             finally:
                 # Retire the live message: this segment is final, so nothing
@@ -1814,6 +2003,7 @@ class TelegramRenderer(Renderer):
                 message_thread_id=self._thread_id,
                 disable_notification=True,
             )
+            self._tally_redactions(inner)
         except Exception:
             logger.debug("Telegram: thinking post failed", exc_info=True)
 
@@ -1853,7 +2043,8 @@ class TelegramRenderer(Renderer):
         self._awaiting_approval = True
         rid = str(request_id)
         nonce = new_approval_nonce()
-        TelegramApprovalDecider.arm(TelegramApprovalDecider.key(self._session_key, rid), nonce)
+        key = TelegramApprovalDecider.key(self._session_key, rid)
+        TelegramApprovalDecider.arm(key, nonce)
         # Three choices, matching Slack's ladder: approve this one, trust the rest
         # of this session, or refuse. Without Trust every tool of an agentic turn
         # costs its own round-trip, which is what pushes an operator to global YOLO,
@@ -1897,13 +2088,38 @@ class TelegramRenderer(Renderer):
             if len(detail) > _APPROVAL_INPUT_CHARS:
                 detail = detail[: _APPROVAL_INPUT_CHARS - 1].rstrip() + "…"
             body = f"{body}\n<pre>{html.escape(detail)}</pre>"
-        await self._client.send_message(
-            self._chat_id,
-            body,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            message_thread_id=self._thread_id,
-        )
+        try:
+            posted = await self._client.send_message(
+                self._chat_id,
+                body,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                message_thread_id=self._thread_id,
+            )
+        except BaseException:
+            # The prompt never reached the chat, so nothing can be pressed and no
+            # wait will run the ``finally`` that normally closes this window.
+            # Retire it here instead of leaving a live nonce and reservation for a
+            # prompt nobody saw. Raised on, because a caller that swallowed this
+            # would leave the driver waiting out the whole window on an invisible
+            # prompt and then call that elapsed wait a decision.
+            TelegramApprovalDecider.retire(key)
+            raise
+        if not posted:
+            # This client reports a failed send by RETURNING no message id rather
+            # than by raising -- a revoked token, a chat it cannot write to, a
+            # deleted topic, a rate limit or 5xx past its retries -- so the
+            # ``except`` above does not cover it. Nothing is on screen to press,
+            # and the driver awaits the decision next, so record the refusal on the
+            # reservation it is about to adopt: it denies at once instead of
+            # spending the whole window on a prompt nobody can see and reporting
+            # that as an expiry.
+            TelegramApprovalDecider.refuse_undelivered(key)
+            logger.warning(
+                "Telegram: the approval prompt for %s was not accepted by the chat; "
+                "refusing the request rather than waiting it out",
+                rid,
+            )
 
     async def on_compaction(self, context_usage_pct: float) -> None:
         self._note_progress()
@@ -1964,6 +2180,7 @@ class TelegramRenderer(Renderer):
             # the user — attach it to the placeholder instead of dropping it.
             if self._seal_count > 0 and keyboard is None:
                 await self._post_thinking()
+                await self._maybe_send_redaction_notice()
                 return
             placeholder = "…" if ok else (self._failure_reason or _GENERIC_ERROR_TEXT)
             if self._stream_mid is not None:
@@ -1981,10 +2198,12 @@ class TelegramRenderer(Renderer):
                     message_thread_id=self._thread_id,
                 )
             await self._post_thinking()
+            await self._maybe_send_redaction_notice()
             return
         await self._seal_current(keyboard=keyboard, footer=self._turn_footer())
         # After the answer, so the answer is what the push notification previews.
         await self._post_thinking()
+        await self._maybe_send_redaction_notice()
 
     def _limit(self) -> int:
         """Budget for PLAINTEXT frames (live typewriter edits), in source chars.
@@ -2094,6 +2313,35 @@ class TelegramRenderer(Renderer):
             t = _neutralize_md(self._steer_texts[i])
             return f"> {t}" if t else None
         return None
+
+    def _tally_redactions(self, text: str) -> None:
+        """Record the redaction placeholders in one LANDED frame's final text."""
+        cred_count, url_count = count_redaction_tags(text)
+        self._redacted_creds += cred_count
+        self._redacted_urls += url_count
+
+    async def _maybe_send_redaction_notice(self) -> None:
+        """One best-effort notice for the whole turn, after its answer landed.
+
+        Best-effort by the shared contract: the answer is already out, so a
+        failed notice send is logged, never raised — losing the notice is a
+        degraded warning, failing the turn would discard a delivered reply.
+        Threaded like the answer so the notice lands under the reply it
+        describes rather than in the chat root.
+        """
+        if not (self._redacted_creds or self._redacted_urls):
+            return
+        try:
+            await self._client.send_message(
+                self._chat_id,
+                redaction_notice(self._redacted_creds, self._redacted_urls),
+                message_thread_id=self._thread_id,
+            )
+        except Exception:
+            logger.warning(
+                "telegram: could not deliver the redaction notice (answer already sent)",
+                exc_info=True,
+            )
 
     async def close(self, failure_reason: str | None = None) -> None:
         """Idempotent teardown: stop the typing indicator and finalize the turn

@@ -61,6 +61,8 @@ async def _status_frame(state: DashboardState) -> dict[str, Any]:
 SUBAGENT_REPLAY_BATCH_THRESHOLD = 8
 
 SIDE_RESULT_EVENT = "chat.side_result"
+#: A reply landing in a thread on a crewmate chat message (``chat_threads``).
+THREAD_REPLY_EVENT = "chat.thread_reply"
 SIDE_QUEUE_EVENT = "chat.side_queue"
 SIDE_KIND = "side"
 
@@ -206,6 +208,60 @@ def broadcast_side_result(
     # steer echoes are the owner's own conversation, and an app that asks the HTTP API
     # about a slot it does not own gets a 404.
     state.broadcast_ws_owners(SIDE_RESULT_EVENT, payload)
+
+
+def broadcast_thread_reply(
+    state: DashboardState,
+    *,
+    slot_key: str,
+    mid: str,
+    run_id: str,
+    role: str,
+    content: str,
+    is_error: bool = False,
+    final: bool = False,
+    ts: float | None = None,
+    reply: dict[str, object] | None = None,
+) -> None:
+    """Broadcast one frame of a reply thread (``dashboard/chat_threads.py``).
+
+    ``{type: "chat.thread_reply", data: payload}``: ``mid`` names the parent
+    message the thread hangs off, ``run_id`` groups the streamed deltas of one
+    crewmate reply, and the terminal frame (``final``) carries the stored
+    ``reply`` record so the panel can replace its streamed text with the row the
+    store holds. Owner-only, like the side chat: a thread is the owner's own
+    conversation. Same channel discipline as ``chat.side_result`` -- a receiver
+    that does not subscribe never sees it, so thread frames stay out of the main
+    transcript by construction.
+
+    Sent only while ``dashboard.crewmate_threads`` is on. The routes refuse
+    before any turn starts, so this guard covers the one turn that was already
+    running when the flag went off: its frames are dropped, and the reply it
+    stores is served again once the flag is back on. The watcher's snapshot is
+    the read (a plain attribute, never a disk load on the loop); before the
+    watcher has one, the frame is dropped too -- the flag is off by default and
+    a frame nobody can act on is the cheaper mistake.
+    """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None or not cfg.dashboard.crewmate_threads:
+        return
+    payload: dict[str, object] = {
+        "slot": slot_key,
+        "mid": mid,
+        "run_id": run_id,
+        "role": role,
+        "content": redact_credentials(redact_exfiltration_urls(content)[0])[0],
+        "ts": ts if ts is not None else time.time(),
+    }
+    if is_error:
+        payload["is_error"] = True
+    if final:
+        payload["final"] = True
+    if reply is not None:
+        payload["reply"] = reply
+    state.broadcast_ws_owners(THREAD_REPLY_EVENT, payload)
 
 
 def broadcast_side_queue(
@@ -550,6 +606,19 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             logger.warning("slots connect snapshot failed to serialize", exc_info=True)
             raise
         await ws.send_str(snapshot_payload)
+        # One-shot per-member event-log baseline, to THIS socket only, right
+        # after the connect snapshot and before any later broadcast can reach
+        # it -- so the client's held member_projection frames can be pruned
+        # against a lastSeqs baseline it received first. Owner surface only:
+        # app tokens never receive member_projection / members_subscribed (both
+        # are classified owner-only in ws_event_scope), so skip them here too.
+        if is_dashboard_user:
+            # Isolated: a failure to send this baseline must not take the
+            # provider refresh scheduling below down with it.
+            try:
+                await state.send_members_subscribed(ws)
+            except Exception:
+                logger.debug("members_subscribed baseline not sent", exc_info=True)
         if owner_request or is_dashboard_user:
             # Issue links carry no check status — skip them so the scheduler
             # never hands an issue URL to the pull-request-only chip fetch.

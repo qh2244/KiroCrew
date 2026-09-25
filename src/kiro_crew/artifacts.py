@@ -21,8 +21,19 @@ Security
 - Slugs are validated against ``_SLUG_RE`` to block path-traversal attempts.
 - All filesystem writes go through ``Path.resolve()`` + a parent-directory
   check to prevent escapes.
-- ``security.is_sensitive_path()`` is queried before any read/write, so the
-  store cannot accidentally land under ``~/.aws``, ``~/.ssh``, etc.
+- The sensitive-path fence is queried before any read/write, so the store
+  cannot accidentally land under ``~/.aws``, ``~/.ssh``, etc. The store's own
+  file helpers hand it the ``realpath`` they already computed through
+  ``security.is_sensitive_canonical_path()`` (see ``_fence_refuses``), which
+  answers off the event loop without a resolver-pool submission and with the
+  bounded ``security.is_sensitive_path()`` on the loop; the root check and the
+  source-file pointers ask the bounded gate directly.
+- Store reads are pinned to the descriptor they open
+  (``pinned_fs.open_fenced_for_read`` via ``_open_pinned_for_read``): the open
+  refuses a link at the final name, the inode must be a regular file with one
+  link, and the fence judges the kernel's own path for that inode when it
+  differs from the path already judged, so a swap between the check and the
+  open cannot redirect the read.
 - Tool invocations emit SEL audit events via ``sel().log_tool_invocation()``.
 
 The MCP tools (``artifact_save`` etc.) and HTTP handlers wrap this module --
@@ -45,10 +56,12 @@ from dataclasses import asdict, dataclass, field
 from dataclasses import fields as fields_of
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Iterator
 from typing import List as _List
+from typing import Mapping
 
-from kiro_crew import hooks
+from kiro_crew import hooks, pinned_fs
 from kiro_crew.artifact_source import is_verifiable_root
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.constants import ARTIFACT_MAX_CONTENT_BYTES
@@ -63,7 +76,7 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
 )
 from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.security import is_sensitive_canonical_path, is_sensitive_path
 from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
@@ -168,7 +181,7 @@ MAX_TAGS = 16
 # Slug pattern: lowercase letters, digits, hyphens. 1-80 chars. No leading or
 # trailing hyphen. Single-character slugs are allowed for trivial names.
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
-_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
+_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}\Z")
 _VERSION_FILE_RE = re.compile(r"^v(\d+)\.html$")
 _SLUG_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
@@ -205,6 +218,29 @@ class ArtifactStillPublishedError(ArtifactError):
     "not this one" instead of silently erasing that handle. Distinct from the base
     error so such a caller can separate "refused, and correctly" from a real failure.
     """
+
+
+class ArtifactReplacedError(ArtifactError):
+    """Raised when a slug does not hold the artifact generation the caller named.
+
+    A slug is a NAME, not an identity: :meth:`ArtifactStore._unique_slug` re-mints a
+    freed slug identically, so an artifact created under the same title after an
+    earlier one at that slug is gone lands on exactly that slug. A caller that decided
+    what to do while holding a slug therefore has to say WHICH artifact it decided
+    about, and ``created_at`` is that generation stamp.
+
+    Passing ``expect_created_at`` asks for the decision to be re-checked against the
+    record under the store lock; this is raised instead of acting when a different
+    generation now answers to the name. Distinct from the base error so a caller can
+    separate "a replacement arrived, so I left it alone" from a real failure -- the
+    replacement is a live artifact nobody asked to destroy.
+    """
+
+
+#: The empty generation map -- the default for :meth:`ArtifactFolderStore.delete`'s
+#: ``destroyable_generations``, naming no artifact as safe to destroy. Immutable because
+#: a shared mutable default is one caller away from vouching for another's artifacts.
+_NO_GENERATIONS: "Mapping[str, str]" = MappingProxyType({})
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -334,6 +370,49 @@ class ArtifactComment:
     # Transient: set on inbound provider mirrors that came back as tombstones so
     # merge_remote_comments can drop the local copy. Never persisted.
     deleted: bool = False
+
+
+def filter_comments_for_forward(
+    comments: _List["ArtifactComment"],
+) -> _List["ArtifactComment"]:
+    """Canonical comment-forwarding filter (comment→chat replay fix).
+
+    The single source of truth for which comments get *forwarded/counted* when
+    an artifact's feedback is sent into chat, so the UI count, the side-panel
+    submit and the agent's read all agree.
+
+    Evaluated at **thread-root granularity**: a reply inherits its root's
+    status, so resolving a thread drops the whole thread rather than leaving
+    replies whose parent is gone.
+
+    A resolved thread is the only thing dropped. Staleness is deliberately NOT
+    inferred from the anchor version: a comment anchored to an older version
+    whose quoted span still exists is live feedback nobody has addressed, and
+    dropping it would silently stop forwarding a thread the sidebar still shows
+    as open. ``anchor_orphaned`` already marks the genuinely stale case (the
+    quote is gone) and the UI warns on it, so that call stays with the human.
+    """
+    by_id = {c.id: c for c in comments}
+
+    def root_of(c: "ArtifactComment") -> "ArtifactComment":
+        # ``thread_id`` names the root directly (a root's is its own id), so it
+        # is the first choice: a nested reply whose *immediate* parent has been
+        # deleted still names its root, which a parent walk cannot reach.
+        root = by_id.get(c.thread_id)
+        if root is not None:
+            return root
+        # Fall back to the parent walk when thread_id resolves to nothing (the
+        # field defaults to ""). The `seen` set terminates a parent cycle; a
+        # parent missing from the list ends the walk, leaving the comment its
+        # own root.
+        seen: set[str] = set()
+        cur = c
+        while cur.parent_id and cur.parent_id in by_id and cur.parent_id not in seen:
+            seen.add(cur.id)
+            cur = by_id[cur.parent_id]
+        return cur
+
+    return [c for c in comments if root_of(c).status != "resolved"]
 
 
 @dataclass
@@ -581,10 +660,48 @@ def slugify(name: str) -> str:
     return text[:80].rstrip("-") or slug_hash_fallback(name, "artifact")
 
 
+class _ExpectAbsent:
+    """Sentinel for ``expect_created_at``: the caller read this slug as holding NOTHING.
+
+    ``None`` there means "I have no generation to compare", which is the honest answer for
+    a caller that never resolved the artifact -- and it disables the check. A delete that
+    read the slug as ABSENT needs the opposite: any artifact present by the time the lock
+    is held appeared after that read, so it is one nobody asked to delete. Those are two
+    different statements and a single ``None`` cannot carry both, which is why absence gets
+    its own value rather than sharing one.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover -- diagnostics only
+        return "EXPECT_ABSENT"
+
+
+#: The value a caller passes as ``expect_created_at`` when it read the slug as empty.
+EXPECT_ABSENT = _ExpectAbsent()
+
+
 def _validate_slug(slug: str) -> str:
     if not isinstance(slug, str) or not _SLUG_RE.match(slug):
         raise ArtifactValidationError(f"invalid slug {slug!r}: must match {_SLUG_RE.pattern}")
     return slug
+
+
+def slug_is_well_formed(slug: str) -> bool:
+    """Whether this string could name an artifact, said without asking whether one exists.
+
+    Defined on top of the same validator every store method applies, so a caller deciding
+    what to do with a slug the store has not resolved cannot disagree with the store about
+    which strings are slugs at all. The publication guard needs exactly this question: an
+    artifact created inside a delete's own window has no record to resolve, so the guard has
+    to be taken on the NAME, while a malformed name is still passed through unguarded so the
+    store can answer for it.
+    """
+    try:
+        _validate_slug(slug)
+    except ArtifactValidationError:
+        return False
+    return True
 
 
 #: Kinds a HUMAN may select for an artifact from the dashboard's type control.
@@ -1093,6 +1210,46 @@ def _lock_for_root(root: Path) -> threading.Lock:
             lock = threading.Lock()
             _root_locks[key] = lock
         return lock
+
+
+def _fence_refuses(resolved: Path) -> bool:
+    """Ask the sensitive-path fence about a path the store already canonicalised.
+
+    *resolved* MUST be the output of ``os.path.realpath`` computed by the caller
+    on the line above, in the same function: that is the precondition of
+    ``security.is_sensitive_canonical_path`` (see its docstring), and the
+    store's file helpers are pinned to it by ``test_artifacts_pathres.py``.
+
+    Which gate answers is the shared entry point's decision, by thread: off the
+    event loop -- a ``run_in_executor`` / ``to_thread`` worker, or a plain
+    synchronous caller -- the pre-resolved gate answers with no ``mc-pathres``
+    submission. ``list()`` reaches this once per ``meta.json``, and the bounded
+    gate costs two pool hops per call, so a listing over a few hundred
+    artifacts would fill the two-worker pool with resolutions of paths this
+    store has already canonicalised; the fail-closed stall then reads as a
+    sensitive-path refusal and drops healthy artifacts from the listing. On the
+    loop the bounded gate stays in place, so an on-loop store call behaves as
+    it always has, and a caller earns the off-pool gate by offloading, never by
+    declaring anything.
+    """
+    return is_sensitive_canonical_path(str(resolved))
+
+
+def _open_pinned_for_read(resolved: Path) -> int:
+    """Open a store file for reading, pinned to the descriptor it returns.
+
+    *resolved* is a path the caller has already canonicalised and judged with
+    :func:`_fence_refuses`. :func:`pinned_fs.open_fenced_for_read` refuses a
+    link at the final component, requires a regular file with a single link,
+    and asks :func:`_fence_refuses` about the kernel's own path for the opened
+    inode exactly when that path differs from the judged one. Refusals raise
+    :class:`ArtifactError`; a missing file raises ``FileNotFoundError``.
+    """
+    return pinned_fs.open_fenced_for_read(
+        resolved,
+        fence=lambda fd_real: _fence_refuses(Path(fd_real)),
+        refusal=ArtifactError,
+    )
 
 
 class ArtifactStore:
@@ -2232,7 +2389,13 @@ class ArtifactStore:
         art.updated_at = _now_iso()
         self._write_meta(art)
 
-    def delete(self, slug: str, *, refuse_if_published: bool = False) -> None:
+    def delete(
+        self,
+        slug: str,
+        *,
+        refuse_if_published: bool = False,
+        expect_created_at: "str | _ExpectAbsent | None" = None,
+    ) -> None:
         """Permanently delete an artifact and all of its versions.
 
         ``refuse_if_published`` raises :class:`ArtifactStillPublishedError` instead of
@@ -2249,20 +2412,51 @@ class ArtifactStore:
         withdrew but did NOT clear would be refused on every published artifact, which is
         why the flag is off by default rather than always on.
 
-        The check runs inside the same lock as the removal, so unlike a pre-pass it
-        cannot be overtaken by a publish landing after the decision and before the
-        delete -- which is the whole reason the flag is here rather than at the caller.
+        ``expect_created_at`` names the artifact GENERATION the caller decided to destroy,
+        and raises :class:`ArtifactReplacedError` when the slug now holds a different one.
+        A caller that decided over a slug alone is not naming an artifact: a freed slug is
+        re-minted identically, so between a caller's decision and this call the artifact it
+        meant can be gone and a same-titled newcomer can hold the name. Destroying that
+        newcomer is unrecoverable and, reported as an ordinary deletion, is
+        indistinguishable from the intended victim. Any caller whose decision is older
+        than this call -- one that awaited anything, a bulk pass working from a snapshot --
+        passes it; a caller acting on a record it just read does not need to.
+
+        Pass :data:`EXPECT_ABSENT` for the case a generation cannot express: the caller read
+        this slug as holding NOTHING. Reaching the check below then means an artifact
+        appeared after that read, so it is one nobody asked to delete and this refuses
+        instead. ``None`` remains "no generation to compare", which performs no check, and
+        the two are deliberately separate values rather than one overloaded ``None``.
+
+        Both checks run inside the same lock as the removal, so unlike a pre-pass neither
+        can be overtaken by a publish or a recreation landing after the decision and
+        before the delete -- which is the whole reason they are here rather than at the
+        caller.
         """
         slug = _validate_slug(slug)
         with self._lock:
             adir = self._artifact_dir(slug)
             if not adir.exists():
                 raise ArtifactNotFoundError(f"artifact not found: {slug}")
-            if refuse_if_published:
+            if isinstance(expect_created_at, _ExpectAbsent):
+                raise ArtifactReplacedError(
+                    f"artifact {slug} exists, and the caller read this slug as empty: it "
+                    "was created after that read, so deleting it would destroy an "
+                    "artifact nobody asked to delete"
+                )
+            if refuse_if_published or expect_created_at is not None:
                 # Deliberately re-read under the lock rather than trusting anything the
                 # caller passed in. `_load_meta` does not take this lock (meta reads are
                 # unlocked by design), so this cannot deadlock.
-                if self._load_meta(slug).publication is not None:
+                meta = self._load_meta(slug)
+                if expect_created_at is not None and meta.created_at != expect_created_at:
+                    raise ArtifactReplacedError(
+                        f"artifact {slug} was created at {meta.created_at!r}, not "
+                        f"{expect_created_at!r}: the artifact under this slug was "
+                        "replaced, so deleting it would destroy one nobody asked to "
+                        "delete"
+                    )
+                if refuse_if_published and meta.publication is not None:
                     raise ArtifactStillPublishedError(
                         f"artifact {slug} is still published; withdraw the published "
                         "copy before deleting it, or its record -- the only handle able "
@@ -2776,11 +2970,52 @@ class ArtifactStore:
             )
             return art
 
-    def clear_publication(self, slug: str) -> Artifact:
-        """Remove an artifact's publication block (after unpublish/delete)."""
+    def clear_publication(
+        self,
+        slug: str,
+        *,
+        expect_created_at: str | None = None,
+        expect_publication_id: str | None = None,
+    ) -> Artifact:
+        """Remove an artifact's publication block (after unpublish/delete).
+
+        ``expect_created_at`` names the artifact GENERATION whose copy the caller
+        withdrew, and raises :class:`ArtifactReplacedError` instead of clearing when the
+        slug now holds a different one. A withdrawal is a network round trip, so a caller
+        clearing afterwards is acting on a slug it read before that wait: if the artifact
+        it withdrew is gone and a same-titled newcomer holds the name, clearing here
+        erases the NEWCOMER's record -- the only handle able to withdraw a copy that is
+        still served.
+
+        ``expect_publication_id`` names the PUBLICATION whose copy came down, and is the
+        check that actually decides it. The generation alone cannot: :meth:`set_publication`
+        replaces the publication block and leaves ``created_at`` untouched, so the same
+        artifact re-published during that same round trip carries an unchanged stamp and a
+        brand-new live copy. Matching the record's own ``artifact_id`` is what tells the
+        record the caller withdrew from a record it has never seen.
+
+        Every caller that clears after awaiting anything passes BOTH, and both are compared
+        here rather than at the caller because only this lock also performs the write.
+        """
         slug = _validate_slug(slug)
         with self._lock:
             art = self._load_meta(slug)
+            if expect_created_at is not None and art.created_at != expect_created_at:
+                raise ArtifactReplacedError(
+                    f"artifact {slug} was created at {art.created_at!r}, not "
+                    f"{expect_created_at!r}: the artifact under this slug was replaced, "
+                    "so clearing its publication would discard the only handle able to "
+                    "withdraw a copy nobody asked to unpublish"
+                )
+            if expect_publication_id is not None:
+                current = art.publication.artifact_id if art.publication else None
+                if current != expect_publication_id:
+                    raise ArtifactReplacedError(
+                        f"artifact {slug} is published as {current!r}, not "
+                        f"{expect_publication_id!r}: the record under this slug names a "
+                        "different copy, so clearing it would discard the only handle "
+                        "able to withdraw a copy nobody asked to unpublish"
+                    )
             art.publication = None
             self._write_meta(art)
             logger.info("artifact publication cleared: slug=%s", slug)
@@ -3218,10 +3453,11 @@ class ArtifactStore:
     def _snapshot_version(self, slug: str, version: int, src: Path) -> None:
         target = self._artifact_dir(slug) / "versions" / f"v{version}.html"
         # Defense in depth: route the read through the gated helper so the
-        # is_sensitive_path() check fires on every filesystem read, even when
+        # sensitive-path check fires on every filesystem read, even when
         # ``src`` is a store-internal path constructed by the store itself.
-        # Per the security-controls rule: all file reads must go through
-        # hooks.py which enforces is_sensitive_path().
+        # Per security rule 1: a read either goes through hooks.py or, as
+        # here, asks ``is_sensitive_canonical_path`` on the canonicalised
+        # path and opens through ``pinned_fs.open_fenced_for_read``.
         self._write_text(target, self._read_text(src))
 
     def _write_meta(self, art: Artifact) -> None:
@@ -3509,14 +3745,31 @@ class ArtifactStore:
         )
 
     def _read_text(self, path: Path) -> str:
+        """Read a store-internal text file through a pinned descriptor.
+
+        The fence is asked with the ``realpath`` computed on the line above (see
+        :func:`_fence_refuses` for which gate answers, and why). The opened
+        descriptor is checked again so a replacement at the final name cannot
+        redirect the read after that first decision.
+        """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to read sensitive path: {resolved}")
-        return resolved.read_text(encoding="utf-8")
+        fd = _open_pinned_for_read(resolved)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            return fh.read()
 
     def _write_text(self, path: Path, text: str) -> None:
+        """Atomically write a store-internal file through the sensitive-path fence.
+
+        Same fence and same precondition as :meth:`_read_text`. This is the
+        read+write fence (``_SENSITIVE_HOME_DIRS`` plus the keystone publish
+        artifacts): the write-only superset ``is_sensitive_write_path`` guards the
+        agent's file-edit tool, has no pre-resolved form, and adopting it here
+        would change the decision rather than the submission path.
+        """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to write sensitive path: {resolved}")
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: tmp file + rename.
@@ -3527,13 +3780,14 @@ class ArtifactStore:
     def _read_bytes(self, path: Path) -> bytes:
         """Binary sibling of :meth:`_read_text` (image asset reads).
 
-        Same sensitive-path gate — every store read, text or binary, must pass
-        ``is_sensitive_path`` per the security-controls rule.
+        Same sensitive-path gate and the same descriptor checks as text reads.
         """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to read sensitive path: {resolved}")
-        return resolved.read_bytes()
+        fd = _open_pinned_for_read(resolved)
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read()
 
     def _read_image_asset_bytes(self, path: Path) -> bytes:
         """Read an image sidecar with the open descriptor as the unit of trust.
@@ -3574,7 +3828,7 @@ class ArtifactStore:
         never observes a half-written asset.
         """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to write sensitive path: {resolved}")
         resolved.parent.mkdir(parents=True, exist_ok=True)
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")
@@ -4064,6 +4318,7 @@ class ArtifactFolderStore:
         *,
         delete_contents: bool,
         artifact_store: "ArtifactStore",
+        destroyable_generations: "Mapping[str, str]" = _NO_GENERATIONS,
     ) -> dict[str, Any]:
         """Delete a folder. ``delete_contents`` picks the semantics:
 
@@ -4073,6 +4328,32 @@ class ArtifactFolderStore:
         * **True (cascade)** — permanently delete the whole subtree: every
           descendant artifact (via the guarded :meth:`ArtifactStore.delete`)
           and every descendant folder.
+
+        ``destroyable_generations`` maps the slug of each artifact the caller has made
+        safe to destroy to that artifact's ``created_at``. A descendant whose slug is
+        absent is left in place and reported under ``unguarded_artifact_slugs``; one whose
+        slug is present but whose stamp differs is a REPLACEMENT and is left in place and
+        reported under ``replaced_artifact_slugs``. It defaults to EMPTY rather than to
+        everything, so a cascade whose caller forgot to name its victims empties nothing
+        and says which artifacts it left, instead of destroying a subtree nobody vouched
+        for. Unread when ``delete_contents`` is false, which destroys no artifact at all.
+
+        A slug is not an identity, which is why the stamp travels with it: the caller draws
+        this map up before withdrawing published copies, that withdrawal awaits the
+        network per copy, and a freed slug is re-minted identically. So an artifact the
+        caller named can be deleted and a same-titled newcomer can take the name while the
+        pass runs, and a slug-only map would match the newcomer and destroy it with no
+        undo -- reported as an ordinary deletion, indistinguishable from the intended
+        victim.
+
+        The caller holding each listed artifact's publication guard is what makes the
+        map meaningful: a first publish uploads its object before writing the
+        record naming it, so ``refuse_if_published`` below cannot see one that is
+        in flight, and an artifact filed into this subtree after the caller drew
+        up its list is exactly the artifact whose publish this store cannot
+        observe. Leaving it alone costs a folder that does not fully empty, which
+        the owner deletes again; destroying it can strand a world-readable copy
+        whose only handle goes with it.
 
         Returns a summary dict describing what changed.
         """
@@ -4146,14 +4427,49 @@ class ArtifactFolderStore:
         deleted_slugs: _List[str] = []
         reparented_slugs: _List[str] = []
         kept_published_slugs: _List[str] = []
+        unguarded_slugs: _List[str] = []
+        replaced_slugs: _List[str] = []
         for art in artifact_store.list():
             fid = getattr(art, "folder_id", "") or ""
             if fid not in affected_ids:
                 continue
             if delete_contents:
+                expect = destroyable_generations.get(art.slug)
+                if expect is None:
+                    # Filed into this subtree after the caller drew up its guarded set, so
+                    # its publication state is the one thing this store cannot settle: the
+                    # only evidence here is a record, and a first publish in flight has
+                    # uploaded its object and written none. It survives either way, which
+                    # degrades it to Unfiled exactly as a kept artifact does; the record
+                    # decides only which list reports it, so one that IS published keeps
+                    # the report it already had and only the unknown case is separate.
+                    if art.publication is not None:
+                        kept_published_slugs.append(art.slug)
+                    else:
+                        unguarded_slugs.append(art.slug)
+                    logger.warning(
+                        "cascade left %s alone: it joined the subtree outside the "
+                        "caller's guarded set, so a publish in flight for it cannot be "
+                        "ruled out",
+                        art.slug,
+                    )
+                    continue
                 try:
-                    artifact_store.delete(art.slug, refuse_if_published=True)
+                    artifact_store.delete(
+                        art.slug, refuse_if_published=True, expect_created_at=expect
+                    )
                     deleted_slugs.append(art.slug)
+                except ArtifactReplacedError:
+                    # The artifact the caller named is already gone and a newcomer holds
+                    # its slug. Nobody asked for the newcomer to be destroyed, and the
+                    # removal has no undo, so it survives unfiled like a kept one.
+                    replaced_slugs.append(art.slug)
+                    logger.warning(
+                        "cascade kept %s: the artifact under this slug was replaced "
+                        "after the caller named it, so destroying it would take one "
+                        "nobody asked to delete",
+                        art.slug,
+                    )
                 except ArtifactStillPublishedError:
                     kept_published_slugs.append(art.slug)
                     logger.warning(
@@ -4177,6 +4493,8 @@ class ArtifactFolderStore:
             "deleted_folder_ids": sorted(affected_ids),
             "deleted_artifact_slugs": deleted_slugs,
             "kept_published_artifact_slugs": kept_published_slugs,
+            "unguarded_artifact_slugs": unguarded_slugs,
+            "replaced_artifact_slugs": replaced_slugs,
             "reparented_artifact_slugs": reparented_slugs,
             "reparented_to": parent,
             "delete_contents": delete_contents,

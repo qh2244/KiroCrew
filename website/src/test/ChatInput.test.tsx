@@ -379,6 +379,29 @@ describe('ChatInput', () => {
       renderWithProviders(<ChatInput {...defaultProps} isMac onUploadFiles={vi.fn()} onScreenshot={vi.fn()} uploading />)
       expect(screen.getByTitle('Add files & options')).toBeDisabled()
     })
+
+    /* #5744: while an upload is in flight every attach entry point is
+     * disabled, so without this control the only way out of a slow transfer
+     * is reloading the page. */
+    it('offers a cancel control only while uploading', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    it('renders no cancel control when the host passes no onCancelUpload', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+    })
+
+    it('calls onCancelUpload when the cancel control is pressed', () => {
+      const onCancelUpload = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
+      expect(onCancelUpload).toHaveBeenCalledTimes(1)
+    })
   })
 
   describe('drag-to-resize handle', () => {
@@ -1304,6 +1327,31 @@ describe('ChatInput', () => {
       fireEvent.click(btn)
       expect(onSend).toHaveBeenCalled()
       expect(onStop).not.toHaveBeenCalled()
+    })
+
+    it('disables the Queue message button, with the offline label, when the gateway drops mid-turn', () => {
+      // The idle Send button already pairs `!connected` with offlineProps; the
+      // mid-turn controls must not render enabled with their normal tooltip and
+      // then do nothing (the central `fireComposer` guard would swallow the press).
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="more" isRunning onStop={vi.fn()} onSend={onSend} connected={false} />)
+      const btn = screen.getByRole('button', { name: /Queue message disabled/ })
+      expect(btn).toBeDisabled()
+      expect(btn).toHaveAttribute('title', 'Gateway offline — reconnect to send')
+      fireEvent.click(btn)
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('disables the split button\'s fire half when the gateway drops mid-turn, and keeps the mode caret live', () => {
+      const onSteer = vi.fn()
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="more" isRunning canSteer onStop={vi.fn()} onSend={onSend} onSteer={onSteer} connected={false} />)
+      const fire = screen.getByTestId('busy-send-button')
+      expect(fire).toBeDisabled()
+      fireEvent.click(fire)
+      expect(onSteer).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      expect(screen.getByTestId('busy-send-caret')).not.toBeDisabled()
     })
   })
 

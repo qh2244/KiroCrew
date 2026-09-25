@@ -71,6 +71,8 @@ from kiro_crew.acp.client import (
     parse_slash_command,
     pick_served_default,
     prompt_timeout_for_ceiling,
+    registration_rate_limited_error,
+    registration_throttle_line,
     resolve_usable_model,
 )
 from kiro_crew.acp.liveness import (
@@ -98,6 +100,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
@@ -167,6 +170,22 @@ from kiro_crew.sel import sel
 from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
 
 logger = logging.getLogger(__name__)
+
+#: Hook executions one session may have running at once. A hook runs for up to
+#: its own timeout, so this bounds the processes a peer can hold open.
+_MAX_INFLIGHT_HOOK_EXECUTIONS = 4
+
+#: The backend's hooks requests, answered by
+#: :meth:`AcpSessionHandle._answer_kas_hooks_request`. A frozenset so the
+#: dispatch test is one membership check. ``executeHook`` is the one that runs a
+#: command, and :func:`kas_wire.hooks_execute` owns every gate it passes.
+_KAS_HOOKS_METHODS = frozenset(
+    {
+        kas_wire.METHOD_HOOKS_LIST,
+        kas_wire.METHOD_HOOKS_SESSION_START,
+        kas_wire.METHOD_HOOKS_EXECUTE,
+    }
+)
 
 # ── Constants ──
 
@@ -661,6 +680,43 @@ class AcpRequestTimeout(AcpRuntimeError):
 
     transient = True
 
+    # Whether this timeout happened while STARTING a session (``session/new`` /
+    # ``session/load`` / ``session/resume``) rather than on any other
+    # control-plane request. Carried on the type, and mirrored by
+    # ``AcpError.session_start_failed`` on the dedicated-client path, so a
+    # self-driving caller can count "my cycle never got a session" without
+    # matching on message wording. Read structurally with ``getattr``: the two
+    # exception families do not share a base, and only the raise sites that know
+    # the method set it True.
+    session_start_failed = False
+
+
+class AcpRuntimeOverloaded(AcpRequestTimeout):
+    """``initialize`` went unanswered while the agents slice was being throttled.
+
+    A cold start under the aggregate memory ceiling is slow, not broken: the
+    kernel is throttling every process in ``kirocrew-agents.slice``, so a
+    healthy kiro-cli can take longer than any fixed handshake budget to answer
+    ``initialize``. Raised only when the process was still ALIVE at the
+    deadline and the slice was throttling -- a process that exited, or a stall
+    on an unthrottled host, stays a plain :class:`AcpRequestTimeout`.
+
+    Subclasses the timeout so every ``except AcpRequestTimeout`` /
+    ``except AcpRuntimeError`` handler keeps working. What the subclass
+    changes is the retry verdict: ``transient = False``. The parent's
+    ``True`` says "host weather, try again", and every retry layer reads it
+    structurally (``llm_helpers.acp_error_is_transient``, the taskq
+    ``acp_provider`` classifier), so an inherited ``True`` would respawn a
+    fresh kiro-cli straight back into the same throttled slice -- each retry
+    pays the whole startup again and deepens the throttle it is waiting on.
+    Overload is the one timeout where the remedy is NOT to retry: it is to
+    reduce concurrent agent memory (close idle sessions, fewer parallel
+    subagents), and the message names that remedy so the failure surfaces as
+    overload rather than as a crash to debug.
+    """
+
+    transient = False
+
 
 class AcpRuntimeProtocol(Protocol):
     """Minimal interface that AcpSessionHandle needs from AcpRuntime."""
@@ -768,8 +824,20 @@ class AcpSessionHandle:
         runtime: AcpRuntimeProtocol,
         watchdog: WatchdogSettings | None = None,
         crew_agent: str = "",
+        session_key: str = "",
     ) -> None:
         self._session_id = session_id
+        # The Kiro Crew session that OWNS this ACP session, threaded from the
+        # runtime's create/load paths the way ``crew_agent`` is, and rebound on a
+        # warm-pool claim. The hooks execute path keys its listed-id record and
+        # its governance resolution by it; the ACP ``sessionId`` a request names is
+        # host-supplied and is never used for either. Empty for a pooled session
+        # nobody has claimed yet, which the execute path refuses.
+        self._session_key = session_key
+        self._listed_hooks = kas_wire.ListedHookStore()
+        # Strong references to in-flight hook executions: the loop holds only a
+        # weak one, and a collected task would leave its request unanswered.
+        self._hook_tasks: set[asyncio.Task[None]] = set()
         self.native_context_documents: dict[str, str] = {}
         self._queue = queue
         self._runtime = runtime
@@ -861,6 +929,15 @@ class AcpSessionHandle:
         self._turn_done = asyncio.Event()
         self._turn_done.set()
         self._stale_eligible = False
+        # Latched on this session's FIRST text chunk or tool_call and never
+        # cleared: the registration-throttle death classification is refused
+        # once work has been observed, so the transient verdict it hands the
+        # retry ladders can only ever license replaying a session that provably
+        # did nothing. Per SESSION, not per turn or per process — replay safety
+        # is a fact about what THIS session's consumer may re-run, and the
+        # process-level fact (a stale throttle line in a shared runtime's ring)
+        # must not license replaying a sibling that already acted.
+        self._prompt_or_tool_seen = False
         # Set when a genuine stale turn is probed via session/cancel; read by the
         # unresponsive-cancel branch to distinguish a confirmed wedge (signal
         # auto-recovery) from an ordinary unacked cancel (unblock caller).
@@ -1008,6 +1085,18 @@ class AcpSessionHandle:
     def session_id(self) -> str:
         return self._session_id
 
+    @property
+    def prompt_or_tool_seen(self) -> bool:
+        """True once this session observed a text chunk or a tool call.
+
+        The registration-throttle death classification reads it (here and in
+        ``AcpSessionProvider._translate_dead``): the transient verdict may only
+        license replaying a session that provably produced no output and ran no
+        tool, so the window closes at the first observed event and never
+        reopens.
+        """
+        return self._prompt_or_tool_seen
+
     def _died(self, base: str) -> AcpProcessDied:
         """Build an AcpProcessDied carrying the runtime's death attribution.
 
@@ -1017,7 +1106,23 @@ class AcpSessionHandle:
         unattributed mid-turn deaths in five days were undiagnosable from the
         bare message alone. ``getattr``-guarded so a minimal runtime double
         without ``death_summary`` degrades to the bare message.
+
+        A death whose retained stderr shows a throttled dynamic registration
+        returns the typed transient subclass instead of the generic death — but
+        only while this session has seen NO text chunk and NO tool call
+        (``prompt_or_tool_seen``). A stale throttle line surviving in the ring
+        past real work must not hand the retry ladders a transient verdict for
+        a session whose replay could repeat side effects. The tail is read as
+        LINES (``redacted_stderr_tail``), because the summary folds them behind
+        a prefix that a per-line signature cannot match — the same reason the
+        sandbox corroboration reads it. The typed message keeps one retained
+        cause instead of the tail's repeated copies.
         """
+        if not self._prompt_or_tool_seen:
+            tail = getattr(self._runtime, "redacted_stderr_tail", lambda: "")()
+            cause = registration_throttle_line(tail) if tail else None
+            if cause is not None:
+                return registration_rate_limited_error(base, cause)
         summary = getattr(self._runtime, "death_summary", lambda: None)()
         return AcpProcessDied(f"{base} — {summary}" if summary else base)
 
@@ -1676,6 +1781,7 @@ class AcpSessionHandle:
         """
         self._stale_probe = _stale_probe
         self._cancelled = True
+        self._cancel_hook_tasks()
         self._cancel_ts = time.monotonic()
         self._cancel_grace_secs = max(_CANCEL_GRACE_SECS, grace_secs)
         # cancel is a JSON-RPC notification (no id, no response) — use
@@ -2668,6 +2774,15 @@ class AcpSessionHandle:
         self._watchdog = settings if settings is not None else _load_watchdog_settings(crew_agent)
         self._oracle._sample_min_secs = self._watchdog.wellness_sample_secs
 
+    def bind_session_key(self, session_key: str) -> None:
+        """Rebind the owning Kiro Crew session on a warm-pool claim.
+
+        The listed-hook record is keyed by that session, so ids listed before the
+        claim are unreachable from the new key, and its next list answer replaces
+        them.
+        """
+        self._session_key = session_key
+
     def store_session_config(self, resp: dict[str, Any]) -> None:
         """Extract configOptions and available models from session/new or session/load response.
 
@@ -2877,6 +2992,7 @@ class AcpSessionHandle:
         # sequential form skipped the cleanup on the path that produces the most
         # of these files, and every survivor is permanent: nothing else deletes
         # an ephemeral session's transcript.
+        self._cancel_hook_tasks()
         try:
             await self._runtime.terminate_session(self._session_id)
         finally:
@@ -3561,6 +3677,22 @@ class AcpSessionHandle:
                         logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
                     continue
 
+                # The backend's hooks requests, answered here rather
+                # than through the shared classifier: that classifier is also read
+                # by the single-session client, which serves no hooks surface, and
+                # naming an action there that only this loop handles would leave
+                # the request unanswered on that path instead of refused.
+                #
+                # Gated on the capability set, not on the method name alone. This
+                # loop is shared by every backend the runtime demuxes, and only one
+                # of them defines this channel -- the answers carry
+                # operator-authored hook commands, so a backend that never asked for
+                # the surface is answered -32601 like any other method it does not
+                # serve.
+                if self._is_kas_hooks_request(msg):
+                    await self._answer_kas_hooks_request(msg)
+                    continue
+
                 # Dispatch by method
                 action = self._classify(msg)
 
@@ -3826,6 +3958,11 @@ class AcpSessionHandle:
                     if own_session:
                         continue
                     if ssid and tcid:
+                        # A child's tool call is this session's side effect for
+                        # replay purposes, whichever spelling carried it: close
+                        # the registration-throttle window here exactly as the
+                        # plain-spelling route does.
+                        self._prompt_or_tool_seen = True
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
                             sub_session_id=ssid,
@@ -3833,6 +3970,10 @@ class AcpSessionHandle:
                             title=redact_text(str(upd.get("title") or "")),
                         )
                     elif ssid and su_text and su_kind == "agent_message_chunk" and not _su_thinking:
+                        # A child's streamed text closes the window too: work
+                        # was observed, and a child whose tool frame was lost or
+                        # differently spelled must not read as "did nothing".
+                        self._prompt_or_tool_seen = True
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
                             sub_session_id=ssid,
@@ -4056,8 +4197,9 @@ class AcpSessionHandle:
             rec = get_recorder()
             rec.counter("kirocrew.watchdog.action", attrs=attrs)
             # ms, like every other kirocrew duration histogram: the dashboard's
-            # generic aggregation reports all histograms under *_ms keys, so a
-            # seconds-unit instrument would render 1000x off there.
+            # generic aggregation reports a histogram under *_ms keys unless its
+            # emitting module declares a non-millisecond unit for it, and this
+            # one declares none, so a seconds-unit value would render 1000x off.
             rec.histogram(
                 "kirocrew.watchdog.idle.duration",
                 float(idle) * 1000.0,
@@ -4455,6 +4597,131 @@ class AcpSessionHandle:
         """Classify a notification message into an action string."""
         return classify_notification(msg)
 
+    def _is_kas_hooks_request(self, msg: JsonRpcMessage) -> bool:
+        """Whether this frame is a hooks request THIS session may answer.
+
+        A named predicate rather than an inline condition, so the backend clause
+        has a test that fails when it is removed: asserting the membership set's
+        contents cannot catch a deleted membership CHECK, and the check is the part
+        that keeps operator-authored hook commands away from a backend that never
+        defined the channel.
+
+        Five conditions, all required: the frame is a request (it carries an id and
+        so needs a response), its method is a string, that string is one of the
+        hooks methods, this session's backend is in the capability set, and -- for
+        ``executeHook``, the one that runs a command -- the handshake announced
+        hooks. The type check is load-bearing, not defensive: ``method`` carries
+        whatever the peer put on the wire, and a JSON list or object there makes the
+        membership test raise :class:`TypeError` inside the dispatch loop.
+
+        The announce clause keeps the execute path dark in fact, not only by hint:
+        a backend that sends ``executeHook`` unasked is answered ``-32601`` like any
+        method it was never offered.
+        """
+        return (
+            msg.id is not None
+            and isinstance(msg.method, str)
+            and msg.method in _KAS_HOOKS_METHODS
+            and self._runtime.acp_backend in ACP_BACKENDS_HOOKS_LIST
+            and (msg.method != kas_wire.METHOD_HOOKS_EXECUTE or kas_wire.hooks_announced())
+        )
+
+    async def _answer_kas_hooks_request(self, msg: JsonRpcMessage) -> None:
+        """Answer one hooks request from the backend.
+
+        The answers are built in :mod:`kiro_crew.acp.kas_wire`, which owns the
+        shapes; this is the route that carries them.
+
+        ``list`` and ``sessionStart`` stay on this loop: each reads an in-memory
+        dict and nothing else, so a thread hop would buy nothing. ``list`` records
+        what it answered under this handle's OWNING session, which is the record
+        ``executeHook`` checks.
+
+        ``executeHook`` runs as a task of its own. It waits on a subprocess for up
+        to the hook's timeout, and this loop demuxes every frame of the turn --
+        including the cancel that would end it.
+        """
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if msg.method == kas_wire.METHOD_HOOKS_EXECUTE:
+            if len(self._hook_tasks) >= _MAX_INFLIGHT_HOOK_EXECUTIONS:
+                # Refused before a task exists, so a flood of execute frames
+                # holds a bounded number of hook processes, never one per frame.
+                # Audited like every other refusal on this path.
+                reason = "too many hooks already running"
+                await asyncio.to_thread(
+                    kas_wire.audit_execute_refusal,
+                    self._session_key,
+                    self._crew_agent,
+                    params,
+                    reason,
+                )
+                await self._send_hook_error(msg.id, f"Refused by Kiro Crew: {reason}")
+                return
+            task = asyncio.create_task(self._answer_kas_hook_execute(msg.id, params))
+            self._hook_tasks.add(task)
+            task.add_done_callback(self._hook_tasks.discard)
+            return
+        if msg.method == kas_wire.METHOD_HOOKS_LIST:
+            result = kas_wire.hooks_list_response(
+                params, session_key=self._session_key, listed=self._listed_hooks
+            )
+        else:
+            result = kas_wire.hooks_session_start_response(params)
+        await self._runtime.send_response(msg.id, result)
+
+    async def _answer_kas_hook_execute(self, request_id: Any, params: dict) -> None:
+        """Run one listed hook and answer the request, refusal included.
+
+        A refusal is answered as a JSON-RPC error carrying its reason, never as a
+        result: a result carries an exit code, and a command that never started has
+        none. An unexpected failure is answered the same way, and a cancelled run
+        is answered ``cancelled`` before the cancellation propagates, so the
+        backend's turn is never left waiting on a request nobody will answer.
+        """
+        try:
+            result = await kas_wire.hooks_execute(
+                params,
+                session_key=self._session_key,
+                agent=self._crew_agent,
+                listed=self._listed_hooks,
+            )
+        except asyncio.CancelledError:
+            try:
+                await self._runtime.send_response(request_id, {"exitCode": -1, "cancelled": True})
+            except Exception:
+                logger.warning(
+                    "KAS executeHook cancel answer undeliverable for %s", self._session_id
+                )
+            raise
+        except kas_wire.HookExecuteRefused as exc:
+            logger.info("KAS executeHook refused for %s: %s", self._session_id, exc)
+            await self._send_hook_error(request_id, f"Refused by Kiro Crew: {exc}")
+            return
+        except Exception:
+            logger.exception("KAS executeHook failed for %s", self._session_id)
+            await self._send_hook_error(request_id, "Kiro Crew could not run the hook")
+            return
+        try:
+            await self._runtime.send_response(request_id, result)
+        except Exception:
+            logger.warning("KAS executeHook answer undeliverable for %s", self._session_id)
+
+    def _cancel_hook_tasks(self) -> None:
+        """Cancel every in-flight hook execution this session started.
+
+        ``run_script_hook`` kills the hook's process tree when it is cancelled
+        mid-wait, so a cancelled turn or a torn-down session leaves no hook running.
+        """
+        # Read defensively: a handle assembled without ``__init__`` carries none.
+        for task in list(getattr(self, "_hook_tasks", ())):
+            task.cancel()
+
+    async def _send_hook_error(self, request_id: Any, message: str) -> None:
+        try:
+            await self._runtime.send_error(request_id, kas_wire.HOOK_EXECUTE_REFUSED_CODE, message)
+        except Exception:
+            logger.warning("KAS executeHook refusal undeliverable for %s", self._session_id)
+
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build an AcpEvent for a permission request via the shared parser.
 
@@ -4623,6 +4890,13 @@ class AcpSessionHandle:
         if not agent_subtask_id and not pipeline:
             return None
 
+        # ANY frame carrying subtask lineage means the wave has started: a
+        # spawned child can mutate state before its first activity frame is
+        # observed, so the parent lifecycle frame itself closes the
+        # registration-throttle window. Placed at the acceptance gate so the
+        # pipeline arm, the parent arm and the child fall-through all close it.
+        self._prompt_or_tool_seen = True
+
         # Pipeline frame: one entry per stage.
         if isinstance(pipeline, dict):
             stages = pipeline.get(kas_wire.FIELD_STAGES)
@@ -4715,6 +4989,9 @@ class AcpSessionHandle:
             # surface as visible sub-agent activity — parity with the kiro native
             # subagent path, which only forwards non-thinking agent_message_chunk.
             return []
+        # Observed child output: the wave did work, so the registration-throttle
+        # window closes — the same closure the tool prefix builder applies.
+        self._prompt_or_tool_seen = True
         return [
             AcpEvent(
                 kind=EVENT_SUBAGENT_ACTIVITY,
@@ -4739,6 +5016,11 @@ class AcpSessionHandle:
         tool_call_id = str(update.get("toolCallId") or "")
         if not tool_call_id:
             return []
+        # A KAS child's nested tool call is this session's side effect for
+        # replay purposes — the same closure every other child tool route
+        # applies. Latched here, in the one builder every caller shares, so a
+        # new call site cannot forget it.
+        self._prompt_or_tool_seen = True
         title = redact_text(str(update.get("title") or ""))
         return [
             AcpEvent(
@@ -4826,6 +5108,10 @@ class AcpSessionHandle:
             out: list[AcpEvent] = []
             for ev in child_events:
                 if ev.kind == EVENT_TOOL_CALL and ev.tool_call_id:
+                    # A child's tool call is this session's side effect for
+                    # replay purposes: the parent prompt spawned it, so a replay
+                    # would re-run it. Close the registration-throttle window.
+                    self._prompt_or_tool_seen = True
                     out.append(
                         AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
@@ -4835,6 +5121,9 @@ class AcpSessionHandle:
                         )
                     )
                 elif ev.kind == EVENT_TEXT_CHUNK and ev.text:
+                    # Same closure as the tool arm: observed child output means
+                    # the wave did work, so the zero-activity verdict is gone.
+                    self._prompt_or_tool_seen = True
                     out.append(
                         AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
@@ -4972,9 +5261,11 @@ class AcpSessionHandle:
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
                 self._stale_eligible = True
+                self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
                 self._stale_eligible = False
                 self._tool_dispatched = True
+                self._prompt_or_tool_seen = True
                 # The L1 verdict describes the LAST tool result, so a newly
                 # dispatched call retires the previous one's. Clearing here and
                 # not only on the next result is what covers a call that

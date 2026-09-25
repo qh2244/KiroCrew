@@ -205,6 +205,8 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "chat_segment", "chat_append", "chat_message_update", "chat_variant_switch",
     # Side-conversation channel (``broadcast_side_result``); carries ``slot``.
     "chat.side_result",
+    # Reply-thread channel (``broadcast_thread_reply``); carries ``slot``.
+    "chat.thread_reply",
     "heartbeat", "context_usage",
     # Tool / queue
     "tool_call", "tool_result",
@@ -264,6 +266,22 @@ _SUBAGENT_BATCH_ITEM_KEY = {
     "subagent_batch_update": "updates",
     "subagent_batch_chunks": "chunks",
 }
+
+# ---------------------------------------------------------------------------
+# Owner-only event types: the dashboard USER receives them (dashboard-user
+# tokens bypass this gate entirely), but an app token never does. The
+# per-member event log's frames belong here — they carry the operator's crew
+# roster/activity/patrol state, which is not an app's business (the same
+# posture the whole ``handlers/members.py`` surface takes: app tokens are
+# denied outright). Classified here rather than left to the unknown-event
+# floor so the denial is INTENTIONAL and audited with its own reason instead
+# of reading as a misconfiguration, and so a future literal broadcast of one
+# of these names cannot silently start reaching app tokens.
+_OWNER_ONLY_EVENTS = frozenset({
+    "member_projection",   # types.WS_MEMBER_PROJECTION
+    "members_subscribed",  # types.WS_MEMBERS_SUBSCRIBED
+})
+
 
 # ---------------------------------------------------------------------------
 # Global event type → required declaration mapping
@@ -442,6 +460,7 @@ def build_allowed_event_set(events_declared: list[str]) -> frozenset[str]:
 # Core filter: is this event allowed for this app token?
 # ---------------------------------------------------------------------------
 
+
 def ws_event_allowed(
     event_type: str,
     data: dict[str, Any],
@@ -507,6 +526,14 @@ def _decide_ws_event(
     # does not reach them.
     if app_events_revoked(app):
         _audit_deny(app, event_type, "app_disabled")
+        return False
+
+    # Owner-only surfaces: the per-member event-log frames are the operator's
+    # crew state, never an app's. A dashboard user already bypassed this gate;
+    # an app token is denied with an explicit reason (not the unknown-event
+    # floor) so the decision reads as intentional in the audit trail.
+    if event_type in _OWNER_ONLY_EVENTS:
+        _audit_deny(app, event_type, "owner_only")
         return False
 
     # ``slots`` is a full slot-list re-push.  The event itself is always

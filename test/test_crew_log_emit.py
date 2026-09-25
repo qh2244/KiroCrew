@@ -5034,6 +5034,40 @@ def test_a_closed_session_does_not_leave_its_creation_failure_flagged():
     ), "a closed session left its creation-failure flag behind"
 
 
+def test_a_closed_session_does_not_leave_its_overflow_count_behind(monkeypatch):
+    """The per-session overflow count dies with the session, not at the next reset.
+
+    ``overflow_writes(session_id)`` answers "did an append for this session overflow",
+    which a writer reads to tell a landed append from a dropped one. It is therefore
+    per SESSION and read only while that session is writing -- so, like every other
+    per-session map, it is released in the close path's terminal cleanup. Left to
+    ``reset_caches`` a gateway that runs for weeks keeps one ``str -> int`` entry for
+    every session that ever overflowed, and a successor reusing the id would read a
+    count it did not earn.
+
+    Its sibling ``_overflow_reported`` is deliberately NOT touched here: that one is a
+    report-once latch cleared on recovery in ``_note_progress``, it predates this
+    change, and its own lifetime is main's to decide.
+    """
+    _open_session()
+    assert emit.flush()
+
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 0)
+    emit._buffer(
+        SESSION,
+        emit._PendingJob(job=lambda: None, what="overflowed append", nbytes=31),
+    )
+    assert emit.overflow_writes(SESSION) == 1, "the fixture did not record an overflow"
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 100_000)
+
+    emit.on_session_closed(SESSION, reason="test")
+    assert emit.flush(timeout=20.0)
+
+    assert (
+        SESSION not in emit._overflow_by_session
+    ), "a closed session left its overflow count behind"
+
+
 # --- loss debt survives until its marker lands -----------------------------
 
 
@@ -5610,11 +5644,12 @@ def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
         "slot.latch_crew_log_previous(sessions.mapped_sid(session_key))",
         "slot.latch_crew_log_previous(state.sessions.mapped_sid(session_key))",
     ], f"the predecessor is latched somewhere unexpected: {latches}"
-    # Spent exactly once, at the emitter call. A second consumer would hand the
-    # same edge to two entries; none would leave it for the slot's next store.
+    # Spent exactly once, at the emitter call, which is also where the slot is told
+    # which store it is now on. A second consumer would hand the same edge to two
+    # entries; none would leave it for the slot's next store.
     takes = [line.strip() for line in source.splitlines() if "take_crew_log_previous(" in line]
     assert takes == [
-        "previous_sid=slot.take_crew_log_previous(),"
+        "previous_sid=slot.take_crew_log_previous(now_writing=_crew_log_sid),"
     ], f"the predecessor edge is consumed somewhere unexpected: {takes}"
 
 

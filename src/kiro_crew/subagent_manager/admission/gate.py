@@ -8,10 +8,19 @@ from .._component import ManagerComponent
 from .types import ClaimPoint, PreparedSpawn
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from ...execution_context import ExecutionContext
     from ...subagent import (
+        QUEUED_REASON_ADAPTIVE_CAP_ZERO,
+        QUEUED_REASON_CONCURRENCY_LIMIT,
+        QUEUED_REASON_LOW_MEMORY,
+        QUEUED_REASON_POSTURE_CRITICAL,
         KiroCrewConfig,
         SubagentInfo,
+        _cost_bucket,
+        _effective_next_start_gb,
+        _startup_cost_gb,
         _startup_memory_reserve_gb,
         _validate_agent,
         _validate_app_agent_ownership,
@@ -19,13 +28,13 @@ if TYPE_CHECKING:
         asyncio,
         cached_admission_check,
         check_memory_available,
+        learned_cost_for,
         logger,
         platform_compat,
         redact_credentials,
         redact_exfiltration_urls,
         sel,
         time,
-        uuid,
         validate_cwd,
     )
 
@@ -36,6 +45,7 @@ class _GateMixin(ManagerComponent):
     if TYPE_CHECKING:
         # Sibling-mixin methods this module reaches through ``self``; typing only.
         CLAIM_UNAVAILABLE: str
+        CLAIM_RETAINED: str
 
         TASK_STORE_UNAVAILABLE_CODE: str
 
@@ -183,6 +193,7 @@ class _GateMixin(ManagerComponent):
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
         _execution_context: dict | None = None,
+        _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | None":
         """Spawn a subagent for *task*.
 
@@ -242,7 +253,7 @@ class _GateMixin(ManagerComponent):
         # ``_preassigned_id``, so a member that waits behind the stagger /
         # concurrency gate keeps its identity across the round-trip instead of
         # being announced under one id and starting under another.
-        agent_id: str = _preassigned_id or uuid.uuid4().hex[:8]
+        agent_id: str = _preassigned_id or self._manager._mint_agent_id()
         # Submission accounting: count this member as
         # submitted BEFORE any rejection or queue/registration branching. A
         # member refused below (empty task, low memory, bad cwd, governance)
@@ -519,6 +530,7 @@ class _GateMixin(ManagerComponent):
             "memory_store": memory_store,
             "_execution_context": execution.to_record(),
             "crew": crew,
+            "_stage_boundary_owner": _stage_boundary_owner,
             "_memory_mode": _memory_mode,
             # Same rule for the asking turn: `spawn_async` re-enters from this
             # dict (prepare -> write -> re-enter), so a follow-up whose asking
@@ -584,7 +596,9 @@ class _GateMixin(ManagerComponent):
         )
         admitted_memory_mode: str = _memory_mode
 
-        def _deferred(reason: str, refused: SubagentInfo) -> SubagentInfo | None:
+        def _deferred(
+            reason: str, refused: SubagentInfo, *, wait: dict[str, Any]
+        ) -> SubagentInfo | None:
             # Pressure is a scheduling fact, not a verdict on the task: the row
             # stays queued, holds nothing, and is re-checked after the admit
             # wait. None when the store holds no such row (a legacy in-memory
@@ -599,6 +613,14 @@ class _GateMixin(ManagerComponent):
             # loop to hand it to takes ``BEGIN IMMEDIATE`` here -- on the loop
             # that wait is the whole busy timeout, with chat and the heartbeat
             # behind it.
+            # ``wait`` is the same verdict as a label: it rides on the returned
+            # record and on the ``subagent_queued`` event, so the UI and
+            # ``POST /api/spawn`` can say a MEMORY deferral is one instead of
+            # rendering it as the capacity queue. It is published only by the
+            # emit that FOLLOWS a successful defer write (each branch below
+            # carries it to its own emit), so a row the store turned out not to
+            # hold -- refused, not queued -- leaves no label behind for the
+            # parent's other rows to wear.
             queued = SubagentInfo(
                 id=agent_id,
                 task=_redacted_task,
@@ -607,6 +629,8 @@ class _GateMixin(ManagerComponent):
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
+                queued_reason=str(wait.get("reason", "")),
+                queued_reason_detail=reason,
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
                 delegation=dict(delegation or {}),
@@ -624,38 +648,88 @@ class _GateMixin(ManagerComponent):
                     batch_id=batch_id,
                     queued=queued,
                     refused=refused,
+                    wait=wait,
                 )
                 return queued
             elif not self._manager._admission.taskq_defer(agent_id, reason=reason):
                 return None
-            self._manager._emit_queue_depth(parent_session_key, batch_id)
+            self._manager._emit_queue_depth(parent_session_key, batch_id, wait=wait)
             return queued
 
         # --- Memory guard: defer (durable) or refuse (legacy) while host memory
         # is critically low. ---
+        # This run's own learned p90 -- keyed the way its samples are written,
+        # by the explicit agent or else the inherited template. None when that
+        # bucket has no dedicated history (or nothing is published yet): the
+        # configured cost, plus the live dedicated peaks folded in below, prices
+        # it -- never another agent's figure.
+        learned_cost = learned_cost_for(
+            getattr(self._manager, "_learned_costs_gb", {}), _cost_bucket(agent, execution)
+        )
+        agents_snapshot = list(self._manager._agents.values())
         try:
             memory_cfg = KiroCrewConfig.load().agent
             min_mem = memory_cfg.spawn_min_memory_gb
-            startup_cost = memory_cfg.subagent_cost_gb
+            configured_cost = float(memory_cfg.subagent_cost_gb)
+            # The learned p90 when the reaper has published one, never below
+            # the configured fallback: this is the only price on a warming
+            # start until it settles, and the fallback alone under-priced a
+            # 6 GB runtime twelve-fold (see _startup_cost_gb). Arithmetic over
+            # manager attributes -- the cost log is read off-loop by the reaper
+            # sweep, never here.
+            startup_cost = _startup_cost_gb(memory_cfg, learned_cost)
         except Exception:
             min_mem = 4.0
+            configured_cost = 0.5
             startup_cost = 0.5
+        # What the next start is really priced at once live dedicated peaks
+        # are folded in -- the figure the reserve uses and the one reported.
+        next_start_price = _effective_next_start_gb(
+            agents_snapshot, cost_gb=configured_cost, next_start_gb=startup_cost
+        )
         if min_mem > 0 and not _dispatch_now:
             # RSS grows after a process starts. Reserve the unobserved part so
             # a fast drain cannot repeatedly spend the same free memory before
-            # the next controller sample. Observed growth replaces reservation.
+            # the next controller sample. Observed growth replaces reservation:
+            # a settled worker owes only its own gap (``cost_gb``), while the
+            # next start and every still-warming start are priced at the
+            # learned figure (``next_start_gb``).
             min_mem += _startup_memory_reserve_gb(
-                list(self._manager._agents.values()),
+                agents_snapshot,
                 running_count=self._manager._running_count,
-                cost_gb=startup_cost,
+                cost_gb=configured_cost,
+                next_start_gb=startup_cost,
             )
         mem_ok, avail_gb = (True, -1.0) if _dispatch_now else check_memory_available(min_gb=min_mem)
         if not mem_ok:
+            # Which figure actually set the price: the learned p90 only when it
+            # is the larger one; otherwise the operator's configured pin (which
+            # is also the honest answer while nothing has been learned yet).
+            if next_start_price > startup_cost:
+                price_source = "live dedicated peak RSS"
+            elif learned_cost is not None and learned_cost > configured_cost:
+                price_source = "learned per-run p90"
+            else:
+                price_source = "configured agent.subagent_cost_gb"
+            # Name the price, not just the total: a learned p90 that outlived
+            # the roster it was measured on can hold this bar above what the
+            # host will ever clear, and deferred runs record no new samples to
+            # correct it. The operator's remedies are lowering
+            # ``agent.spawn_min_memory_gb`` or removing the stale
+            # ``subagents/cost_samples.jsonl`` under the data home.
             logger.warning(
-                "Subagent spawn %s: only %.2f GB available (min %.1f GB required)",
+                "Subagent spawn %s: only %.2f GB available (min %.1f GB required; each "
+                "warming start priced at %.2f GB from the %s -- learned p90 %s, "
+                "configured subagent_cost_gb %.2f). A learned cost that no longer "
+                "reflects this host can be reset by deleting subagents/cost_samples.jsonl "
+                "under the data home.",
                 "deferred" if _durable else "refused",
                 avail_gb,
                 min_mem,
+                next_start_price,
+                price_source,
+                "%.2f GB" % learned_cost if learned_cost is not None else "none yet",
+                configured_cost,
             )
             sel().log_tool_invocation(
                 session_key=parent_session_key or "",
@@ -665,6 +739,8 @@ class _GateMixin(ManagerComponent):
                 metadata={
                     "available_gb": avail_gb,
                     "min_gb": min_mem,
+                    "startup_cost_gb": next_start_price,
+                    "learned_cost_gb": learned_cost,
                     **_task_audit,
                 },
             )
@@ -677,12 +753,25 @@ class _GateMixin(ManagerComponent):
                 agent=agent,
                 parent_session_key=parent_session_key,
                 done=True,
-                error=f"spawn refused: only {avail_gb:.1f} GB memory available (need {min_mem:.0f} GB)",
+                error=(
+                    f"spawn refused: only {avail_gb:.1f} GB memory available (need "
+                    f"{min_mem:.0f} GB; each warming start is priced at "
+                    f"{next_start_price:.1f} GB from the {price_source})"
+                ),
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
             deferred = (
-                _deferred(f"low memory: {avail_gb:.1f} GB available, need {min_mem:.0f} GB", info)
+                _deferred(
+                    f"low memory: {avail_gb:.1f} GB available, need {min_mem:.0f} GB "
+                    f"({next_start_price:.1f} GB per warming start, from the {price_source})",
+                    info,
+                    wait={
+                        "reason": QUEUED_REASON_LOW_MEMORY,
+                        "available_gb": round(float(avail_gb), 2),
+                        "required_gb": round(float(min_mem), 2),
+                    },
+                )
                 if _durable
                 else None
             )
@@ -762,7 +851,18 @@ class _GateMixin(ManagerComponent):
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            deferred = _deferred(str(admission.reason), info) if _durable else None
+            deferred = (
+                _deferred(
+                    str(admission.reason),
+                    info,
+                    wait={
+                        "reason": QUEUED_REASON_POSTURE_CRITICAL,
+                        "available_gb": round(float(admission.available_gb), 2),
+                    },
+                )
+                if _durable
+                else None
+            )
             if deferred is not None:
                 return deferred
             return self._manager._announce_rejection(info)
@@ -830,10 +930,35 @@ class _GateMixin(ManagerComponent):
                 len(self._manager._queue),
                 slot_free,
             )
+            # Which wait this is. A cap the adaptive controller has squeezed to 0
+            # is the one capacity queue "behind the concurrency limit" misreads:
+            # nothing runs, the configured cap still reads N, and the row waits
+            # for the controller's probe, not for a slot. The stagger tick and a
+            # genuinely full cap both clear on their own and keep the default.
+            # The paused kind is answered to callers as a DEFERRAL, so it carries
+            # the same human sentence the memory kinds do; the ordinary kind is
+            # never surfaced as prose and stays bare.
+            adaptive_paused = self._manager._max_concurrent <= 0
+            capacity_wait = {
+                "reason": (
+                    QUEUED_REASON_ADAPTIVE_CAP_ZERO
+                    if adaptive_paused
+                    else QUEUED_REASON_CONCURRENCY_LIMIT
+                )
+            }
+            capacity_detail = (
+                (
+                    "dispatch paused: the host is low on memory or overloaded, so no new "
+                    "subagent starts until it recovers (configured cap "
+                    f"{self._manager._user_max_concurrent}, effective cap 0)"
+                )
+                if adaptive_paused
+                else ""
+            )
             # Advisory UI signal: tell the chip how many agents are now waiting
             # to start for this parent so it can appear immediately and show a
             # "waiting" count instead of only running/completed ones.
-            self._manager._emit_queue_depth(parent_session_key, batch_id)
+            self._manager._emit_queue_depth(parent_session_key, batch_id, wait=capacity_wait)
             # If a slot is free, no running agent will trigger the drain on
             # completion — schedule the staggered pump at the interval boundary
             # so the queued spawn still launches.
@@ -852,6 +977,8 @@ class _GateMixin(ManagerComponent):
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
+                queued_reason=str(capacity_wait["reason"]),
+                queued_reason_detail=capacity_detail,
                 memory_mode=_memory_mode,
                 execution_context=execution,
                 batch_id=batch_id,
@@ -940,22 +1067,29 @@ class _GateMixin(ManagerComponent):
                 # overshoot the cap or skip the stagger.
                 self._manager._running_count += 1
                 self._manager._last_spawn_ts = time.monotonic()
-                return ClaimPoint(agent_id)
+                return ClaimPoint(agent_id, parent_session_key, _stage_boundary_owner)
             taskq_generation, proceed, claim_reason = self._manager._admission.taskq_claim(agent_id)
-        if not proceed and claim_reason == self.CLAIM_UNAVAILABLE:
-            # The store could not take the row (busy / unavailable). Starting
-            # anyway would run work no lease tracks -- generation 0, invisible
-            # to reconcile, restartable by the next pump. The row stays
-            # ``queued`` on disk; the caller keeps a QUEUED handle and the
-            # pump retries after the admit wait.
-            logger.warning("taskq: claim of %s unavailable; left queued for the pump", agent_id)
+        if not proceed and claim_reason in (self.CLAIM_UNAVAILABLE, self.CLAIM_RETAINED):
+            # A pre-claim outage leaves the row QUEUED and needs an ordinary
+            # refill. A post-claim outage leaves it ADMITTED under this process;
+            # claim_and_start retains its generation and reservation, and its
+            # dedicated retry pass owns the wake.
+            retained = claim_reason == self.CLAIM_RETAINED
+            logger.warning(
+                "taskq: %s of %s unavailable; %s",
+                "post-claim settlement" if retained else "claim",
+                agent_id,
+                "retained admitted generation" if retained else "left queued for the pump",
+            )
             self._manager._emit_queue_depth(parent_session_key, batch_id)
-            try:
-                asyncio.get_event_loop().call_later(
-                    self._manager._admission.taskq_admit_wait_secs(), self._manager._drain_queue
-                )
-            except RuntimeError:
-                pass
+            if not retained:
+                try:
+                    asyncio.get_event_loop().call_later(
+                        self._manager._admission.taskq_admit_wait_secs(),
+                        self._manager._drain_queue,
+                    )
+                except RuntimeError:
+                    pass
             info = SubagentInfo(
                 id=agent_id,
                 task=_redacted_task,
@@ -972,10 +1106,9 @@ class _GateMixin(ManagerComponent):
                 include_project=include_project,
             )
             # Pinned HERE, on the pass that still knows which turn asked. The
-            # pump re-enters this method with ``_from_queue=True`` after the
-            # admit wait, where that turn cannot be read; the pin this leaves
-            # is what that pass carries forward, and ``remember_child_origin``
-            # refuses to move it.
+            # pump re-enters this method after the store answers, where that
+            # turn cannot be read; the pin this leaves is what that pass carries
+            # forward, and ``remember_child_origin`` refuses to move it.
             self._record_crew_log_dispatch(info, from_queue=_from_queue, asked=_crew_log_asked)
             return info
         if not proceed:

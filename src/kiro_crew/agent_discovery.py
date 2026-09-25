@@ -17,11 +17,12 @@ import functools
 import logging
 import os
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Generic, Iterator, Sequence, TypeVar
 
-from kiro_crew import agent_state
+from kiro_crew import agent_state, hooks
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
@@ -37,11 +38,72 @@ from kiro_crew.agent_spec_format import (
 )
 from kiro_crew.config.paths import kiro_agents_dir, project_agents_dir, project_kiro_dir
 from kiro_crew.executors import discovery_executor
-from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.hooks import FileTooLargeError, is_unc_shape, unc_probe_allowed
+from kiro_crew.pinned_fs import open_fenced_for_read
+from kiro_crew.security import is_sensitive_canonical_path, is_sensitive_path
 from kiro_crew.sel import sel as _sel
 
 logger = logging.getLogger(__name__)
+
+
+_WINDOWS = os.name == "nt"
+
+
+def _fence_refuses(real: Path) -> bool:
+    """The sensitive-path verdict for the ``Path.resolve(strict=True)`` result.
+
+    Delegates to :func:`security.is_sensitive_canonical_path`, which picks the
+    gate by thread: the pre-resolved gate off the event loop (no ``mc-pathres``
+    submission, so a saturated pool cannot drop a healthy spec) and the bounded
+    gate on it. Dashboard handlers call the readers from coroutines; the native
+    skill projection reads every spec under ``asyncio.to_thread``.
+    """
+    return is_sensitive_canonical_path(str(real))
+
+
+def _unc_refused(spelling: str) -> bool:
+    """The Windows UNC trusted-root gate, as ``hooks.validate_file_path`` applies it.
+
+    A UNC path names a HOST: on Windows, resolving or opening one is an outbound
+    SMB connection, an NTLM credential probe the path's author controls. The
+    readers ask this BEFORE ``Path.resolve`` on the spelling they were handed
+    (so a UNC-shaped spec never reaches the probe) and again on the resolved
+    spelling (so a local link into a share is refused before the open). Only
+    the shares ``unc_probe_allowed`` names are admitted; every other platform
+    answers ``False`` here, exactly as the hooks gate does.
+    """
+    return _WINDOWS and is_unc_shape(spelling) and not unc_probe_allowed(spelling)
+
+
+class _SpecReadRefused(OSError):
+    """The pinned open refused the spec's inode (link, hardlink, non-regular, fence)."""
+
+
+def _read_spec_bytes(real: Path) -> bytes:
+    """Read a resolved, fence-judged spec path pinned to the descriptor it opens.
+
+    :func:`pinned_fs.open_fenced_for_read` refuses a link at the final
+    component, a non-regular or hardlinked inode, and an opened inode whose
+    kernel path :func:`_fence_refuses` rejects, raising :class:`_SpecReadRefused`;
+    a missing file raises ``FileNotFoundError``. The same ``hooks.MAX_FILE_BYTES``
+    cap as :func:`kiro_crew.hooks.safe_read_file_bytes` applies (read at call
+    time, so the two readers share one cap), raising :class:`FileTooLargeError`
+    past it, so a multi-gigabyte "agent config" is still refused at the cap
+    instead of being slurped into memory. Nothing here submits to the resolver
+    pool off the event loop.
+    """
+    fd = open_fenced_for_read(
+        real,
+        fence=lambda fd_real: _fence_refuses(Path(fd_real)),
+        refusal=_SpecReadRefused,
+    )
+    cap = hooks.MAX_FILE_BYTES
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise FileTooLargeError(f"File exceeds {cap // (1024 * 1024)} MB safety cap")
+    return data
+
 
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
@@ -103,6 +165,12 @@ _PARSED_SPECS_REFRESHING: set[str] = set()  # Guarded by _PARSED_SPECS_LOCK.
 # read BEFORE the write that the clear announced, inside one mtime tick where
 # the signature cannot tell the difference.
 _PARSED_SPECS_GEN = 0
+
+
+def spec_cache_generation() -> int:
+    """Return the generation of in-process agent-spec content."""
+    with _PARSED_SPECS_LOCK:
+        return _PARSED_SPECS_GEN
 
 
 @dataclass
@@ -194,11 +262,13 @@ AGENT_SPEC_SUFFIX = ".agent-spec.json"
 def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
     """Emit a denial audit row for a refused path, never raising.
 
-    BOTH denial paths in this module promise not to raise -- ``_read_agent_spec``
+    EVERY denial path in this module promises not to raise -- ``_read_agent_spec``
     by the contract :func:`_warn_on_systematic_scan_failure` documents and its
-    callers read bare, and :func:`project_agent_names` in its own docstring
-    ("Never raises; an unreadable checkout yields an empty set"). Auditing the
-    denial must not become the one way to break either promise: for some
+    callers read bare, :func:`project_agent_names` in its own docstring
+    ("Never raises; an unreadable checkout yields an empty set"), and
+    :func:`project_agent_files` by the contract its own callers read it on, since
+    each treats an empty list as "this checkout declares no agents". Auditing the
+    denial must not become the one way to break any of those promises: for some
     surfaces this is the process's FIRST SEL use, and constructing the singleton
     mkdirs its home (``sel.py``), so an unwritable or hostile SEL directory
     would abort whichever surface asked -- on exactly the hostile path the
@@ -208,8 +278,10 @@ def _audit_denied(*, operation: str, source: str, resources: str, error: str) ->
     what is lost is the audit ROW. That is best-effort by the SEL API's own
     design: ``log_api_access`` reserves fail-closed behaviour for its explicit
     ``critical=True`` callers (``apps/admission.py``, the auto-improvement
-    server) and neither of these sites has ever been one. WARNING, not debug, so
-    an operator sees that the trail has a hole rather than finding out later.
+    server) and no denial site in this module is one -- the denial-side rule in
+    ``docs/architecture/security-deep-dive.md`` says why a refusal must not be
+    coupled to SEL health. WARNING, not debug, so an operator sees that the trail
+    has a hole rather than finding out later.
 
     The fallback names only the ``operation`` -- a fixed internal label. The
     REFUSED PATH is deliberately not logged here: on this branch its resolved
@@ -251,10 +323,13 @@ def _read_agent_spec(
     bytes, a document that is not an object, and oversized files are all
     rejected. A markdown file with no frontmatter fence is not a spec and is
     skipped like malformed JSON. The read itself goes through
-    :func:`kiro_crew.hooks.safe_read_file_bytes` — the hardened gate every other
-    dashboard file read uses — so a multi-gigabyte "agent config" is refused at
-    the size cap instead of being slurped into memory during a cache warm. The
-    agents directories are user-writable and shared with other tools, so none of
+    :func:`_read_spec_bytes`: a no-reparse open pinned to the descriptor it
+    reads, the same ``MAX_FILE_BYTES`` cap as every other dashboard file read,
+    and no resolver-pool submission off the event loop, so a multi-gigabyte
+    "agent config" is refused at the size cap instead of being slurped into
+    memory during a cache warm, and a saturated pool cannot drop a healthy spec.
+    The agents directories are user-writable and shared with other tools, so
+    none of
     these are hypothetical.
 
     *operation*/*source* label the SEL denial event emitted on a sensitive
@@ -273,6 +348,16 @@ def _read_agent_spec(
     """
     if path.name.startswith("._"):
         return None
+    if _unc_refused(str(path)):
+        # Refused BEFORE resolve: on Windows the resolve of a UNC spelling is
+        # itself the outbound SMB probe.
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(path),
+            error="untrusted UNC path rejected",
+        )
+        return None
     try:
         real = path.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -282,8 +367,18 @@ def _read_agent_spec(
         # uncaught loop here crashes whichever surface asked — e.g. Slack's
         # `!agent` handler exits without replying.
         return None
-    if is_sensitive_path(str(real)):
-        logger.debug("Skipping sensitive agent config: %s", path)
+    if _unc_refused(str(real)):
+        # A local link into a share: the resolve has already probed, and the
+        # read must still not load the remote document.
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(real),
+            error="untrusted UNC path rejected",
+        )
+        return None
+    if _fence_refuses(real):
+        logger.debug("Skipping sensitive agent config: %r", path)
         _audit_denied(
             operation=operation,
             source=source,
@@ -292,26 +387,39 @@ def _read_agent_spec(
         )
         return None
     try:
-        raw = safe_read_file_bytes(str(real))
+        raw = _read_spec_bytes(real)
     except FileTooLargeError:
-        logger.debug("Skipping oversized agent config: %s", path)
+        logger.debug("Skipping oversized agent config: %r", path)
         return None
-    if raw is None:
-        logger.debug("Skipping unreadable agent config: %s", path)
+    except _SpecReadRefused as exc:
+        # A link or a hardlink planted at the spec's name, a non-regular inode,
+        # or an opened inode the fence rejects. The agents directories are
+        # shared with other tools (a hardlink-based dotfile layout produces the
+        # nlink refusal legitimately), so the reason and the path are logged
+        # where an operator sees them; a DEBUG line here is what turns a
+        # refused spec into an unexplained "no prepared skill discovery view".
+        # Both values come from an untrusted filename (the refusal message
+        # quotes the spelling), so they are rendered with ``%r``: a newline in
+        # the name is escaped instead of starting a forged log record.
+        logger.warning("Skipping agent config %r: %r", path, exc)
+        return None
+    except OSError:
+        # Absent or unreadable: "not a readable spec".
+        logger.debug("Skipping unreadable agent config: %r", path)
         return None
     try:
         data = parse_agent_spec_bytes(raw, path)
     except (UnicodeDecodeError, ValueError):
-        logger.debug("Skipping unreadable agent config: %s", path)
+        logger.debug("Skipping unreadable agent config: %r", path)
         return None
     if not isinstance(data, dict):
-        logger.debug("Skipping non-object agent config: %s", path)
+        logger.debug("Skipping non-object agent config: %r", path)
         return None
     return data
 
 
 class SensitiveAgentSpecPathError(ValueError):
-    """A spec path resolved to a target :func:`is_sensitive_path` refuses.
+    """A spec path resolved to a target the sensitive-path fence refuses.
 
     A ``ValueError`` like the other deterministic refusals, so a caller that
     only needs "not a spec" catches it with them; distinct so a caller that
@@ -333,29 +441,46 @@ def read_agent_spec_strict(path: Path, *, operation: str, source: str) -> Any:
     both did a bare ``Path.read_text``, so a symlink dropped into the
     user-writable agents directory was followed to wherever it pointed. The
     gates here are the listing reader's -- AppleDouble sidecars, the resolved
-    target checked against :func:`is_sensitive_path` (and the denial audited
-    under *operation*/*source*), the size-capped no-reparse open of
-    :func:`safe_read_file_bytes` -- but the outcome is raised, not swallowed:
+    target checked against the sensitive-path fence through :func:`_fence_refuses`
+    (and the denial audited under *operation*/*source*), the size-capped
+    descriptor-pinned open of :func:`_read_spec_bytes` -- but the outcome is
+    raised, not swallowed:
 
     * ``OSError`` -- the file could not be read: absent, unreadable, a broken
       or looping symlink (pathlib's ``RuntimeError`` is mapped to ``ELOOP``),
       or an open the hardened gate refused. Retrying may succeed.
     * ``ValueError`` -- the content is not a spec, and re-reading will not
-      change that: a sensitive resolved target (the
-      :class:`SensitiveAgentSpecPathError` subclass), a file over the size cap, bytes
-      that are not UTF-8 (``UnicodeDecodeError`` is a ``ValueError``), or a
-      document that does not parse.
+      change that: a sensitive resolved target or a UNC spelling outside the
+      trusted roots (both the :class:`SensitiveAgentSpecPathError` subclass), a
+      file over the size cap, bytes that are not UTF-8 (``UnicodeDecodeError``
+      is a ``ValueError``), or a document that does not parse.
 
     Returns the parsed document; a non-object is the caller's to reject, as
     the two forms' parsers leave it.
     """
     if path.name.startswith("._"):
         raise ValueError(f"{path} is an AppleDouble sidecar, not an agent spec")
+    if _unc_refused(str(path)):
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(path),
+            error="untrusted UNC path rejected",
+        )
+        raise SensitiveAgentSpecPathError(f"{path} names a share outside the trusted roots")
     try:
         real = path.resolve(strict=True)
     except RuntimeError as exc:
         raise OSError(errno.ELOOP, "symlink loop", str(path)) from exc
-    if is_sensitive_path(str(real)):
+    if _unc_refused(str(real)):
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(real),
+            error="untrusted UNC path rejected",
+        )
+        raise SensitiveAgentSpecPathError(f"{path} resolves to a share outside the trusted roots")
+    if _fence_refuses(real):
         _audit_denied(
             operation=operation,
             source=source,
@@ -364,11 +489,11 @@ def read_agent_spec_strict(path: Path, *, operation: str, source: str) -> Any:
         )
         raise SensitiveAgentSpecPathError(f"{path} resolves to a sensitive path")
     try:
-        raw = safe_read_file_bytes(str(real))
+        raw = _read_spec_bytes(real)
     except FileTooLargeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
-    if raw is None:
-        raise OSError(errno.EACCES, "agent spec could not be read", str(path))
+    except _SpecReadRefused as exc:
+        raise OSError(errno.EACCES, "agent spec could not be read", str(path)) from exc
     return parse_agent_spec_bytes(raw, path)
 
 
@@ -379,7 +504,17 @@ class AmbiguousAgentSpecError(ValueError):
     hand the caller an agent the operator did not name, with that agent's tools
     and prompt. Every declared-name resolver refuses instead; the message names
     each file so the operator can remove or rename one.
+
+    ``paths`` carries the same files as data, for a caller that must name them
+    WITHOUT their directory -- the tool-policy endpoint's 409 ``reason``
+    crosses the wire into a model-visible refusal, and the message's full
+    paths disclose the account name and on-disk layout there. Empty when the
+    raiser did not supply them; the message is then the only record.
     """
+
+    def __init__(self, message: str, *, paths: Sequence[Path] = ()) -> None:
+        super().__init__(message)
+        self.paths: tuple[Path, ...] = tuple(paths)
 
 
 def spec_by_declared_name(
@@ -449,7 +584,8 @@ def spec_by_declared_name(
         raise AmbiguousAgentSpecError(
             f"{len(match_paths)} specs declare the name {agent_id!r}: "
             f"{', '.join(repr(str(path)) for path in match_paths)}. Which one is live is "
-            f"undefined -- remove or rename one."
+            f"undefined -- remove or rename one.",
+            paths=match_paths,
         )
     return match
 
@@ -500,6 +636,9 @@ def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: i
 def project_agent_files(
     project_dir: str | Path | None,
     include_legacy: bool = False,
+    *,
+    operation: str = "project_agent_files",
+    source: str = "project_agent_files",
 ) -> list[Path]:
     """Agent config files declared by a project checkout, sorted by stem.
 
@@ -527,11 +666,33 @@ def project_agent_files(
     The sensitive-path check is on the project root because that value arrives from
     a caller-supplied session field; the per-file resolved-target check that
     catches a planted symlink stays with the reader (:func:`_read_agent_spec`).
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    project directory, exactly as on :func:`_read_agent_spec` and
+    :func:`project_agent_names`: the calling surface names itself so the security
+    trail attributes the refusal to the request that triggered it. ``source`` is
+    the interface channel (``SecurityEvent.source`` vocabulary: dashboard, cli,
+    slack, cron, ...; ``"unknown"`` when the caller serves multiple channels) --
+    every call site passes it explicitly, enforced by the call-site ratchet test.
+    Both defaults exist ONLY so a bare call still records the refusal under a
+    label that names this function; they are not for new call sites.
     """
     if not project_dir:
         return []
     if is_sensitive_path(str(project_dir)):
         logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
+        # Audited like every other deny in this module: the path arrives from a
+        # caller-supplied session, spawn or channel field, so a scan of a
+        # protected tree is a probe an operator must be able to see. Best-effort
+        # by :func:`_audit_denied` -- the refusal below already stands, so a lost
+        # row costs the trail, never the guard (see the denial-audit rule in
+        # ``docs/architecture/security-deep-dive.md``).
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(project_dir),
+            error="sensitive project dir rejected",
+        )
         return []
     specs: list[Path] = []
     try:
@@ -647,7 +808,7 @@ def project_agent_names(
         return cached[1]
     candidates = 0
     declared: list[str] = []
-    for f in project_agent_files(project_dir):
+    for f in project_agent_files(project_dir, operation=operation, source=source):
         # AppleDouble sidecars are rejected by design, not by failure — a
         # directory holding only sidecars is empty of specs, not broken.
         if not f.name.startswith("._"):
@@ -1068,11 +1229,12 @@ def agent_skill_globs(
             if strict and agent != "kirocrew":
                 raise SkillScopeResolutionError(f"Cannot resolve skill scope for agent {agent!r}")
             return []
-        directory = (
-            project_agents_dir(str(project_dir))
-            if winner.scope == SCOPE_PROJECT
-            else (agents_dir if agents_dir is not None else _kiro_agents_dir())
-        )
+        if winner.scope == SCOPE_PROJECT:
+            directory = project_agents_dir(str(project_dir))
+        elif agents_dir is not None:
+            directory = agents_dir
+        else:
+            directory = _kiro_agents_dir()
         path = directory / winner.filename
         data = _read_agent_spec(path, operation="agent_skill_globs", source="unknown")
         if strict and data is None:
@@ -1188,8 +1350,10 @@ def agent_welcome_message(
         if not project_dir:
             return ""
         directory = project_agents_dir(project_dir)
+    elif agents_dir is not None:
+        directory = agents_dir
     else:
-        directory = agents_dir if agents_dir is not None else _kiro_agents_dir()
+        directory = _kiro_agents_dir()
     data = _read_agent_spec(
         directory / winner.filename,
         operation="agent_welcome_message",
@@ -1198,6 +1362,22 @@ def agent_welcome_message(
     if data is None:
         return ""
     return spec_welcome_message(data)
+
+
+def _iter_spec_entries(d: Path) -> Iterator[os.DirEntry[str]]:
+    """The one ``scandir`` walk behind the stat-only fingerprints of an agents dir.
+
+    Yields every entry with a recognised spec suffix and nothing else; the
+    caller decides what to ``stat`` and how. Case-insensitive: a
+    case-insensitive filesystem serves ``Foo.JSON`` to ``glob("*.json")``
+    consumers, so a case-sensitive suffix here would omit from a fingerprint a
+    file the scans include -- its edits would never invalidate. A directory that
+    cannot be listed raises the ``OSError``; each caller decides what that means.
+    """
+    with os.scandir(d) as it:
+        for entry in it:
+            if is_agent_spec_name(entry.name):
+                yield entry
 
 
 def _dir_signature(d: Path) -> _ListAgentsSig:
@@ -1213,25 +1393,181 @@ def _dir_signature(d: Path) -> _ListAgentsSig:
     change the stem-derived agent name and the anchoring of relative
     ``skill://`` globs. Invalidates the :func:`list_agents`, project-names,
     and parsed-specs caches.
+
+    Always a tuple, never ``None``: the catalog caches it revalidates stay on
+    for a symlinked or freshly edited directory. :func:`agents_dir_revision`
+    is the stricter fingerprint, for answers that must never be served stale.
     """
     entries: list[tuple[str, int]] = []
     try:
-        with os.scandir(d) as it:
-            for entry in it:
-                # Case-insensitive: a case-insensitive filesystem serves
-                # ``Foo.JSON`` to ``glob("*.json")`` consumers, so a
-                # case-sensitive suffix here would omit from the signature a
-                # file the scans include — its edits would never invalidate.
-                if not is_agent_spec_name(entry.name):
-                    continue
-                try:
-                    m = entry.stat().st_mtime_ns
-                except OSError:
-                    m = 0
-                entries.append((entry.name, m))
+        for entry in _iter_spec_entries(d):
+            try:
+                m = entry.stat().st_mtime_ns
+            except OSError:
+                m = 0
+            entries.append((entry.name, m))
     except OSError:
         pass
     return tuple(sorted(entries))
+
+
+_SpecStatRevision = tuple[str, int, int, int, int, int, int]
+AgentsDirRevision = tuple[int, tuple[_SpecStatRevision, ...], int]
+# ``st_ctime_ns`` is creation time on Windows, so entry metadata cannot prove
+# that an in-place rewrite did not happen; the revision is unavailable there.
+AGENTS_DIR_MEMO_ENABLED = not _WINDOWS
+# Above this many spec entries no revision is taken, and a read costs what it costs.
+_AGENTS_DIR_REVISION_MAX_ENTRIES = 4096
+# Follow the racy-git precedent: metadata younger than this window is untrusted.
+_AGENTS_DIR_RACY_WINDOW_NS = 2_000_000_000
+# An answer set that reaches this many keys is cleared whole, so a churn of names cannot grow it.
+_AGENTS_DIR_MEMO_MAX_KEYS = 256
+_AGENTS_DIR_REVISION_LOCK = threading.Lock()
+_AGENTS_DIR_REVISION_OVERFLOW_WARNED: set[str] = set()  # Guarded by the lock above.
+
+
+def agents_dir_revision(agents_dir: Path) -> AgentsDirRevision | None:
+    """Stat-only fingerprint of *agents_dir* strong enough to pin a read answer to.
+
+    ``None`` means "cannot prove freshness; do not memoize". Where
+    :func:`_dir_signature` answers every call with a tuple because the catalog
+    caches it serves tolerate a same-tick edit, this refuses whenever entry
+    metadata could miss a rewrite: no spec is opened or parsed either way.
+
+    The directory's own mtime catches an entry added, removed, renamed or
+    re-linked; each spec entry's name, timestamps, size, identity and mode catch
+    ordinary in-place edits and metadata changes. The in-process spec
+    generation (:func:`spec_cache_generation`) is part of the tuple, so
+    :func:`clear_list_agents_cache` -- which the in-process spec writers call --
+    moves every revision at once, closing the sub-tick window. An entry whose
+    mtime or ctime is within the last two seconds gives ``None``, so a
+    same-size rewrite that lands in the same filesystem timestamp tick as the
+    previous one cannot be served stale (the racy-git rule).
+
+    A symlinked spec gives ``None``: its entry metadata cannot see edits to its
+    target. On Windows the answer is always ``None``: ``st_ctime_ns`` is
+    creation time there, so entry metadata cannot prove an in-place rewrite did
+    not happen. A directory past :data:`_AGENTS_DIR_REVISION_MAX_ENTRIES` gives
+    ``None`` and logs one warning per directory.
+
+    Only entries with a recognised spec suffix (``is_agent_spec_name``) are
+    fingerprinted; that is a superset of what the spec scans parse (a Markdown
+    spec shadowed by its JSON twin is still fingerprinted), so the revision can
+    only be more sensitive than the scan, never less. Adding or removing a stray
+    file still invalidates through the directory mtime, but the stray file itself
+    is omitted from the entry tuples. A ``stat`` that fails records zeros: the
+    entry is still named, so its appearance and disappearance are revisions. An
+    entry whose kind cannot be determined gives ``None``, and so does a
+    directory that cannot be listed: an unlistable directory is not an empty one.
+    """
+    if not AGENTS_DIR_MEMO_ENABLED:
+        return None
+    try:
+        dir_mtime = agents_dir.stat().st_mtime_ns
+    except OSError:
+        dir_mtime = 0
+    entries: list[_SpecStatRevision] = []
+    try:
+        for entry in _iter_spec_entries(agents_dir):
+            try:
+                if entry.is_symlink():
+                    return None
+            except OSError:
+                return None
+            try:
+                st = entry.stat(follow_symlinks=False)
+                entries.append(
+                    (
+                        entry.name,
+                        st.st_mtime_ns,
+                        st.st_ctime_ns,
+                        st.st_size,
+                        st.st_ino,
+                        st.st_dev,
+                        st.st_mode,
+                    )
+                )
+            except OSError:
+                entries.append((entry.name, 0, 0, 0, 0, 0, 0))
+            if len(entries) > _AGENTS_DIR_REVISION_MAX_ENTRIES:
+                key = str(agents_dir)
+                with _AGENTS_DIR_REVISION_LOCK:
+                    should_warn = key not in _AGENTS_DIR_REVISION_OVERFLOW_WARNED
+                    _AGENTS_DIR_REVISION_OVERFLOW_WARNED.add(key)
+                if should_warn:
+                    logger.warning(
+                        "agents-dir memo disabled for %s: %d spec entries exceed %d",
+                        agents_dir,
+                        len(entries),
+                        _AGENTS_DIR_REVISION_MAX_ENTRIES,
+                    )
+                return None
+    except OSError:
+        return None
+    cutoff = time.time_ns() - _AGENTS_DIR_RACY_WINDOW_NS
+    if dir_mtime > cutoff or any(entry[1] > cutoff or entry[2] > cutoff for entry in entries):
+        return None
+    return dir_mtime, tuple(sorted(entries)), spec_cache_generation()
+
+
+T = TypeVar("T")
+
+
+class AgentsDirMemo(Generic[T]):
+    """Answers computed from one walk of an agents directory, pinned to its revision.
+
+    The two ``spec_by_declared_name`` callers (the KAS projection and the
+    tool-policy read) each parse every spec in the directory to resolve one
+    name, and each keeps its own instance here so their SEL ``operation``
+    labels never share an answer. The store and hit rules live once:
+
+    - a revision is taken before ``compute`` and again after it, and the answer
+      is stored only when both are equal and not ``None``, so a write landing
+      during the read is never memoized under the revision that preceded it;
+    - an exception from ``compute`` propagates and nothing is stored;
+    - one answer set per directory, replaced whole on a new revision and
+      cleared when it reaches :data:`_AGENTS_DIR_MEMO_MAX_KEYS`, so a churn of
+      keys cannot grow it.
+
+    An in-process spec write that calls :func:`clear_list_agents_cache` moves
+    the spec generation, which is part of every revision, so the stored answers
+    stop matching without the memo being told.
+
+    The answer returned is the stored object itself, so a caller that hands it
+    to code which may mutate it must copy (the KAS projection deep-copies; the
+    tool-policy read's answer is serialized and never mutated). Two threads
+    missing at once compute redundantly and last-write-wins, the same answer
+    from the same revision. The lock guards the dict only; callers run on
+    worker threads.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._answers: dict[str, tuple[AgentsDirRevision, dict[str, T]]] = {}
+
+    def get(self, agents_dir: Path, key: str, compute: Callable[[], T]) -> T:
+        """Return the memoized answer for *key* under *agents_dir*, or ``compute()``."""
+        dir_key = str(agents_dir)
+        revision = agents_dir_revision(agents_dir)
+        if revision is None:
+            return compute()
+        with self._lock:
+            cached = self._answers.get(dir_key)
+            if cached is not None and cached[0] == revision and key in cached[1]:
+                return cached[1][key]
+        answer = compute()
+        if agents_dir_revision(agents_dir) != revision:
+            return answer
+        with self._lock:
+            cached = self._answers.get(dir_key)
+            if cached is None or cached[0] != revision:
+                cached = (revision, {})
+                self._answers[dir_key] = cached
+            answers = cached[1]
+            if len(answers) >= _AGENTS_DIR_MEMO_MAX_KEYS:
+                answers.clear()
+            answers[key] = answer
+        return answer
 
 
 def clear_list_agents_cache() -> None:
@@ -1245,6 +1581,8 @@ def clear_list_agents_cache() -> None:
     Invalidation is normally automatic via the directory signature; call this
     only to force an immediate refresh (e.g. right after writing an agent
     file).
+
+    The generation invalidates spec-derived caches in other modules.
     """
     _LIST_AGENTS_CACHE.clear()
     global _PARSED_SPECS_GEN
@@ -1402,7 +1740,7 @@ def list_agents(
     JSON on the event loop.
     """
     d = agents_dir or _kiro_agents_dir()
-    project_files = project_agent_files(project_dir)
+    project_files = project_agent_files(project_dir, operation="list_agents", source="unknown")
     cache_key = (str(d), str(project_dir or ""))
     signature: tuple[_ListAgentsSig, ...] = (
         _dir_signature(d),

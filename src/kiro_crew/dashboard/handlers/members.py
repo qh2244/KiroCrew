@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 
 from aiohttp import web
 
@@ -42,6 +43,12 @@ logger = logging.getLogger(__name__)
 #: scan alike; the log itself rotates at ~256KiB so this is a display cap,
 #: not a durability boundary.
 _ACTIVITY_LIMIT = 50
+# How many log envelopes one backwards page reads. Larger than the display limit
+# because the log is shared: config, binding, rules, message, slot and patrol
+# events all sit between one member's activity records, so a page the size of the
+# display cap would usually need several round trips to fill it. This bounds the
+# allocation per page, which is the point -- it is not a cap on the answer.
+_ACTIVITY_PAGE = 500
 
 
 def _parse_activity_ts(raw: str) -> float:
@@ -184,6 +191,55 @@ def normalize_member_source(raw: object) -> str:
     return _SOURCE_PACKAGE
 
 
+def _slot_flush_generation(slot: object) -> tuple[int, int, int] | None:
+    """The three counters a live slot's persistence state is made of.
+
+    ``(len(messages), _disk_window_len, _dirty_gen)``: a row appended, a flush
+    that persisted rows, or an in-place edit each moves one of them. Sampled
+    BEFORE the roster observation and compared AFTER the transcript read, so a
+    slot whose state moved anywhere inside that window -- a reply that landed
+    after the pre-await sample but before the disk read -- is refused the
+    preview correction, the same observe/revalidate pair the roster fields
+    already get. ``None`` when there is no live slot (dormant threads carry no
+    in-memory rows, so their disk read is the only copy).
+    """
+    if slot is None:
+        return None
+    messages = getattr(slot, "messages", None)
+    count = len(messages) if isinstance(messages, (list, tuple)) else 0
+    return (
+        count,
+        int(getattr(slot, "_disk_window_len", 0) or 0),
+        int(getattr(slot, "_dirty_gen", 0) or 0),
+    )
+
+
+def _slot_has_unflushed_rows(slot: object) -> bool:
+    """Does this live slot hold rows the transcript on disk does not yet?
+
+    The same three gates ``chat_handlers._reconcile_slot_window`` checks before
+    trusting a disk read against a live window: in-memory rows past the last
+    flush (``len(messages) > _disk_window_len``), a rewind in flight, or unsaved
+    in-place edits. Module level so the roster read and its test share ONE
+    definition. Used by ``api_members`` to refuse the preview correction for a
+    member whose latest speech has reached the member log (the live emit fires at
+    in-memory append time) but not yet the transcript file the speech-only read
+    walks -- the disk read would return the PREVIOUS speech, the roster observed
+    before it already holds the new one, and the correction would durably
+    append the older quote on top. A later read, after the flush, still sees
+    the roster and the transcript agree, so skipping here loses nothing.
+    """
+    if slot is None:
+        return False
+    messages = getattr(slot, "messages", None)
+    pending = False
+    if isinstance(messages, (list, tuple)):
+        pending = len(messages) > int(getattr(slot, "_disk_window_len", 0) or 0)
+    return bool(
+        pending or getattr(slot, "_pending_rewrite", False) or getattr(slot, "_dirty_flag", False)
+    )
+
+
 async def api_members(request: web.Request) -> web.Response:
     """GET /api/members — crew roster with DM binding and cheap live status.
 
@@ -199,6 +255,12 @@ async def api_members(request: web.Request) -> web.Response:
         return denied
     state: DashboardState | None = request.app.get("state")
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
+
+    # The roster's redaction chokepoint, shared with ``GET /api/agents`` so the
+    # two endpoints cannot drift apart. Function-local for the same reason
+    # ``agent_panel`` is below: ``handlers.agents`` reaches back into this
+    # package at import time, so a module-level import would close the cycle.
+    from kiro_crew.dashboard.handlers.agents import _roster_avatar, _roster_mask
 
     rows: list[dict] = []
     for name, agent_cfg in cfg.agents.items():
@@ -222,18 +284,27 @@ async def api_members(request: web.Request) -> web.Response:
                 # would ship every future field (including a credential-shaped
                 # one) to the roster endpoint automatically. Each field below is
                 # here because a caller renders or routes on it.
+                # `name` and `slug` stay verbatim: they are the row's
+                # IDENTITY, which every per-member route is keyed on, and a
+                # credential-shaped name is refused at creation
+                # (`_name_would_be_masked`). Every other
+                # record value is agent-writable free text, so it goes through
+                # `_roster_mask` and is replaced WHOLESALE when the redactors
+                # would alter it.
                 "name": name,
                 "slug": slug,
-                "kiro_agent": agent_cfg.kiro_agent,
-                "workspace": agent_cfg.workspace,
-                "memory_store": agent_cfg.memory_store,
+                "kiro_agent": _roster_mask(agent_cfg.kiro_agent),
+                "workspace": _roster_mask(agent_cfg.workspace),
+                "memory_store": _roster_mask(agent_cfg.memory_store),
                 "memory_version": version,
-                "memory_owner": owner,
-                "model": agent_cfg.model,
-                # Presentation-only and validated by _safe_avatar at load, so
-                # it cannot carry a credential-shaped value. Without it every
-                # Members surface silently falls back to the name-derived face.
-                "avatar": agent_cfg.avatar,
+                "memory_owner": _roster_mask(owner),
+                "model": _roster_mask(agent_cfg.model),
+                # Presentation-only, but `_safe_avatar` pins only the SHAPE:
+                # its `traits` and `expressions` values are free text, so the
+                # avatar is masked leaf-by-leaf (`_roster_avatar`) rather than
+                # shipped raw. Without it every Members surface silently falls
+                # back to the name-derived face.
+                "avatar": _roster_avatar(getattr(agent_cfg, "avatar", {})),
                 # Roster-filter inputs. `source` lets the page collapse the
                 # package-installed majority the agent sync writes; it is
                 # NORMALIZED, never the raw config string (see
@@ -248,8 +319,12 @@ async def api_members(request: web.Request) -> web.Response:
                 # of these should handle a ticket", by the reader or by a router.
                 # An empty `triggers` is meaningful rather than missing: it is the
                 # operator's opt-out from being routed to at all.
-                "description": agent_cfg.description,
-                "triggers": agent_cfg.triggers,
+                "description": _roster_mask(agent_cfg.description),
+                "triggers": _roster_mask(agent_cfg.triggers),
+                # Presentation label only, masked like the other free text. The
+                # page shows it in place of `name` when non-empty; `name` stays
+                # the identity every per-member route and binding is keyed on.
+                "display_name": _roster_mask(agent_cfg.display_name),
             }
         )
 
@@ -260,6 +335,8 @@ async def api_members(request: web.Request) -> web.Response:
 
     bindings = await asyncio.to_thread(_read_bindings)
 
+    unflushed_slot_keys: set[str] = set()
+    flush_generation_before: dict[str, tuple[int, int, int] | None] = {}
     for row in rows:
         binding = bindings.get(row["slug"])
         # The binding's own `member` field is authoritative: a colliding slug's
@@ -271,12 +348,19 @@ async def api_members(request: web.Request) -> web.Response:
         row["slot_key"] = slot_key
         slot = state._slots.get(slot_key) if (state and slot_key) else None
         row["running"] = bool(slot.running) if slot is not None else False
+        # Read BEFORE the roster observation and the transcript read below: a
+        # slot with unflushed rows has speech on the member log the disk does
+        # not hold yet, so its speech-only read must not become a correction.
+        if slot is not None and _slot_has_unflushed_rows(slot):
+            unflushed_slot_keys.add(slot_key)
+        if slot_key:
+            flush_generation_before[slot_key] = _slot_flush_generation(slot)
 
     # Last activity, for the roster's most-recent-first ordering. The DM
     # transcript's mtime is the one durable signal that survives restarts and
     # covers live and dormant threads alike. File stats are IO — one thread
     # hop for the whole roster, mirroring the binding reads above.
-    def _read_transcript_tails() -> dict[str, tuple[float, str, bool]]:
+    def _read_transcript_tails() -> dict[str, tuple[float, str, bool, bool]]:
         if state is None or state.conversation_log is None:
             return {}
 
@@ -288,7 +372,7 @@ async def api_members(request: web.Request) -> web.Response:
             text, _ = _h.redact_credentials(text)
             return text
 
-        out: dict[str, tuple[float, str, bool]] = {}
+        out: dict[str, tuple[float, str, bool, bool]] = {}
         for row in rows:
             if not row["slot_key"]:
                 continue
@@ -302,21 +386,76 @@ async def api_members(request: web.Request) -> web.Response:
             mt = state.conversation_log.session_mtime(log_key)
             if not mt:
                 continue
-            preview, msg_ts, stopped = state.conversation_log.last_message_info(
+            # Speech only: the row's preview quotes what the member's chat
+            # draws (its speech), never a tool call or a patrol turn.
+            # `last_speech_info`, not `last_message_info`: the fourth value says
+            # whether the tail walk reached the start of the log. An EMPTY
+            # answer from a walk that did not is "spoke further back than the
+            # windows reach", not "never spoke", and must never be written
+            # into the member log as the authority (the reconcile below).
+            preview, msg_ts, stopped, exhaustive = state.conversation_log.last_speech_info(
                 log_key, sanitize=_sanitize
             )
             # Order by the newest MESSAGE, not the file: metadata writes and
             # rehydration bump the mtime without any new message, which made
             # rows reorder with no visible cause. mtime remains only as the
             # fallback for pre-timestamp transcript rows.
-            out[row["slot_key"]] = (msg_ts or mt, preview, stopped)
+            out[row["slot_key"]] = (msg_ts or mt, preview, stopped, exhaustive)
         return out
 
+    def _observe_rosters() -> dict[str, dict]:
+        # The roster projection as it stood BEFORE the transcript read below.
+        # `reconcile_member_preview` corrects the folded preview to what the
+        # transcript says, and refuses when the roster has moved since THIS
+        # observation: a live `member/message` that lands after it is either
+        # already in the transcript the read sees (so the read agrees with
+        # it) or newer than the read (so the correction is stale and refused).
+        # Observing AFTER the read would let a message in between be read as
+        # unchanged and then overwritten by the older transcript answer.
+        from kiro_crew.eventlog.service import get_service
+
+        svc = get_service()
+        seen: dict[str, dict] = {}
+        for row in rows:
+            slug = row["slug"]
+            if slug in seen:
+                continue
+            try:
+                snap = svc.snapshot(slug)
+                values = snap.get("values", {}) if isinstance(snap, dict) else {}
+                seen[slug] = dict(values.get("roster") or {})
+            except Exception:
+                seen[slug] = {}
+        return seen
+
+    observed_rosters = await asyncio.to_thread(_observe_rosters)
     tails = await asyncio.to_thread(_read_transcript_tails)
+    # Slot keys whose speech-only read is trustworthy enough to correct the
+    # member log with: a non-empty quote, or an empty one from a walk that
+    # reached the start of the log -- and, either way, only for a slot whose
+    # in-memory rows had all been flushed when this read started
+    # (`_slot_has_unflushed_rows`). An empty read that ran out of window, or a
+    # read racing a flush, is left alone -- the row still carries the read here
+    # (the client falls back to the folded quote), but nothing is written.
+    preview_authoritative: set[str] = set()
     for row in rows:
-        mt, preview, stopped = tails.get(row["slot_key"], (0.0, "", False))
+        mt, preview, stopped, exhaustive = tails.get(row["slot_key"], (0.0, "", False, False))
         row["last_active_ts"] = mt
         row["last_message"] = preview
+        if not (preview or exhaustive) or row["slot_key"] in unflushed_slot_keys:
+            continue
+        # Re-ask AFTER the awaits: a slot that was clean at the pre-await sample
+        # can have appended a reply during the roster observation or the disk
+        # read (its member/message emit fires at in-memory append time, the
+        # transcript copy lands at flush), and the disk read would then hold
+        # the PREVIOUS speech. Both the state now and the generation since the
+        # sample must agree, or the correction is refused for this read.
+        slot_now = state._slots.get(row["slot_key"]) if state else None
+        if slot_now is not None and _slot_has_unflushed_rows(slot_now):
+            continue
+        if _slot_flush_generation(slot_now) != flush_generation_before.get(row["slot_key"]):
+            continue
+        preview_authoritative.add(row["slot_key"])
         # A locale-independent boolean, NEVER the word "Stopped": the preview
         # is computed here where the client's locale is unknown, which is why
         # the trailing stop is SKIPPED from `last_message` rather than rendered
@@ -326,6 +465,125 @@ async def api_members(request: web.Request) -> web.Response:
         # stays byte-for-byte what it is without it.
         if stopped:
             row["last_message_stopped"] = True
+
+    # Per-member event-log projections + lazy config reconcile. Off-loop
+    # because ensure/append/snapshot are synchronous file IO (one fsync per
+    # append). Best-effort: a logging fault never breaks the roster, so a
+    # member whose log cannot be reconciled falls back to an empty projection
+    # rather than failing the endpoint. The config-derived row fields are
+    # sourced from the reconciled roster view — after reconcile they equal the
+    # live config, so a hand-edited config is corrected in the log AND the row
+    # stays byte-identical to what it would have carried straight from cfg.
+    agent_cfgs = {row["name"]: cfg.agents.get(row["name"]) for row in rows}
+
+    def _project_rows() -> dict[str, dict]:
+        from kiro_crew import eventlog_hooks
+        from kiro_crew.eventlog.service import get_service
+
+        svc = get_service()
+        out: dict[str, dict] = {}
+        # This map is keyed by SLUG while the roster is keyed by row, and a slug is
+        # a lossy fold, so two rows can land on one key. Whichever row is projected
+        # last would win it: in one order the log's own member loses its state to a
+        # stranger's blank, and in the other the stranger's row renders the owner's
+        # roster, activity, wake and driving state as its own. Counting the rows per
+        # slug FIRST makes the answer independent of iteration order -- a collided
+        # slug is blank for everyone, which is the same visibly-empty row the
+        # header-name guard below already serves, and never somebody else's data.
+        slug_rows = Counter(row["slug"] for row in rows)
+        for row in rows:
+            slug = row["slug"]
+            try:
+                if slug_rows[slug] > 1:
+                    logger.warning(
+                        "member slug %r is shared by %d members, so none of them "
+                        "gets a projection; rename one member so their slugs differ",
+                        slug,
+                        slug_rows[slug],
+                    )
+                    out[slug] = {"asOfSeq": -1, "values": {}}
+                    continue
+                # Hand over the config this read already loaded: ensure resolves a
+                # placeholder header name, and `name == slug` is true for any member
+                # whose name IS its own fold, so without this the roster would load
+                # the config once per row off the loop.
+                svc.ensure(slug, row["name"], cfg)
+                # A slug is LOSSY, and colliding names are supported: `Review_Agent`
+                # and `review-agent` both fold to `review-agent`, and each activity
+                # entry keeps the exact name so attribution survives. What does NOT
+                # survive is a whole-member PROJECTION: one log holds one member's
+                # folded roster, activity, wake and driving state, so serving it on a
+                # second member's row renders the first member's work as the second's.
+                # The header names the member the log belongs to, so a row that is
+                # not that member is served an empty projection instead of a wrong
+                # one. Logged at warning level because a blank row needs its reason.
+                # A header holding the SLUG is exempt: `ensure` writes the header only
+                # while the log is fresh, so a writer with no name in hand (the
+                # message path passes None) locks the slug in as the name for good.
+                # That placeholder names nobody, and a slug is a lossy fold, so it
+                # differs from almost every real name -- reading it as a second member
+                # would blank a member's own state over a value that never was a name.
+                logged = svc.logged_name(slug)
+                if logged is not None and logged != row["name"] and logged != slug:
+                    logger.warning(
+                        "member slug %r logs %r, so %r gets no projection; "
+                        "rename one member so their slugs differ",
+                        slug,
+                        logged,
+                        row["name"],
+                    )
+                    out[slug] = {"asOfSeq": -1, "values": {}}
+                    continue
+                snap = svc.snapshot(slug)
+                values = snap.get("values", {}) if isinstance(snap, dict) else {}
+                agent_cfg = agent_cfgs.get(row["name"])
+                appended = False
+                if agent_cfg is not None:
+                    appended = (
+                        eventlog_hooks.reconcile_member_config(
+                            slug, row["name"], agent_cfg, values.get("roster", {})
+                        )
+                        is not None
+                    )
+                # The transcript's speech-only preview (read above) is the
+                # authority for the roster's `last_message`; a fold that still
+                # quotes a pre-speech-only machinery preview is corrected here,
+                # to blank when the member has never spoken. Compared against
+                # the roster observed BEFORE the transcript read (not this
+                # later snapshot), so a message that spoke in between refuses
+                # the correction instead of being overwritten by it.
+                if row["slot_key"] in preview_authoritative:
+                    appended = (
+                        eventlog_hooks.reconcile_member_preview(
+                            slug,
+                            row["name"],
+                            row.get("last_message", ""),
+                            row.get("last_active_ts"),
+                            observed_rosters.get(slug, {}),
+                        )
+                        or appended
+                    )
+                if appended:
+                    # Re-snapshot only when a reconcile appended (the roster
+                    # fields would otherwise be stale for this response).
+                    snap = svc.snapshot(slug)
+                out[slug] = snap if isinstance(snap, dict) else {"asOfSeq": -1, "values": {}}
+            except Exception:
+                logger.debug("member projections failed for %r", slug, exc_info=True)
+                out[slug] = {"asOfSeq": -1, "values": {}}
+        return out
+
+    projections = await asyncio.to_thread(_project_rows)
+    # Same network-boundary redaction as the /history read and the projection
+    # WS push: a projection block carries agent-authored free-text (an activity
+    # record's `project`, message previews) and `svc.snapshot()` returns it raw,
+    # so the credential + exfiltration-URL chain has to run before it crosses to
+    # the browser or the roster list leaks what the sibling reads scrub.
+    from kiro_crew.eventlog.service import _redact_projection_value
+
+    for row in rows:
+        block = projections.get(row["slug"], {"asOfSeq": -1, "values": {}})
+        row["projections"] = _redact_projection_value(block)
 
     return web.json_response({"members": rows})
 
@@ -712,6 +970,19 @@ async def api_member_thread(request: web.Request) -> web.Response:
                 },
                 status=500,
             )
+        # Record the binding in the member's append-only log. The trust-file
+        # write above is the security fence and stays authoritative; this is
+        # the durable projection input for the roster's slot_key. Best-effort
+        # and off-loop (ensure/append are synchronous file IO); a logging fault
+        # never fails a binding the fence already persisted.
+
+        def _emit_binding() -> None:
+            from kiro_crew import eventlog_hooks
+            from kiro_crew.eventlog.types import MEMBER_BINDING
+
+            eventlog_hooks.emit(slug, member_name, MEMBER_BINDING, {"slot_key": slot.key})
+
+        await asyncio.to_thread(_emit_binding)
 
     return web.json_response({"slot_key": slot.key, "slug": slug, "member": member_name})
 
@@ -754,7 +1025,70 @@ async def api_member_activity(request: web.Request) -> web.Response:
             {"error": "member query parameter required", "code": "missing_member"}, status=400
         )
 
-    entries = await asyncio.to_thread(members_mod.read_activity, slug)
+    # Source the records from the member's append-only log: ACTIVITY_RECORD
+    # events for THIS exact member, unwrapped to the record dict each carries.
+    #
+    # The member filter and the timestamp parse run INSIDE this read, before any
+    # cap, because a log's newest N envelopes are not N of one member's activity
+    # records. The same log also carries config, binding, rules, message, slot and
+    # patrol events, and a colliding slug's log carries another exact name's
+    # records as well -- so capping the envelope read first and filtering second
+    # drops activity that is well inside the window the drawer promises.
+    #
+    # But the read is PAGED rather than asked for the whole log. `history` with
+    # `limit=None` materialises every event in the lifetime file into a list and
+    # reverses it, which is bounded only while the log still fits the retained tail
+    # (`MAX_RETAINED_EVENTS`); past that the allocation is the file's whole length,
+    # on a request path, for a response that shows `_ACTIVITY_LIMIT` rows. The log
+    # has no rotation, so outgrowing the tail is ordinary ageing rather than an
+    # extreme input. Paging keeps the filter where it has to be AND keeps the
+    # allocation bounded: walk backwards a page at a time and stop as soon as one
+    # more than the display cap has matched, which is all `capped` needs to know.
+    def _read_activity_records() -> list[tuple[float, int, dict]]:
+        from kiro_crew.eventlog.service import get_service
+        from kiro_crew.eventlog.types import ACTIVITY_RECORD
+
+        svc = get_service()
+        out: list[tuple[float, int, dict]] = []
+        before: int | None = None
+        while True:
+            page = svc.history(slug, before=before, limit=_ACTIVITY_PAGE)
+            if not page:
+                break
+            for event in page:
+                if event.get("type") != ACTIVITY_RECORD:
+                    continue
+                record = event.get("data")
+                if not isinstance(record, dict):
+                    continue
+                if record.get("member") != member:
+                    # A colliding slug's log holds records for another exact name;
+                    # they belong to that member's drawer, not this one's.
+                    continue
+                ts = _parse_activity_ts(record.get("ts", ""))
+                if ts <= 0:
+                    # A record without a readable timestamp cannot be placed on a
+                    # timeline; skip it rather than sorting garbage to the top.
+                    continue
+                # ``seq`` is the log's own append order, which is what the former
+                # read index stood in for -- and it stays the same number whatever
+                # slice this read returns, so same-second ties break identically.
+                out.append((ts, int(event.get("seq", 0)), record))
+            if len(out) > _ACTIVITY_LIMIT:
+                # One past the display cap is enough: the sort below can only trim
+                # the oldest tail, and `capped` is a boolean, not a total.
+                break
+            if len(page) < _ACTIVITY_PAGE:
+                break  # the log is exhausted
+            oldest = page[-1].get("seq")  # pages come newest-first
+            if not isinstance(oldest, int) or (before is not None and oldest >= before):
+                # No usable cursor, or one that did not move: stop rather than
+                # re-read the same page for ever.
+                break
+            before = oldest
+        return out
+
+    entries = await asyncio.to_thread(_read_activity_records)
 
     def _sanitize(text: str) -> str:
         # Same redaction chain the roster's message preview uses: a project
@@ -768,20 +1102,11 @@ async def api_member_activity(request: web.Request) -> web.Response:
         return text
 
     rows: list[tuple[float, int, dict]] = []
-    for idx, entry in enumerate(entries):
-        if entry.get("member") != member:
-            # A colliding slug's log holds records for another exact name;
-            # they belong to that member's drawer, not this one's.
-            continue
-        ts = _parse_activity_ts(entry.get("ts", ""))
-        if ts <= 0:
-            # A record without a readable timestamp cannot be placed on a
-            # timeline; skip it rather than sorting garbage to the top.
-            continue
+    for ts, seq, entry in entries:
         rows.append(
             (
                 ts,
-                idx,
+                seq,
                 {
                     "ts": ts,
                     "via": entry.get("via", "") or "chat",
@@ -806,6 +1131,152 @@ async def api_member_activity(request: web.Request) -> web.Response:
             # of asserting an exact count it cannot know.
             "capped": capped,
             "entries": [r[2] for r in rows[:_ACTIVITY_LIMIT]],
+        }
+    )
+
+
+async def api_member_briefing(request: web.Request) -> web.Response:
+    """GET /api/members/{slug}/briefing?member=<name> — a crewmate's own notes, read-only.
+
+    Feeds the Crewmates page panel's Notes tab. The briefing
+    (``members/<slug>/briefing.md``) is the crewmate's self-maintained standing
+    notes — an AGENT-written file, curated by the crewmate for its future self.
+    This endpoint reads and never writes, and the panel offers no editor for
+    the file: the dashboard's file viewer reads through a redacting path and
+    its Save writes the buffer back, so any in-dashboard edit of an
+    agent-written file could replace a secret the crewmate wrote in the
+    meantime with its placeholder. The notes are edited where the crewmate
+    writes them, outside the dashboard.
+
+    The text comes from :func:`members.read_member_briefing_bounded` and
+    inherits its total contract: a missing or unreadable file reads as ``""``
+    (the normal state of a fresh crewmate — never a 404), and content past
+    ``MEMBER_BRIEFING_MAX_CHARS`` is cut at the cap with a visible marker
+    (:func:`members.cap_member_briefing`, applied AFTER redaction so the cap
+    cannot split a token past the patterns), which the panel renders as-is so
+    the human sees the same overflow the crewmate is shown. ``supported`` is :func:`members.member_briefing_supported`:
+    on platforms without ``O_NOFOLLOW`` and the pinned ancestor walk the read
+    fails closed to ``""`` and the panel explains that from the flag rather
+    than presenting an empty briefing as "no notes yet". ``updated_ts`` is the
+    file's own mtime (epoch seconds) or ``null`` when there is no file.
+    ``redacted`` and ``truncated`` each say the wire text shows less than the
+    file holds (a secret replaced by its placeholder; a tail past the cap not
+    shown), so the panel can say so above the notes instead of leaving
+    placeholders and a marker unexplained. A successful read leaves a SEL row
+    (``members.briefing.read`` / ``allowed``), as the rules read does.
+
+    ``member`` (query, REQUIRED) is the exact crew name, same posture as the
+    activity endpoint: slugification is lossy, and the exact name is echoed
+    back so the frontend keys its cache by name rather than by a slug two
+    crewmates can share -- and, as on the rules endpoint, the exact name must
+    derive this slug, exist, and be the ONLY crew that derives it: the briefing
+    is one file per slug, so for a colliding slug the notes belong to neither
+    crewmate and the read is refused (409 ``briefing_slug_ambiguous``) rather
+    than shown -- with an Edit -- as one of theirs.
+    """
+    denied = await _deny_app_caller(request, "members.briefing")
+    if denied is not None:
+        return denied
+    # Owner gate, the rules endpoint's boundary: the briefing is the crewmate's
+    # private working memory, written for its owner. Any allowed Slack user can
+    # mint a dashboard session (`!dashboard`), so the app-caller guard alone
+    # would let a non-owner colleague read notes the owner never shared. Gated
+    # before any validation or file IO, so a denial costs no read.
+    owner_denied = await require_owner_dashboard_request(request, "members.briefing.read")
+    if owner_denied is not None:
+        return owner_denied
+    slug = request.match_info["slug"]
+    try:
+        members_mod.validate_slug(slug)
+    except MemberSlugError:
+        return web.json_response(
+            {"error": "invalid member slug", "code": "invalid_member_slug"}, status=400
+        )
+    member = request.query.get("member", "")
+    if not member or not _AGENT_NAME_RE.match(member):
+        return web.json_response(
+            {"error": "member query parameter required", "code": "missing_member"}, status=400
+        )
+    # The briefing is a PER-SLUG file and the slug is lossy (`Code_Reviewer` and
+    # `code-reviewer` share one), so for a colliding slug the file belongs to
+    # neither crewmate cleanly: showing it as one member's notes -- with an Edit
+    # that saves over it -- would let the two overwrite each other. Same posture
+    # as the rules endpoint: verify the exact member derives this slug, exists,
+    # and is the ONLY one that does; otherwise refuse with a coded answer the
+    # panel turns into a plain sentence. Config read off-loop (file IO).
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    try:
+        if members_mod.member_slug(member, cfg) != slug:
+            return web.json_response(
+                {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
+            )
+    except MemberSlugError:
+        return web.json_response(
+            {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
+        )
+    if member not in cfg.agents:
+        return web.json_response(
+            {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
+        )
+    if _member_names_for_slug(cfg, slug) != [member]:
+        return web.json_response(
+            {
+                "error": "multiple crews share this slug; their notes would be ambiguous",
+                "code": "briefing_slug_ambiguous",
+            },
+            status=409,
+        )
+
+    supported = members_mod.member_briefing_supported()
+
+    # The pinned, bounded open (text + mtime from one descriptor) is blocking
+    # file IO: one hop off the loop.
+    text, updated_ts, read_bounded = await asyncio.to_thread(
+        members_mod.read_member_briefing_bounded, slug
+    )
+
+    # Same redaction chain as the activity endpoint: the briefing is an
+    # AGENT-written file, so a token the crewmate pasted into its own notes
+    # would otherwise cross this network boundary into the browser verbatim.
+    # Run on the whole BOUNDED buffer, BEFORE the character cap: a redaction
+    # over already-capped text cannot match a token the cap split in two, and
+    # the plaintext half would cross the boundary unmatched. The cap comes
+    # after -- judged on the REDACTED length, so a briefing that only
+    # overflowed before its placeholders shrank it is shown whole -- and drops
+    # a trailing split word for the same reason (the bounded read has an edge
+    # of its own).
+    text, url_hits = _h.redact_exfiltration_urls(text)
+    text, cred_hits = _h.redact_credentials(text)
+    text, truncated = members_mod.cap_member_briefing(text, read_bounded, drop_split_tail=True)
+    # Whether the text on the wire shows less than the file holds, so the panel
+    # can say so above the notes: ``redacted`` when a placeholder replaced a
+    # secret, ``truncated`` when the marker stands in for the tail.
+    redacted = bool(url_hits or cred_hits)
+
+    # Audit the disclosure, as the rules read does: WHO read a crewmate's
+    # private notes matters as much as who was refused, and a denied-only
+    # trail cannot answer "was this boundary disclosed". Best effort -- an
+    # audit must never change the outcome.
+    try:
+        _sel().log_api_access(
+            caller=request.remote or "",
+            operation="members.briefing.read",
+            outcome="allowed",
+            source="dashboard",
+            resources=f"slug={slug}",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for members.briefing.read failed", exc_info=True)
+
+    return web.json_response(
+        {
+            "slug": slug,
+            "member": member,
+            "supported": supported,
+            "text": text,
+            "updated_ts": updated_ts,
+            "redacted": redacted,
+            "truncated": truncated,
         }
     )
 
@@ -1000,6 +1471,18 @@ async def api_member_rules_put(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "could not persist rules", "code": "rules_write_failed"}, status=500
         )
+
+    # Record the rules change in the member's append-only log. The trust-file
+    # write above is the security fence and stays authoritative; this is the
+    # durable event so the log reflects the current rules text. Best-effort and
+    # off-loop; a logging fault never fails a save the fence already persisted.
+    def _emit_rules() -> None:
+        from kiro_crew import eventlog_hooks
+        from kiro_crew.eventlog.types import MEMBER_RULES
+
+        eventlog_hooks.emit(slug, member, MEMBER_RULES, {"text": rules})
+
+    await asyncio.to_thread(_emit_rules)
 
     # Same audit posture as the GET: a successful boundary WRITE is the event
     # an owner most needs a trace of — it is the moment the member's safety

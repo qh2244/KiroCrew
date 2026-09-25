@@ -239,6 +239,28 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
     link.symlink_to(target, target_is_directory=True)
 
 
+def plant_day_link(link: pathlib.Path, secret_file: pathlib.Path) -> None:
+    """Plant a reparse point at the dated history name ``link`` that leads outside.
+
+    The property under test is that a memory reader never publishes bytes that
+    live outside the memory tree when the agent-writable dated ``.md`` name is a
+    reparse point. On POSIX the planted shape is a FILE symlink to
+    ``secret_file``, the exact credential-exfiltration vector. On Windows a file
+    symlink needs SeCreateSymbolicLinkPrivilege, so the stand-in is a directory
+    JUNCTION at ``link`` pointing at ``secret_file.parent``: a junction needs no
+    privilege, is a reparse point at the same dated name, and the guarded reader
+    refuses it through ``is_link_or_junction`` and its non-regular check, so the
+    outside directory's contents can never be read as a day. Both variants keep
+    the assertion running on every CI platform instead of skipping it.
+    """
+    if platform_compat.IS_WINDOWS:
+        import _winapi
+
+        _winapi.CreateJunction(str(secret_file.parent), str(link))
+        return
+    link.symlink_to(secret_file)
+
+
 def host_abs(*parts: str) -> str:
     """A fixture path that is absolute on THIS host: ``/opt/shims`` or ``C:\\opt\\shims``.
 
@@ -296,6 +318,43 @@ REDOS_LARGE_BUDGET_SECONDS = 2.0
 #: Pump lengths for the polynomial class, ascending so a cubic overruns at 2 000
 #: (8e9 steps) before 20 000 is ever attempted.
 REDOS_LARGE_PUMPS = (200, 2_000, 20_000)
+
+# The PEM anchor is ASSEMBLED from fragments and split mid-word, so no source line
+# here carries a whole BEGIN...KEY header for the internal content scan to flag.
+# The runtime value is byte-identical to the marker the redactor matches.
+_PEM_DASHES = "-" * 5
+_PEM_TAIL_HALF = f"ATE KEY{_PEM_DASHES}\nMIIBOgIBAAJBAKJ2\n"
+
+#: Credential shapes a message cap can SEVER. Each half is clean on its own, so
+#: scrubbing the two pieces separately sees nothing, while a reader shown them one
+#: after the other sees the key -- the platform renders the markup away.
+#:
+#: One row per character class a hand-written guard has to know about, plus the
+#: shapes such a class cannot reach: a comma inside a link target, a cut through a
+#: key carrying no markup at all, and a cut inside a link's URL -- which is the one
+#: shape the two readings of a join disagree about, since completing the link hides
+#: the URL from a scan of the concatenation while the screen still shows it.
+#:
+#: Shared because two suites pin the same table -- the primitive that decides where
+#: a cut may fall (``test_display_split_safety.py``) and the renderer that applies
+#: it (``test_wecom_renderer.py``) -- and a duplicated fixture table drifts.
+CREDENTIAL_STRADDLE_SHAPES = [
+    pytest.param("[AKIA](https://ex.test/a,b)", "IOSFODNN7EXAMPLE", id="link-target-comma"),
+    pytest.param(
+        "Authorization: Bearer",
+        " abcdefghijklmnopqrstuvwxyz0123456789",
+        id="header-whitespace",
+    ),
+    pytest.param("AKIAIOSF_", "_ODNN7EXAMPLE", id="underscore-emphasis"),
+    pytest.param("AKIAIOSF~", "~ODNN7EXAMPLE", id="tilde-emphasis"),
+    pytest.param("https://evil.test/?q=AKIAIOSFODNN7", "EXAMPLE.", id="url-punctuation"),
+    pytest.param("[l](https://ex.test/x/AKIAIOSF", "ODNN7EXAMPLE)", id="cut-inside-a-url"),
+    pytest.param(f"{_PEM_DASHES}BEGIN RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor"),
+    pytest.param(
+        f"{_PEM_DASHES}BEG**IN** RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor-markup-split"
+    ),
+    pytest.param("AKIAIOSF", "ODNN7EXAMPLE", id="no-markup-at-all"),
+]
 
 
 def assert_rejected_without_backtracking(reject, build_pump) -> None:
@@ -771,6 +830,33 @@ def _reset_degraded_config_observations():
 
 
 @pytest.fixture(autouse=True)
+def _reset_channel_turn_ceiling():
+    """Forget the channel turn ceiling's process-global per-conversation counts.
+
+    ``kiro_crew.messaging.turn_ceiling`` keeps ONE counter for the whole process
+    (``_SHARED``), keyed by session key, so a counted turn outlives the test that
+    drove it. Tests share one interpreter and the Slack, Telegram and Discord
+    inbound routes all drive the same handful of session keys, so a worker that
+    runs more gated channel turns under one key than the ceiling allows latches
+    that conversation for the rest of the worker: every LATER test on the same key
+    gets a refused turn instead of the behaviour it asserts, in files that never
+    mention the ceiling. A wide shard reaches the default of 90 and reds
+    ``test_slack_success_after_delivery_10050.py``, whose native-route tests then
+    book neither success nor failure because the handler returns at the gate.
+
+    The notification sink is module-global for the same reason and is cleared with
+    it, so a test that registers an observer cannot be heard by the next one.
+    """
+    from kiro_crew.messaging.turn_ceiling import set_notification_sink, shared_ceiling
+
+    shared_ceiling().clear()
+    set_notification_sink(None)
+    yield
+    shared_ceiling().clear()
+    set_notification_sink(None)
+
+
+@pytest.fixture(autouse=True)
 def _restore_autonudge_singleton():
     """Floor under ``autonudge._INSTANCE`` — the process-global service reference.
 
@@ -970,11 +1056,20 @@ def _reset_live_execution_records():
     def clear():
         for name, attribute in (
             ("kiro_crew.execution_context", "_LIVE_EXECUTIONS"),
+            ("kiro_crew.execution_context", "_VOUCHED_EXECUTIONS"),
             ("kiro_crew.subagent_persistence", "_LIVE_RUN_STATES"),
         ):
             module = sys.modules.get(name)
             if module is not None:
                 getattr(module, attribute).clear()
+        # The overflow throttle is scalar process state, not a container, so it
+        # needs its own reset. A test that leaves the flag ARMED makes the next
+        # test's first episode silent, which reads as a missing log line rather
+        # than as leaked state.
+        execution = sys.modules.get("kiro_crew.execution_context")
+        if execution is not None:
+            execution._vouched_overflow_reported = False
+            execution._vouched_overflow_count = 0
 
     clear()
     try:

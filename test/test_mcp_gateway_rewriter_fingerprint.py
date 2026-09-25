@@ -639,6 +639,27 @@ def test_pre_cmd_safe_schema_forces_regeneration(
     assert rewrite_counter["n"] == before + 2
 
 
+def test_pre_governed_passthrough_schema_forces_regeneration(
+    tmp_path: Path, rewrite_counter: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema 7 overlay can hold a stub for a server that must not be pooled.
+
+    A registry-governed or muted entry passes through unwrapped, and its inputs
+    are identical either way -- so the stat fingerprint alone sees no change and
+    a kept overlay keeps a stub whose name ``injection_server_names`` collects.
+    That stub launches the server at session level: for a marked entry, one whose
+    launch belongs to the administrator's catalog; for a muted one, the server the
+    user silenced. The schema is what rejects such an overlay on upgrade.
+    """
+    _mk_tree(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 7)
+        _rewrite(tmp_path)
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 2
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows executable casing")
 @pytest.mark.parametrize("transient_settings_fault", [False, True])
 @pytest.mark.parametrize("rename_command", [False, True])
@@ -817,19 +838,19 @@ def test_transient_agent_read_failure_keeps_the_previous_overlay(
     assert sidecars_before  # _mk_tree declares env, so sidecars exist
 
     _bump_mtime(src / "agent-1.json")  # invalidate so the next call rewrites
-    # Specs are read through the hardened gate (``agent_discovery``'s
-    # ``safe_read_file_bytes``), which reports an unreadable file as ``None``;
-    # the strict reader turns that into the transient ``OSError`` handled here.
-    real_read = agent_discovery.safe_read_file_bytes
+    # Specs are read through ``agent_discovery._read_spec_bytes``, whose
+    # unreadable file surfaces as ``OSError``; the strict reader lets that
+    # propagate as the transient ``OSError`` handled here.
+    real_read = agent_discovery._read_spec_bytes
     fail = {"on": True}
     victim_src = (src / "agent-1.json").resolve()
 
-    def flaky(raw: str) -> bytes | None:
-        if fail["on"] and Path(raw) == victim_src:
-            return None
-        return real_read(raw)
+    def flaky(real: Path) -> bytes:
+        if fail["on"] and Path(real) == victim_src:
+            raise OSError(errno.EACCES, "agent spec could not be read", str(real))
+        return real_read(real)
 
-    monkeypatch.setattr(agent_discovery, "safe_read_file_bytes", flaky)
+    monkeypatch.setattr(agent_discovery, "_read_spec_bytes", flaky)
     _rewrite(tmp_path)
     fail["on"] = False
 
@@ -1228,18 +1249,19 @@ def test_transient_source_read_failure_is_not_cached(
     """A file that stats fine but fails to READ must not freeze an incomplete
     output set: readability can return without the stat signature changing."""
     _mk_tree(tmp_path)
-    # Agent specs are read through the hardened gate; ``None`` from it is the
-    # transient read failure the rewriter keeps the previous overlay for.
-    real_read = agent_discovery.safe_read_file_bytes
+    # Agent specs are read through ``agent_discovery._read_spec_bytes``; an
+    # ``OSError`` from it is the transient read failure the rewriter keeps the
+    # previous overlay for.
+    real_read = agent_discovery._read_spec_bytes
     fail = {"on": True}
 
-    def flaky(raw: str) -> bytes | None:
-        p = Path(raw)
+    def flaky(real: Path) -> bytes:
+        p = Path(real)
         if fail["on"] and p.name == "agent-0.json" and "agents" in p.parts:
-            return None
-        return real_read(raw)
+            raise OSError(errno.EACCES, "agent spec could not be read", str(real))
+        return real_read(real)
 
-    monkeypatch.setattr(agent_discovery, "safe_read_file_bytes", flaky)
+    monkeypatch.setattr(agent_discovery, "_read_spec_bytes", flaky)
     _rewrite(tmp_path)
     fail["on"] = False
 

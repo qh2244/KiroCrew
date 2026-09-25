@@ -66,7 +66,7 @@ from kiro_crew.mcp_core import (
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.pinned_fs import fd_real_path
-from kiro_crew.platform import current_context
+from kiro_crew.platform import current_context, redact_log_via_context
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import _AGENT_DENIED_ENV_KEYS
@@ -949,6 +949,59 @@ def _audit_fire_time_decision(job_id: str, scope: str, outcome: str, reason: str
         logger.debug("fire-time governance audit emit failed", exc_info=True)
 
 
+def _vet_app_owner_enabled(job: CronJob) -> str | None:
+    """Refuse the fire of an app-installed cron unless its app is enabled.
+
+    An app's jobs are COPIES: the installer writes them into the global cron
+    store, where they then live on their own. Disabling the app removes them
+    only when a cron service is reachable at that moment, so a disable that
+    happened without one left the jobs enabled and firing -- the app toggle was
+    not a kill switch. Re-asking at FIRE time heals a store that has already
+    drifted, with no migration, and a re-enable resumes the jobs on its own
+    because nothing here is persisted.
+
+    Ownership is the ``created_by`` stamp :class:`~kiro_crew.apps.cron_sdk.CronSDK`
+    writes (``app:<name>``), never the job's name prefix: a person's job may be
+    named anything, and only the stamp is host-written.
+
+    It audits its own allow as well as its deny, which the call site cannot do:
+    only this function knows whether a job is app-owned at all.
+
+    Only a definite ``True`` authorizes -- an unreadable state, or a stamp that is
+    not a safe lookup key, is no licence to run an app's code. ``apps.backend``
+    reads it the same closed way before spawning one, reserving ``is not False``
+    for callers whose action -- deleting files -- cannot be undone. A skip is
+    recoverable and persists nothing, so the next fire re-asks.
+    """
+    # Imported here, not at module scope: kiro_crew.apps imports back through
+    # kiro_crew.security into this module's own import graph.
+    from kiro_crew.apps.cron_sdk import app_owner_name
+    from kiro_crew.apps.manager import _check_path_safety, app_enabled_state
+
+    app = app_owner_name(getattr(job, "created_by", ""))
+    if not app:
+        return None
+    # The store is writable in-sandbox and the stamp is only type-checked on
+    # load, so the name is refused rather than joined onto a filesystem path.
+    safe = _check_path_safety(app)
+    state = app_enabled_state(app) if safe else None
+    if state is True:
+        _audit_fire_time_decision(job.id, "app_owner_enabled", "allowed")
+        return None
+    # Gate-side LOG text goes through the companion-aware pass, not the baseline.
+    verdict = "is disabled" if state is False else "is not readable as an enabled app"
+    logger.warning(
+        "Cron %r (%s) skipped: owning app %s %s",
+        job.name,
+        job.id,
+        redact_log_via_context(app),
+        verdict,
+    )
+    reason = f"Error: cron is owned by app {redact(app)}, which {verdict}"
+    _audit_fire_time_decision(job.id, "app_owner_enabled", "denied", reason)
+    return reason
+
+
 def vet_job_at_fire_time(job: CronJob) -> str | None:
     """Re-run the governance gates for an already-scheduled cron job at FIRE time.
 
@@ -958,6 +1011,8 @@ def vet_job_at_fire_time(job: CronJob) -> str | None:
     rules that were in force when it was created. The gateway's
     ``_cron_callback`` calls this immediately before executing every job kind:
 
+    - all kinds: the owning app's ``enabled`` state, for a job an app
+      installed (:func:`_vet_app_owner_enabled`);
     - all kinds: the ``capabilities.cron`` on/off gate
       (:func:`_vet_cron_capability_governance`), keyed ``cron:<job.id>`` so the
       SEL deny trail names the blocked job;
@@ -976,6 +1031,9 @@ def vet_job_at_fire_time(job: CronJob) -> str | None:
     exception handling records them exactly as the pre-existing bare
     resolution call did.
     """
+    reason = _vet_app_owner_enabled(job)
+    if reason:
+        return reason
     reason = _vet_cron_capability_governance(session_key=f"cron:{job.id}")
     if reason:
         # The capability deny already emitted its own governance_decision via
@@ -2707,7 +2765,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         except ValueError as e:
             return f"Error: {e}"
         if not updated:
-            return f"Job not found: {jid}"
+            return f"Error: job not found: {jid}"
         sel().log_api_access(
             caller="mcp",
             operation="cron.update",
@@ -2743,7 +2801,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"Error: {exc}"
         if removed:
             return f"Removed job: {jid}"
-        return f"Job not found: {jid}"
+        return f"Error: job not found: {jid}"
 
     if name == "cron_remove_all":
         jobs = svc.list_jobs(include_disabled=True)
@@ -2792,7 +2850,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"Error: {exc}"
         if paused:
             return f"Paused job: {jid}"
-        return f"Job not found: {jid}"
+        return f"Error: job not found: {jid}"
 
     if name == "cron_resume":
         jid = args["job_id"]
@@ -2808,7 +2866,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"Error: {exc}"
         if resumed:
             return f"Resumed job: {jid}"
-        return f"Job not found: {jid}"
+        return f"Error: job not found: {jid}"
 
     if name == "cron_trigger":
         jid = args["job_id"]
@@ -2818,7 +2876,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # ``trigger_cron_job`` is the enforcing one; this only makes its reason
         # reachable, since an unknown id never survives the ownership lookup.
         if not _JOB_ID_RE.fullmatch(jid):
-            return f"Invalid job ID format: {jid}"
+            return f"Error: Invalid job ID format: {jid}"
         # Ownership check
         own_err = _check_cron_job_ownership(svc, jid)
         if own_err:
@@ -2840,7 +2898,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         )
         if ok:
             return f"{msg} - executing now."
-        return msg
+        # The audit row above already calls this an error; say so on the wire.
+        return msg if msg.startswith("Error:") else f"Error: {msg}"
 
     if name == "cron_secret_request":
         jid = args["job_id"]
@@ -2960,4 +3019,5 @@ def run_mcp_server() -> None:
         _list_tools,
         _call_tool,
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+        error_prefix_is_error=True,
     )

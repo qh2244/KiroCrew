@@ -50,16 +50,28 @@ export const PIERRE_COMPACT_HEADER_CSS = `
 [data-change-icon]{width:13px;height:13px}
 `
 
-/** Clears the file header's left edge for DiffBlock's fold chevron.
+/** The chat file-row header look, shared by the two places that draw it.
  *
- *  The chevron is a 32px square overlaid at the block's top-left corner, OUTSIDE
- *  the shadow root. Pierre's `default` header starts its filename at
- *  `padding-inline: 16px`, so without this the name sits under the chevron. Only
- *  applied when a block carries `onFold`; a block without the handle keeps the
- *  library's inset. Matches the `pl-8` the plain-mode stand-in header uses. */
-export const PIERRE_FOLD_HANDLE_GUTTER_CSS = `
-[data-diffs-header="default"]{padding-inline-start:32px}
-`
+ *  `FileChangeChips` injects these into Pierre's shadow header through
+ *  `unsafeCSS` (`ROW_CSS_BASE` in components/fileChangeChipsCss.ts), and the
+ *  light-DOM header rows the oversized pair draws for itself — its plain
+ *  fallback and its opted-in line-by-line state (`PlainFilePairHeader`) — apply
+ *  the same values inline, because a shadow-scoped stylesheet cannot reach
+ *  them. One source for the numbers, so a card's header reads the same
+ *  whether Pierre or this code draws it, and an oversized row's header cannot
+ *  drift from the within-budget row above it.
+ *
+ *  Background: half-way between the chat canvas and --bg-elevated — the full
+ *  elevated tone reads as prominently as the composer and pulls the eye to the
+ *  header instead of the change it labels. Metadata group: a fixed width so the
+ *  diffstat indicator starts at the SAME x on every row (the counts are 1–3
+ *  digits wide and Pierre omits a count span entirely when its side is zero,
+ *  so an unfixed group narrows on an additions-only file); sized for two 4ch
+ *  counts, the 46px indicator and the gaps between them. */
+export const DIFF_HEADER_BG_CSS = 'color-mix(in srgb,var(--bg-elevated) 50%,var(--bg))'
+export const DIFF_HEADER_PADDING_INLINE_PX = 10
+export const DIFF_HEADER_COUNT_MIN_WIDTH_CH = 4
+export const DIFF_HEADER_META_W_PX = 124
 
 /** Gives every collapsed-region separator the separator tint.
  *

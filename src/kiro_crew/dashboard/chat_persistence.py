@@ -39,6 +39,7 @@ from kiro_crew.dashboard.chat_utils import (
     _redact_meta_for_role,
     _sync_dashboard_slots,
     effective_session_key,
+    redact_display_content,
     session_key_for,
     slot_history_key,
     slot_transcript_key,
@@ -134,6 +135,16 @@ def _rehydrate_title_refresh_mark(stored: object) -> int:
     return 0
 
 
+def _rehydrate_title_low_signal(stored: object) -> bool:
+    """Resolve the persisted low-signal flag; absent/invalid means False.
+
+    A legacy session written before the field existed rehydrates as False —
+    the conservative default, since re-arming the early refresh on old
+    sessions would spend one-liner calls their budget never accounted for.
+    """
+    return stored is True
+
+
 def _rehydrate_slot_title(
     slot: _ChatSlot,
     raw_title: str,
@@ -154,6 +165,7 @@ def _rehydrate_slot_title(
     slot._titled = titled
     slot._title_origin = _rehydrate_title_origin(titled, metadata.get("title_origin"))
     slot._title_refresh_mark = _rehydrate_title_refresh_mark(metadata.get("title_refresh_mark"))
+    slot._title_low_signal = _rehydrate_title_low_signal(metadata.get("title_low_signal"))
 
 
 _MAX_HISTORY_CHARS = 8000
@@ -1005,7 +1017,7 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
         slot.messages[-1]["variants"] = [  # type: ignore[assignment]
             {
                 **v,
-                "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0],
+                "content": redact_display_content(v.get("content", "")),
             }
             for v in m["variants"]
             if isinstance(v, dict)
@@ -1751,8 +1763,7 @@ def _rehydrate_slot_from_history(
             # stays raw because its author is its only reader, but `system` MUST be
             # redacted — the write path excludes it, so system bytes reach disk raw.
             if role != "user":
-                content, _ = redact_exfiltration_urls(content)
-                content, _ = redact_credentials(content)
+                content = redact_display_content(content)
             slot.append(
                 role,
                 content,
@@ -2291,8 +2302,7 @@ def _apply_recent_session(
         # measured rationale (content ~0.4s / ~204 readers, meta ~5.5s /
         # 31 readers that touch only control fields outside the emit sites).
         if role != "user":
-            content, _ = redact_exfiltration_urls(content)
-            content, _ = redact_credentials(content)
+            content = redact_display_content(content)
         slot.append(
             role,
             content,
@@ -3696,6 +3706,14 @@ def _save_slot_to_history(
                     _mark = getattr(slot, "_title_refresh_mark", 0)
                     if _mark:
                         fields["title_refresh_mark"] = _mark
+                    # Title-coupled like the two fields above, and written
+                    # UNCONDITIONALLY: _persist_title is the primary writer but
+                    # returns False without retry on a transient failure, so a
+                    # full save must land the CURRENT boolean either direction
+                    # -- a skipped True loses the turn-one refresh after
+                    # restart, and a skipped False (flag just cleared by
+                    # consumption or manual regenerate) re-arms it.
+                    fields["title_low_signal"] = bool(getattr(slot, "_title_low_signal", False))
                 else:
                     fields["title"] = ""
                 if slot.agent:
@@ -3713,8 +3731,10 @@ def _save_slot_to_history(
                 # Clearable like memory_store: a name-only pick after a template
                 # pick must not keep advertising the template namespace.
                 fields["agent_kind"] = slot.agent_kind
-                if slot.project:
-                    fields["project"] = slot.project
+                # Written even when EMPTY: the merge is an upsert that cannot delete a key, so
+                # omitting a cleared project leaves the previous directory on disk to be read
+                # back as though the clear never happened.
+                fields["project"] = slot.project
                 if slot._app:
                     fields["app"] = slot._app
                 if slot._origin:
@@ -4022,6 +4042,12 @@ def _save_slot_to_history(
                     history_key,
                     expected_slot_name,
                 )
+                # A refusal is not a commit, and the periodic writer cannot tell
+                # the difference: it clears ``_dirty`` on any return that did not
+                # raise. Keeping the state owed is what makes this guard safe for
+                # a caller whose edit lives only in memory -- the same treatment
+                # the other retryable refusals in this function already apply.
+                _keep_owed_after_refusal(slot)
                 return False
             path.parent.mkdir(parents=True, exist_ok=True)
             meta_line: dict = {
@@ -4072,6 +4098,14 @@ def _save_slot_to_history(
                 _mark = getattr(slot, "_title_refresh_mark", 0)
                 if _mark:
                     meta_line["title_refresh_mark"] = _mark
+                # Title-coupled like the two fields above, and written
+                # UNCONDITIONALLY: _persist_title is the primary writer but
+                # returns False without retry on a transient failure, so the
+                # full save must land the CURRENT boolean either direction -- a
+                # skipped True loses the turn-one refresh after restart, and a
+                # skipped False (flag just cleared by consumption or manual
+                # regenerate) re-arms it.
+                meta_line["title_low_signal"] = bool(getattr(slot, "_title_low_signal", False))
             if slot.agent:
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
@@ -4698,6 +4732,32 @@ def session_was_deleted(state: DashboardState, slot: _ChatSlot) -> bool:
     return False
 
 
+def register_guarded_history_write(slot: _ChatSlot, save: "asyncio.Future[bool]") -> None:
+    """Make a truncating write visible to a retraction of this slot's name.
+
+    A close fences the slot, then waits for every future in this registry to
+    finish before it pops the name. A write that is not registered here is
+    invisible to that wait, so the close can pop while the write is still on its
+    way to the rename and a same-name replacement then adopts the truncated
+    transcript.
+
+    The registry holds FUTURES, not a count: a count released in an awaiter's
+    ``finally`` reads zero as soon as that awaiter is cancelled, while the worker
+    thread it dispatched runs on. A future completes when the thread returns,
+    whatever happened to the awaiter.
+
+    Anything that is not a real set is treated as an absent registry: a
+    compatibility caller may pass a slot double that synthesizes attributes, and
+    a synthesized object must not reach the done callback.
+    """
+    writes = getattr(slot, "_guarded_history_writes", None)
+    if not isinstance(writes, set):
+        writes = set()
+        slot._guarded_history_writes = writes
+    writes.add(save)
+    save.add_done_callback(writes.discard)
+
+
 async def save_slot_off_loop(
     state: DashboardState,
     slot: _ChatSlot,
@@ -4711,6 +4771,7 @@ async def save_slot_off_loop(
     expected_history_key: str | None = None,
     expected_slot_name: str | None = None,
     rows_only: bool = False,
+    issued_by_the_retraction: bool = False,
 ) -> bool:
     """Persist a slot from the event loop without blocking or dropping the save.
 
@@ -4762,7 +4823,11 @@ async def save_slot_off_loop(
     Returns ``False`` only when the save was skipped WITHOUT writing: the
     session was permanently deleted while the save awaited the lock (the
     delete-won guard in :func:`_save_slot_to_history`), or the routing moved
-    off ``expected_history_key``. Neither skip raises, for either
+    off ``expected_history_key``. A guarded write is also skipped when the slot
+    is already fenced for close, because the retraction of its name has passed
+    the point where it can wait for this write -- unless the retraction itself
+    issued it (``issued_by_the_retraction``), which the handover drain does and
+    nothing else does. Neither skip raises, for either
     ``best_effort`` mode, so a clean return does NOT prove a committed write.
     Callers that go on to republish the slot's content elsewhere (fork, the
     transfer export) must check the return; archival callers (close/cleanup)
@@ -4797,6 +4862,76 @@ async def save_slot_off_loop(
             inflight - 1 if type(inflight) is int and inflight > 0 else 0
         )
 
+    def _register_guarded_write(save: "asyncio.Future[bool]") -> None:
+        """Hold a guarded write's executor future until the WORKER completes.
+
+        ``_finish_guarded_metadata_write`` runs in THIS coroutine's ``finally``,
+        so a caller cancelled while the executor is running releases the count
+        with the worker thread still on its way to the rename. The future does
+        not share that fate: cancelling the awaiter either cancels the work
+        before it starts, in which case nothing is written, or fails to cancel a
+        thread already running and the future still completes when that thread
+        returns. A retraction of this slot's name orders itself after that
+        completion, which is a guarantee the count cannot give.
+        """
+        register_guarded_history_write(slot, save)
+
+    async def _dispatch_to_worker(active_loop: asyncio.AbstractEventLoop) -> bool:
+        if guarded_metadata and not issued_by_the_retraction and getattr(slot, "is_closing", False):
+            # A retraction of this slot's name is already past its own wait for
+            # the guarded writes registered below, so dispatching now would put a
+            # worker thread on its way to the rename with nothing left to order
+            # against it. The caller that reached here checked the same fence
+            # before its own awaits, and those awaits are where the fence went
+            # up; re-reading it HERE is what makes the pair decidable. There is
+            # no suspension between this read and the registration below, so the
+            # two possible interleavings are the only ones: fence first and this
+            # write refuses, or registration first and the retraction waits.
+            #
+            # The fence asks whether this write races a retraction. A write the
+            # retraction ITSELF issues does not: the handover drain runs inside
+            # the close that raised the fence, is sequenced by it, and is the
+            # last chance the original's unsaved rows have to reach disk.
+            # ``issued_by_the_retraction`` is how that caller says so, and only
+            # that caller passes it.
+            #
+            # Refusing writes nothing, which is the ``False`` contract this
+            # function already documents for a write its own guards decline. The
+            # close's archival save is unaffected for a second reason: it carries
+            # no authorized transcript key, so it is not a guarded write.
+            logger.warning(
+                "Refusing a guarded history write for %s: the conversation is being closed",
+                getattr(slot, "key", "?"),
+            )
+            # Refusing must not be silently FINAL. A metadata-only mutation
+            # (recreate title, folder filing, tag, pin, mode) calls this with
+            # ``force=True``, does not otherwise set ``_dirty``, and its callers
+            # publish on the strength of the acknowledged edit without reading
+            # this return. A close can raise the fence and then leave the slot
+            # live -- it refuses on a breached wait, and the sweep raises and
+            # releases the fence around a deferral -- so an edit landing in that
+            # window would be dropped and the old value would come back after a
+            # restart. Arming the flush is the same remedy this function's own
+            # exception arms use below, and it converges once the fence is down.
+            try:
+                slot._dirty = True
+            except Exception:  # noqa: BLE001 - a slot double may not accept it
+                pass
+            return False
+        save = active_loop.run_in_executor(None, _do)
+        if not guarded_metadata:
+            return await save
+        _register_guarded_write(save)
+        # Shield the FUTURE from this caller's cancellation. Cancelling an
+        # asyncio future returned by ``run_in_executor`` succeeds whatever the
+        # worker thread is doing -- the chained cancel of the underlying
+        # concurrent future cannot stop a thread already running -- so an
+        # unshielded await would resolve the registration above while the write
+        # is still on its way to the rename, which is the exact blindness the
+        # registration exists to remove. The thread runs on either way; shielding
+        # only keeps it observable.
+        return await asyncio.shield(save)
+
     guarded_metadata = expected_history_key is not None
     try:
         loop = asyncio.get_running_loop()
@@ -4823,7 +4958,7 @@ async def save_slot_off_loop(
         if guarded_metadata:
             _begin_guarded_metadata_write()
         try:
-            return await loop.run_in_executor(None, _do)
+            return await _dispatch_to_worker(loop)
         except Exception:  # noqa: BLE001 - best-effort durable copy
             # See the inline branch above: re-arm the periodic flush so a
             # swallowed metadata/message save is retried rather than lost.
@@ -4840,7 +4975,7 @@ async def save_slot_off_loop(
     if guarded_metadata:
         _begin_guarded_metadata_write()
     try:
-        return await loop.run_in_executor(None, _do)
+        return await _dispatch_to_worker(loop)
     finally:
         if guarded_metadata:
             _finish_guarded_metadata_write()
