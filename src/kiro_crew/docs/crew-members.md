@@ -69,7 +69,10 @@ over an ordinary session — the context you built up with it is where you left 
 Member threads are deliberately kept out of the Sessions list; the Crew Members
 page is their only home. The right-hand panel is the same one the chat page
 docks, so Files, Artifacts, Terminal and Browser all work against the thread,
-and its first tab is a read-only **Crew summary** of what the crewmate uses.
+and it opens on three crewmate tabs: **Notes** (what it learned — its own
+standing notes, read-only here), **Work log** (what it did) and **Dashboard**
+(the page it publishes itself). Setup — template, wake sources, memory, cloud —
+lives on the crewmate's detail page, not in the panel.
 
 A few situations make Kiro Crew refuse to open a thread rather than guess:
 
@@ -96,12 +99,28 @@ render as floors (`12+ chats`) instead of asserting a total.
 
 ## Creating and editing
 
-The only crewmate *configuration* the Crew Members page writes is the star on a
+**New crewmate** — the hero button on an empty roster, or the **+** menu in the
+roster header once one exists (its rows are **New crewmate** and **New team**)
+— opens an in-page dialog on the Crew Members page. It asks for a **Name** and what the crewmate is **Built from** (the
+starting setup it copies), plus an optional line on **what it looks after**;
+**Advanced** unfolds the workspace, model, triggers and session color. Creating
+opens the new crewmate's chat with a first greeting seeded for you. The name is
+free-form display text — spaces, punctuation, any script, emoji (`Dr. Eggbot 🥚`
+is a name) — and the dialog only refuses a blank name or one already on the
+roster before the request leaves the browser; the server owns every other rule
+(a credential-shaped name, hidden characters, the length cap) and its answer is
+shown in the dialog. The stable member id, path-safe slug and slot key are
+derived by the server and stay bounded identifiers, as does the **Built from**
+template id. Two crewmates whose names share a slug (`on_call` and `on-call`,
+say) are allowed: the server gives the second its own identity, so each keeps
+its own chat and memory.
+
+Beyond that, the only crewmate *configuration* the page writes is the star on a
 row, a roster preference stored on the crewmate. (Opening a member writes too,
-but only its own thread binding.) Every configuration edit — **Add member** and
-both Edit affordances — navigates to the crew manager — **Agent Capabilities → Crews**
-(`/capabilities?tab=crews`) — which is the single editor for name, template,
-model, reasoning effort, workspace, triggers, avatar and session color.
+but only its own thread binding.) Both **Edit** affordances still navigate to
+the crew manager — **Agent Capabilities → Crews** (`/capabilities?tab=crews`) —
+which remains the editor for an existing crewmate's name, template, model,
+reasoning effort, workspace, triggers, avatar and session color.
 
 From the CLI:
 
@@ -133,7 +152,7 @@ restore treat it.
 |---|---|
 | Crewmate | A named assistant of yours: template + workspace + memory + model. Picking one runs work as that crewmate, on its memory. |
 | Agent template | A shared spec in `~/.kiro/agents/`. Picking a template runs the shared template on the shared default memory and creates no crewmate. The chat agent picker groups the two separately for exactly this reason. |
-| Remote instance | Another Kiro Crew gateway this dashboard can reach, under **Settings → Instances**. A different machine, not a different assistant. |
+| Remote crew | Another Kiro Crew gateway this dashboard can reach, under **Settings → Remote Crew**. A different machine, not a different assistant. |
 
 ## Where you can pick a crewmate
 

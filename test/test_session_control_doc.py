@@ -2,7 +2,7 @@
 
 ``scripts/docs_lint.py`` gates a doc's links, its reachability from an index, and the
 paths it cites. None of that asks the question this page's whole value rests on: does
-it still describe the 14 tools the server actually advertises? A tool added to
+it still describe every tool the server actually advertises? A tool added to
 ``_tool_definitions`` and absent from the page is a capability an agent reading the
 shipped docs cannot find, and a tool the page names after the server drops it is worse
 — the agent calls it and gets ``Error: unknown tool``.
@@ -62,7 +62,9 @@ def test_the_page_names_every_advertised_tool(doc_text: str, advertised_tools: l
     tool_half = doc_text.split("## What you cannot reach", 1)[0]
     claimed = {
         match.group(1)
-        for match in re.finditer(r"`((?:session|chat_folder|chat_tag)_[a-z_]+)`", tool_half)
+        for match in re.finditer(
+            r"`((?:session|chat_folder|chat_tag|chat_session)_[a-z_]+)`", tool_half
+        )
     }
     assert claimed, "found no backticked tool names at all — the scan anchor moved"
     assert claimed <= advertised, (
@@ -139,14 +141,19 @@ def test_the_page_matches_the_session_control_group_and_the_channel_block(
     from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_TOOLS
     from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
 
-    assert len(SESSION_CONTROL_TOOLS) == 5
+    assert len(SESSION_CONTROL_TOOLS) == 11
     for tool in SESSION_CONTROL_TOOLS:
         assert f"`{tool}`" in doc_text
         assert tool in CHANNEL_AGENT_BLOCKED_TOOLS, (
             f"{tool} left the channel containment list; the page tells a channel agent "
-            "it is blocked from all five"
+            "it is blocked from every session tool"
         )
-    assert "all five\nsession tools" in doc_text or "all five session tools" in doc_text
+    # The claim is phrased WITHOUT a number on purpose: a count in the prose is a
+    # second place to update when a tool is added, and the page was already stale
+    # once that way. The set equality above is what pins the membership.
+    assert "blocked from every\nsession tool" in doc_text or (
+        "blocked from every session tool" in doc_text
+    )
 
 
 def test_every_tabulated_refusal_code_is_one_the_source_raises(doc_text: str) -> None:
@@ -252,18 +259,21 @@ def test_the_queue_row_matches_what_each_verb_does_to_the_queue(doc_text: str) -
 
 
 def test_the_documented_switch_defaults_match_config(doc_text: str) -> None:
-    """``agent.session_control`` and ``agent.member_dispatch`` defaults, from the section."""
+    """The agent switches the doc's table states, each read off ``AgentConfig``."""
     from kiro_crew.config.sections import AgentConfig
 
     agent_cfg = AgentConfig()
-    assert agent_cfg.session_control is True
-    assert agent_cfg.member_dispatch is True
-    for key in ("agent.session_control", "agent.member_dispatch"):
-        assert f"`{key}`" in doc_text
+    switches = ("session_control", "member_dispatch", "crew_panel")
+    for name in switches:
+        assert getattr(agent_cfg, name) is True, name
+        assert f"`agent.{name}`" in doc_text, name
     switch_table = doc_text.split("### Switches and ceilings", 1)[1]
-    assert (
-        switch_table.count("| `true` |") == 2
-    ), "the switches table must state both defaults as true, matching AgentConfig"
+    # Counted from the tuple above rather than written as a literal, so adding a
+    # fourth switch to the section fails on the missing ROW rather than on a
+    # number nobody updated.
+    assert switch_table.count("| `true` |") == len(
+        switches
+    ), "the switches table must state every default as true, matching AgentConfig"
 
 
 def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
@@ -289,3 +299,14 @@ def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
     assert (
         f"({int(STOP_WINDOW_SECS)} seconds)" in doc_text
     ), "the stop-retry window the page quotes must be stop_retry.WINDOW_SECS"
+    # The broadcast cap is quoted TWICE -- once in prose, once in the refusal
+    # table -- and both are pinned, because this page shipped `32` after the
+    # constant rose to 50: an agent reading it named a subset it never needed.
+    from kiro_crew.validation import MAX_BROADCAST_TARGETS
+
+    assert (
+        f"at most **{MAX_BROADCAST_TARGETS}** sessions are reachable" in doc_text
+    ), "the prose cap must be validation.MAX_BROADCAST_TARGETS"
+    assert (
+        f"A broadcast reaches at most {MAX_BROADCAST_TARGETS} sessions" in doc_text
+    ), "the refusal table's cap must be validation.MAX_BROADCAST_TARGETS"

@@ -3,7 +3,7 @@
 ## Overview
 
 Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/`) for
-managing KiroCrew feature worktrees (git worktrees of the main repo) and their isolated
+managing Kiro Crew feature worktrees (git worktrees of the main repo) and their isolated
 pod test instances. It runs as a managed app backend SUBPROCESS: an aiohttp server on the
 backend-assigned port, reached only through the gateway proxy. Every proxied request
 carries an HMAC signature (`X-KiroCrew-Proxy: <ts>:<hmac>` over
@@ -237,11 +237,11 @@ backend's namespace. See *Make Live → Pointer file*.
 A second, deliberately small pod surface exists for AGENT sessions, served **in the
 gateway process** rather than by the backend subprocess (`agent_pod_api.py`).
 
-Why it is separate rather than a reuse of the proxied routes above: an agent session
-runs behind a sandbox with its own user namespace, so it cannot `connect(2)` the
-systemd user-bus socket that every pod verb needs, and `kirocrew pod up` in an agent
-shell fails with a bare `Permission denied`. The gateway is the process the sandbox
-launcher descends from, so it holds the host bus. The agent reaches these routes the
+Why it is separate rather than a reuse of the proxied routes above: on Linux, an agent
+session runs behind a sandbox with its own user namespace, so it cannot `connect(2)`
+the systemd user-bus socket that pod lifecycle verbs need, and `kirocrew pod up` in
+an agent shell fails with a bare `Permission denied`. The gateway is the process the
+sandbox launcher descends from, so it holds the host bus. The agent reaches these routes the
 way it reaches any tool — an MCP call, then loopback HTTP — with no D-Bus passthrough
 into the sandbox. The proxied `/apps/dev-fleet/api/*` routes cannot serve this: they
 require a dashboard cookie or token, which an agent does not hold, and admitting an
@@ -249,7 +249,7 @@ internal-secret caller there would expose the app's whole backend surface.
 
 | Method | Route | Input | Description |
 |--------|-------|-------|-------------|
-| POST | `/api/apps/dev-fleet/pod/up` | `{worktree}` | Boot a pod; answers the CLI's `--json` handle (`base_url`, `token`, `port`, `ttl`). Provisioning is NOT reachable here: a cold venv + SPA build is minutes of work, and one blocking request for that dies to any timeout with no way to learn the outcome. An unbuilt worktree is refused with the CLI's own remedy; the dashboard's Provision button streams the same work under a run id |
+| POST | `/api/apps/dev-fleet/pod/up` | `{worktree}` | Boot a pod; answers the CLI's `--json` handle (`base_url`, `token`, `port`, `ttl`). The token is minted **in the gateway process** when pod config is available (see *Token mint runs in the gateway*); otherwise the CLI mints it. Provisioning is NOT reachable here: a cold venv + SPA build is minutes of work, and one blocking request for that dies to any timeout with no way to learn the outcome. An unbuilt worktree is refused with the CLI's own remedy; the dashboard's Provision button streams the same work under a run id |
 | POST | `/api/apps/dev-fleet/pod/down` | `{worktree}` | Stop the pod and reclaim its isolated HOME |
 | GET | `/api/apps/dev-fleet/pod/status?worktree=` | — | `{name, status, port, health}`, as `pod status --json` reports it |
 | GET | `/api/apps/dev-fleet/pod/list` | — | `{pods: [{name, port, health}]}` for every pod active on the host, unfiltered by repo |
@@ -259,7 +259,8 @@ Contract:
 - **Gated on the app being enabled** (`_require_enabled`), since routes are
   registered at startup and Dev Fleet ships `defaultEnabled: false`.
 - **No operator opt-in and no per-call approval, deliberately.** A pod runs the code
-  in a git worktree an agent can write, started by the user systemd manager, so it
+  in a git worktree an agent can write, started by the per-user service manager
+  (systemd `--user` on Linux or launchd on macOS), so it
   executes outside the agent's sandbox. That reachability is Kiro Crew's DOCUMENTED
   posture rather than something these routes introduce: `security.md`, under "Scoped
   user-bus locator forward", records that sandboxed agent shells legitimately run
@@ -288,6 +289,38 @@ Contract:
 - **No pod logic of its own.** Every handler delegates to the same `worktree_ops`
   helpers the dashboard's buttons call, so "up" means one thing and a pod's status
   has one definition.
+- **Token mint runs in the gateway when its pod config is available.** `_pod_up`
+  resolves config once before boot. With config, it boots the pod with
+  `pod up --no-token` and then mints the pod's 2h dashboard token
+  IN THIS GATEWAY PROCESS (`runtime.mint_token`, the same in-process path
+  `_pod_token` uses), stamping it into the `--json` handle. Before boot it captures
+  the expected worktree path. One executor callable holds `pod_name_mutex` while
+  strictly re-reading the checkout pin and minting. A missing or changed pin
+  returns `ok=False`, `code=pod_checkout_mismatch`, and no token; an unreadable
+  pin or another mint error returns `code=pod_token_mint_failed`. This prevents a
+  same-name pod from another checkout replacing the intended token recipient.
+  The gateway emits `pod.token` audit rows: `allowed` for a mint, `denied` for a
+  pin mismatch or unproven ownership, and `failure` for a mint error. Rows carry
+  the name and `ttl=2h`, plus the port once attributed, never the token; caller
+  is `dev_fleet` and source is `app`. Audit failures log a warning without changing
+  the mint result. Without config,
+  including the Windows CLI fallback, it omits `--no-token` and keeps the CLI's
+  token. An unproven port owner leaves `ok=True` and `token=""`, with a redacted
+  `warning` explaining why the credential is withheld; other mint errors fail
+  the operation. The CLI's `--no-token` emits the `pod.token` audit outcome
+  `skipped` with `reason=no-token`, and human output says the token is skipped
+  by request rather than claiming an ownership check failed. It must mint in
+  the gateway on Linux because of
+  who the pod's `/api/token/local` will certify: that route gates on
+  `local_owner_bootstrap_allowed`, which on Linux requires the CALLER to share the
+  pod gateway's user + mount namespaces. The `pod up` child is spawned through
+  `sandboxed_spawn_argv`, so on Linux it runs in its OWN user namespace, and the
+  pod refuses it with `member_owner_token_refused` — most visibly from a
+  crew-member session, whose runtime is itself a dedicated sandbox. The gateway is
+  the host-namespace process the sandbox launcher descends from, so it is the one
+  the pod accepts. This does NOT widen `/api/token/local`: a sandboxed foreign
+  process is still refused; the fix only moves the mint to a process the gate
+  already trusts.
 - **Refusals are 409 with a literal `code`** (`pod_up_failed`, `pod_down_failed`,
   `pod_status_failed`, `pod_list_failed`); malformed input is 400
   (`invalid_worktree`, `invalid_body`). A refused lifecycle op is a host-state
@@ -304,7 +337,7 @@ The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` too
 `kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
 verbatim — redacting it would hand back an unusable handle — which is safe because it
 is a 2h credential scoped to that pod's own gateway, minted server-side from the
-pod's `.local_secret` so the agent never touches the secret itself.
+pod's own internal-API credential so the agent never touches the secret itself.
 
 ## Authorization
 
@@ -440,8 +473,11 @@ worktree removal never blocks the gateway event loop.
 - `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
   Requires POSITIVE ownership proof and refuses when ownership is merely
   unprovable, unlike `health`, which keeps its reading: this call sends the pod's
-  own `.local_secret`, so failing open would hand a credential to whatever
-  answered
+  own internal-API credential, so failing open would hand a credential to whatever
+  answered. That credential resolves per listener first, from the pod home's
+  `run/gateway-<port>.secret`, and falls back to the shared `.local_secret` only
+  for a gateway predating the per-listener file — the shared slot is one per data
+  home, so a live second gateway leaves it naming the other generation
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
@@ -459,6 +495,64 @@ running" bug, issue #220). As defence-in-depth, `_pod_up` and `_pod_down` both
 re-check `runtime.active_names` after the CLI returns and fail closed
 (`pod not active after start` / `pod still active after shutdown`) — a CLI exit 0
 is never taken as proof of the state change, in either direction.
+
+### Pod runtime ownership
+
+Dev Fleet, the pod CLI and the pod test suite all reach the pod runtime as one
+namespace, `kiro_crew.pod.runtime`. That module holds the core: pod names and the
+pod exception types, the per-pod env file, git worktree resolution, a pod's
+identity paths, the `systemd --user` adapter with the launchd / Task Scheduler
+dispatch (`require_backend`, `is_active`, `main_pid`, `unit_state`,
+`active_names`, `recent_journal`), the lifecycle locks (`pod_name_mutex`,
+`pod_plane_mutex`), seed sanitization, `build_pod_env` and `_ensure_pod_dir`. Six
+owners build on that core. The core imports them at the end of its own body, once
+its own names are bound and before it installs its forwarding, so each owner's
+module-level bindings are taken when `kiro_crew.pod.runtime` is imported, as they
+were when it was one module, and never later inside a test's patch of the module
+they come from:
+
+| Owner | Owns |
+|---|---|
+| `runtime_ports` | `derive_port`, the recorded-claim scan and `allocate_port` |
+| `runtime_attestation` | `port_owner`: the gateway PID record against the service manager's `MainPID`, with listener corroboration |
+| `runtime_client` | `health`, `published_credential`, `mint_token` and `pod_api`, each gated on that verdict |
+| `runtime_home` | fixture seeding, the OS home and runtime auth store, `cleanup_home`, `orphan_homes` |
+| `runtime_lifecycle` | `start_pod`, `stop_pod` (drain, reclaim, verify), `halt_pod` (stop only, HOME kept) and `install_backend` |
+| `runtime_boot` | `boot`, `pod exec` and the terminal-refusal record |
+
+`runtime.<name>` keeps resolving for every name the owners took over (the table
+`runtime._EXPORTS_BY_OWNER`): a read is answered by the owner, and a write or
+delete — a test's monkeypatch — is forwarded to it. The owner is looked up by its
+dotted name through `importlib.import_module` on each access, which answers from
+`sys.modules` and waits on the import lock for an owner another thread is still
+importing. So `monkeypatch` and `mock.patch` round-trip, nested or mixed.
+`__all__` lists every public name, so a star import carries the moved names too.
+
+`mock.patch(..., create=True)` on a forwarded name would delete the owner's binding
+when it exits, so `test/test_pod_runtime_refactor_create_guard.py` fails on such a
+patch. It reads every test file that mentions `patch` and `pod` or `dev_fleet`, the
+packages that bind the runtime, and resolves the patch callable and target from the
+file's syntax: import aliases, name assignments, `importlib.import_module` and
+`pytest.importorskip` of a known string, module-name strings, f-strings,
+concatenation, and the `rt` the pod CLI and Dev Fleet bind. A name is looked up
+first among the enclosing functions' parameters. A target that is a parameter, a
+call's result, a name bound only from another call or subscript, or text it cannot
+spell fails as `<dynamic>`; a def, a class or a literal is read as not the runtime.
+
+Owners read core names as `runtime.<name>` at call time, and another owner's names
+through that owner's module, so a patch of any of those names through `runtime`
+reaches every reader. A module the runtime imports (`time`, `launchd`, `pinned_fs`)
+is one shared object: patch its attributes, such as `runtime.time.sleep`. The names
+bound to a module once the owners have loaded (`runtime._MODULE_NAMES`) are refused
+through `runtime`, both a write of anything else and a delete, because each
+importing module holds its own binding; every other name takes any value and gives
+it back. This is the opposite choice from the Dev Fleet backend facade above, where
+tests patch the owner: here the facade is the permanent surface every caller
+already uses, not a migration step. The core stays in `runtime.py` because
+repository gates and other specs cite it there: the spawn-audit allowlist, the
+subprocess-encoding baseline, `require_systemd`, seed sanitization and
+`build_pod_env`. Purging `kiro_crew.pod.runtime` from `sys.modules` and importing it
+again is unsupported, because every owner holds the core module object.
 
 ### Pod identity guard
 
@@ -1280,8 +1374,10 @@ choose the gateway's next image. Instead:
   `GET /api/apps/dev-fleet/live-target` (30 s display cache; `fresh=1` for the
   removal guards). The broker aims at `KIROCREW_BOUND_PORT`, which
   `apps/backend.py` hands to this one backend at spawn from the gateway's own
-  environment — so `dashboard.server.start_dashboard` spawns it in a second wave,
-  AFTER `_export_bound_port` has recorded the port the site actually bound
+  environment — the port is exported the moment it is reserved
+  (`dashboard.server._reserve_dashboard_port`, before any backend spawns;
+  `_export_bound_port` republishes it once the site serves), and
+  `dashboard.server.start_dashboard` spawns this backend in a second wave
   (`apps.backend.DEV_FLEET_APP_NAME`; the main wave still runs before
   `runner.setup()` so every other app's startup hooks find their backend up). A
   backend spawned before the bind would have no port for its whole lifetime;
@@ -1646,8 +1742,9 @@ All user-visible output passes through `redact_credentials()` and
 The app declares `platform.os: ["macos", "linux", "windows"]` in `app.json`,
 because that is where it genuinely runs: the fleet view, PR status, commit and
 disk figures, Provision, Sync, Rebase and Prune are git and filesystem work with
-no systemd in them. Only the pod plane needs Linux; Make Live stages its pointer
-on every platform (only the automatic restart needs a drivable service manager).
+no service-manager dependency in them. The pod plane needs systemd `--user` on
+Linux or launchd on macOS; Windows has no supported pod backend. Make Live stages
+its pointer on every platform (only the automatic restart needs a drivable service manager).
 The app says so in the UI rather than in the manifest — a `highlights` line
 states the pod requirement, and `GET /api/fleet` carries the reason that renders
 as a banner.
@@ -1660,7 +1757,8 @@ the pre-#1254 silence (an absent `platform` block defaults to
 `["macos", "linux"]`, quietly advertising macOS parity).
 
 The declaration is **not** an install gate for this app: `installMode` is the
-default `"server"` and the App Store's platform check at `registry.py` only
+default `"server"` and the App Store's platform check in `install_from_registry`
+(`apps/registry_pipeline/install.py`) only
 refuses `installMode: "client"` apps, so dev-fleet installs and enables
 everywhere regardless. What the list drives is the App Store detail page, which
 renders it verbatim (`AppDetailPage.tsx` → "Platform: macos, linux, windows").
@@ -1671,9 +1769,9 @@ things:
 | Flag | Meaning | True when |
 |---|---|---|
 | `_POD_IMPORTED` | the `kiro_crew.pod` modules imported, so its platform-neutral helpers are callable | the import succeeded (any platform) |
-| `_POD_AVAILABLE` | pods can actually **run** here | Linux **and** `systemctl` on PATH |
+| `_POD_AVAILABLE` | pods can actually **run** here | Linux with `systemctl` on PATH, or macOS with `launchctl` on PATH |
 
-Conflating the two used to report every worktree as "not built" off Linux, since
+Conflating the two used to report every worktree as "not built" on hosts without a runnable pod backend, since
 the `prov.has_venv` / `prov.has_dist` calls — plain filesystem checks — sat
 behind the pod-runnable gate. Build state is now computed on every platform.
 
@@ -1686,19 +1784,23 @@ offering controls that fail:
 | `pods_unavailable_reason` | the human-readable reason, or `null` when pods are available |
 
 Before this existed, the reason string was computed into `_POD_ERROR` and then
-**never read by anything** — a non-Linux user saw pod controls that silently
-failed with no explanation.
+**never read by anything** — a user on a host without a runnable pod backend saw
+pod controls that silently failed with no explanation.
 
 Per-platform behavior:
 
 - **Linux + systemd `--user`** — everything works.
-- **macOS / Windows / Linux without `systemctl`** — the Fleet view, per-branch PR
-  status, commit counts, disk usage, Provision, Sync (pull main + rebuild),
-  Rebase and Prune all work. The UI shows a notice carrying
+- **macOS + launchd** — pod lifecycle and the non-pod fleet actions work. macOS
+  pods have no enforced memory/CPU ceiling. Automatic Make Live additionally
+  requires the current LaunchAgent restart contract; otherwise it stages the
+  pointer and asks the operator to restart manually.
+- **Windows / macOS without `launchctl` / Linux without `systemctl`** — the Fleet
+  view, per-branch PR status, commit counts, disk usage, Provision, Sync (pull
+  main + rebuild), Rebase and Prune all work. The UI shows a notice carrying
   `pods_unavailable_reason` and hides the actions that cannot work: Spin up /
   Restart / Stop pod, Open, QA + video. Make Live and Provision are **not**
-  hidden — `kirocrew pod provision` does not touch systemd, so building a
-  worktree's venv + dist works anywhere; Make Live stages the pointer on any
+  hidden — `kirocrew pod provision` does not touch a service manager, so building
+  a worktree's venv + dist works anywhere; Make Live stages the pointer on any
   platform and reports `staged_only` when it cannot bounce the gateway itself.
 - **Make Live** — staging (pointer write) works on every platform. Automatic
   restart requires an active systemd `--user` unit or a current macOS

@@ -673,6 +673,23 @@ def _resolve_chat_folder_id(
 
 async def api_crons_create(request: web.Request) -> web.Response:
     """POST /api/crons — create a cron job."""
+    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    # the class ``is_owner_dashboard_request`` can rule on at all. An app token
+    # carries a non-empty name and stays confined to its manifest's declared
+    # paths by ``_enforce_app_scope`` -- ``POST /api/crons`` is one of those
+    # declarable paths (see ``docs/app-kit/api-reference.md``). No
+    # ``internal_auth`` clause: this route has no ``X-Internal-Secret`` caller,
+    # and a clause naming one would exempt a future caller nobody reviewed.
+    if request.get("app") == "":
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "crons.create")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     # Per-route cap: the body carries the job's full agent message/prompt text,
     # whose field bound (MAX_CRON_MESSAGE chars) can exceed the shared 64 KB
@@ -848,6 +865,10 @@ async def api_crons_create(request: web.Request) -> web.Response:
 
 async def api_cron_delete(request: web.Request) -> web.Response:
     """DELETE /api/crons/{id} — remove a cron job."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.delete")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
@@ -879,6 +900,10 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
     purged per successfully-removed job, mirroring the single-delete path, and a
     single ``crons`` refresh is pushed after the batch instead of one per id.
     """
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.batch_delete")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     # Default cap: the body is a bounded list of short job ids.
     body, body_err = await read_bounded_json(request)
@@ -936,6 +961,10 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
 
 async def api_cron_update(request: web.Request) -> web.Response:
     """PATCH /api/crons/{id} — update a cron job (partial)."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.update")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
@@ -1775,6 +1804,10 @@ async def api_cron_secret_grant(request: web.Request) -> web.Response:
 
 async def api_cron_run(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/run — trigger immediate execution."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.run")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
@@ -1789,24 +1822,31 @@ async def api_cron_run(request: web.Request) -> web.Response:
     job = await state.crons.get_job_async(job_id)
     if not job:
         return web.json_response({"error": "job not found"}, status=404)
-    # Reject if a run is already in flight. Overwriting _running_tasks[job_id]
-    # would orphan the prior task's handle (it could no longer be
-    # tracked/cancelled/joined) and allow overlapping duplicate runs. The
-    # check-and-set below is atomic: there is no await between the guard and the
-    # assignment, so the single-threaded event loop cannot interleave a second
-    # request into this critical section. (The lookup above awaits, so two
-    # concurrent requests can both reach the guard — but only one can pass it,
-    # because the guard and the assignment are not separated by an await.)
-    if job_id in state.crons._running_tasks or state.crons.is_running(job_id):
+    # Reject if a run is already in flight: a second overlapping run would
+    # orphan the prior task's handle (nothing could track, cancel
+    # or join it). The check-and-claim below is atomic: there is no await between
+    # the guard, run_job's claim and attach_run_task, so the single-threaded
+    # event loop cannot interleave a second request into this critical section.
+    # (The lookup above awaits, so two concurrent requests can both reach the
+    # guard — but only one can pass it, because the guard and the claim are not
+    # separated by an await.)
+    #
+    # A tracked task that has already finished is NOT a run in flight, whatever
+    # the claim says: a run whose task ends without reaching
+    # _run_job_isolated's finally leaves its claim stored with nothing on that
+    # path to release it, and this guard alone would then refuse every manual
+    # run of the job until the reaper sweep meets the finished task (it does
+    # the same release, once a sweep). Drop such leftovers first; the call is
+    # synchronous, so the check-and-claim stays await-free, and a task still
+    # running keeps the 409 below.
+    state.crons.discard_finished_run(job_id)
+    if state.crons.is_running(job_id):
         return web.json_response({"error": "job is already running"}, status=409)
-    task = asyncio.create_task(state.crons.run_job(job_id))  # type: ignore[arg-type]
-    state.crons._running_tasks[job_id] = task  # type: ignore[assignment]
-
-    def _on_done(t: asyncio.Task, _jid: str = job_id) -> None:  # type: ignore[type-arg]
-        if state.crons._running_tasks.get(_jid) is t:
-            state.crons._running_tasks.pop(_jid, None)
-
-    task.add_done_callback(_on_done)
+    # run_job claims the job synchronously while the call is evaluated; the
+    # wrapper task is handed to the claim on the same line so cancel() can
+    # reach a run still parked in its store refresh.
+    task = asyncio.create_task(state.crons.run_job(job_id))
+    state.crons.attach_run_task(job_id, task)
     state.push_refresh("crons")
     safe_name = redact_credentials(redact_exfiltration_urls(job.name)[0])[0]
     return web.json_response({"ok": True, "name": safe_name})
@@ -1889,6 +1929,10 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
 
 async def api_cron_enable(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/enable — toggle enable/disable."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.enable")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
@@ -2033,7 +2077,10 @@ def _read_script_source_sync(
         # resolver would crash on it. Refuse, same code as any bad path.
         return None, ("script path refused", "script_path_refused")
     try:
-        file_path, func_name = resolve_script_path(script_spec)
+        # A PERSISTED spec off crons.json, so an app cron's bundle path must
+        # resolve here; the nolink read below stays pinned to crons/, so a
+        # bundle script yields a typed refusal rather than bundle bytes.
+        file_path, func_name = resolve_script_path(script_spec, allow_bundle_roots=True)
     except FileNotFoundError:
         return None, ("script file not found", "script_not_found")
     except Exception:
@@ -2505,6 +2552,30 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         )
         return web.json_response(
             {"error": "Memory writes are not allowed in this session mode."},
+            status=403,
+        )
+    # Global persistence switch (memory.persistence_enabled).
+    # Enforced on the route rather than in the learn_add MCP handler so every
+    # transport that posts here (MCP tool, dashboard, direct HTTP) is covered
+    # by the one check. Reads and deletions stay available — the right to
+    # forget survives the switch.
+    if not KiroCrewConfig.load().memory.persistence_enabled:
+        _sel().log_api_access(
+            caller=sk,
+            operation="learn_add",
+            outcome="denied",
+            source="dashboard",
+            resources="persistence_disabled",
+            error="Persistent memory is disabled (memory.persistence_enabled).",
+        )
+        return web.json_response(
+            {
+                "error": "Lesson was NOT saved: persistent memory is disabled "
+                "(memory.persistence_enabled is false). Re-enable it with "
+                "`kirocrew config set memory.persistence_enabled true` to save "
+                "lessons again.",
+                "code": "persistence_disabled",
+            },
             status=403,
         )
     # Validate body fields against the SAME schema the learn_add MCP tool uses

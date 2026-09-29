@@ -102,6 +102,24 @@ class TokenMintError(Exception):
     """Raised when minting a remote token fails."""
 
 
+class HopRetiredError(TokenMintError):
+    """The crew holding our hop says that hop is not ours to ride.
+
+    Separate from every other mint failure because the two call for OPPOSITE
+    handling. A transport error -- a timeout, a refused connection, a malformed
+    reply -- means try again, and the refresh loop's deliberate non-terminal retry
+    exists for exactly that. This means the hop is gone: the parent still answers,
+    and what it answers is that the crew is not connected there, or not there at
+    all. Retrying cannot recover it, and the forward we still hold is pointed at a
+    port the parent is now free to give to a different crew, which is how one
+    crew's bearer token reaches another crew's gateway.
+
+    So this one is terminal for the forward, and a bare ``False`` could not say so:
+    the caller would have to infer "gone" from "failed" and would tear down a
+    working chain on a network blip.
+    """
+
+
 def _validate_ttl(ttl: str) -> str:
     """Return *ttl* if it matches the accepted ``<int>[hm]`` form, else raise."""
     if not _TTL_RE.match(ttl):
@@ -354,11 +372,16 @@ def _build_ssh_argv(
     prompt; ``ConnectTimeout`` bounds the TCP connect (and, on OpenSSH >= 8.6,
     the banner/KEX exchange — which is where a slow ProxyCommand spends its
     time, so the mint passes its own configurable budget here instead of the
-    10s fail-fast default). ``ssh_host`` is validated by the caller
+    10s fail-fast default). ``-n`` redirects ssh's own stdin from the null
+    device: every caller here runs a remote command and none of them writes the
+    child's stdin, and an inherited console-less stdin keeps the channel open
+    after the remote command exits (notably through a ``ProxyCommand``), so ssh
+    waits for an EOF that never arrives. ``ssh_host`` is validated by the caller
     (registry / tunnel manager) before reaching here.
     """
     return [
         "ssh",
+        "-n",
         "-o",
         "BatchMode=yes",
         "-o",

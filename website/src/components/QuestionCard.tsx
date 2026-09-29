@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, memo } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, MessageSquare } from 'lucide-react'
+import { Glass } from './Glass'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -28,6 +29,8 @@ interface QuestionCardProps {
   /** True while a submission is in flight: both controls lock so a second
    *  click cannot produce a duplicate resolution or a duplicate chat turn. */
   busy?: boolean
+  /** Surface-specific action copy; other chat callers keep the standard label. */
+  submitLabel?: string
   /** Flips of "the user has an answer in progress" — a non-empty custom
    *  input OR a pending option selection. All of that state lives only in
    *  this component; publishing the boolean lets the store refuse to
@@ -54,7 +57,7 @@ const initialCollapsed = (questions: Question[]): Record<number, boolean> =>
     ? Object.fromEntries(questions.slice(1).map((_, i) => [i + 1, true]))
     : {}
 
-function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftChange }: QuestionCardProps) {
+function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftChange, submitLabel }: QuestionCardProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const [selections, setSelections] = useState<Record<number, Set<string>>>({})
@@ -199,7 +202,12 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
        only once you can reach a chevron. The cap is viewport-relative so the
        composer and the conversation keep their share on a short window, with an
        absolute ceiling so a tall window does not stretch the card to fill it. */
-    <div className="border border-accent/30 rounded-xl bg-card shadow-md overflow-hidden animate-scale-in flex flex-col max-h-[min(60vh,32rem)]">
+    <Glass variant="chip" radius={12} className="glass-accent glass-shadow rounded-xl animate-scale-in flex flex-col max-h-[min(60vh,32rem)]">
+      {/* The clip lives one level in, not on the pane: the pane's hairlines sit
+          half a pixel OUTSIDE its top and bottom edges, and `overflow: hidden`
+          on the pane itself would cut them. The inner box inherits the radius
+          so the scroller's edge and its scrollbar are still clipped to the arc. */}
+      <div className="flex flex-col min-h-0 overflow-hidden rounded-[inherit]">
       {/* The scroller holds ONLY the questions; the action row below stays out of
           it so Submit / Dismiss are reachable without scrolling to the end. */}
       <div className="flex-1 min-h-0 overflow-y-auto">
@@ -331,7 +339,7 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
           disabled={!allAnswered || busy}
           className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md text-[13px] font-medium cursor-pointer transition-all disabled:opacity-30 disabled:cursor-not-allowed bg-accent text-accent-fg hover:bg-accent-hover border-none"
         >
-          <MessageSquare size={14} /> {i18nT('components.questionCard.submit')}
+          <MessageSquare size={14} /> {submitLabel ?? i18nT('components.questionCard.submit')}
         </button>
       </div>
       {/* Dismiss is the only control that ends a question nobody is going to
@@ -345,7 +353,8 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
           {i18nT('components.questionCard.dismiss_hint')}
         </div>
       )}
-    </div>
+      </div>
+    </Glass>
   )
 }
 

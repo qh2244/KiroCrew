@@ -204,7 +204,7 @@ class TestScriptExecution:
     async def test_skip_defers_strike_reset_to_execute(self):
         # The Skip branch must NOT reset the counter or lift auto-pause itself:
         # that is record_success's job, reached only through
-        # CronScheduler._execute, whose reset is guarded by the _cancelled_jobs
+        # CronScheduler._execute, whose reset is guarded by the cancel markers
         # cancel-race check. An unguarded reset in this branch would clear the
         # pause and re-enable a job cancelled mid-tick, so the callback layer
         # leaves the bookkeeping untouched and defers to _execute. (The guarded
@@ -1574,7 +1574,7 @@ class TestCronUsageRow:
 def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
     """A shutdown cancel must not wipe the previous run's result.
 
-    stop() cancels the in-flight task but never adds the job to _cancelled_jobs,
+    stop() cancels the in-flight task but never adds the job to the cancel markers,
     so the funnel's result-less clear would otherwise run on every gateway stop
     and persist an empty result over the last completed run's output.
     """
@@ -1598,7 +1598,8 @@ def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_hang):
-            task = asyncio.create_task(svc._run_job_isolated(job))
+            claim = svc._claim_run(job.id, "scheduled")
+            task = asyncio.create_task(svc._run_job_isolated(job, claim))
             await asyncio.sleep(0.05)
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1809,7 +1810,7 @@ class TestCronPoolQueueWait:
 
             ran = threading.Event()
 
-            async def _execute(_job):
+            async def _execute(_job, _meta=None):
                 return await ex.run_in_cron_pool(ran.set, timeout=30, queue_timeout=60)
 
             svc._execute = _execute  # type: ignore[method-assign]
@@ -1841,7 +1842,7 @@ class TestCronPoolQueueWait:
         )
         job.timeout_secs = 2
 
-        async def _slow(_job):
+        async def _slow(_job, _meta=None):
             await asyncio.sleep(30)
 
         svc._execute = _slow  # type: ignore[method-assign]
@@ -1935,10 +1936,13 @@ class TestCronPoolQueueWait:
         import time as _time
         from unittest.mock import AsyncMock as _AsyncMock
 
+        from kiro_crew.cron import _RunClaim
+
         never = asyncio.get_running_loop().create_future()  # a task that is not done
         holder = asyncio.ensure_future(asyncio.wait_for(never, timeout=30))
-        svc._job_start_times[job.id] = _time.time() - elapsed_secs
-        svc._running_tasks[job.id] = holder
+        svc._claims[job.id] = _RunClaim(
+            trigger="scheduled", claimed_at=_time.time() - elapsed_secs, task=holder
+        )
         svc._jobs = [job]
         reaped = _AsyncMock()
         svc._force_reap = reaped  # type: ignore[method-assign]

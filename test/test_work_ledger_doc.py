@@ -7,7 +7,7 @@ status, and stay green while a dispatched worker read it at runtime and called
 something that does not exist.
 
 This module pins the vocabulary that a worker or a conductor ACTS on, against the
-code that defines it: the four tool names on the work server, the four worker
+code that defines it: the five tool names on the work server, the four worker
 statuses, the five acceptance verdicts, the terminal item states, and the two caps
 the doc quotes as numbers. Each assertion reads the constant rather than a literal,
 so widening either side without the other fails here.
@@ -32,7 +32,7 @@ def doc_text() -> str:
 
 
 def test_the_doc_names_every_work_tool_and_no_other(doc_text: str) -> None:
-    """All four tool names appear, and the doc invents none.
+    """All five tool names appear, and the doc invents none.
 
     A worker reads this page at runtime, so a name that is not on the server is a
     call that fails. The reverse direction matters too: a tool added to the server
@@ -106,10 +106,15 @@ def test_the_doc_pins_the_item_states(doc_text: str) -> None:
 
 
 def test_the_doc_quotes_the_real_caps(doc_text: str) -> None:
-    """The two numbers the page states are read off the store's own constants."""
-    from kiro_crew.work_ledger import MAX_DEPTH, MAX_ITEMS_PER_CONDUCTOR
+    """The three numbers the page states are read off the store's own constants."""
+    from kiro_crew.work_ledger import (
+        MAX_DEPTH,
+        MAX_ITEMS_PER_CONDUCTOR,
+        MAX_STORED_ITEMS_PER_CONDUCTOR,
+    )
 
-    assert f"{MAX_ITEMS_PER_CONDUCTOR} items per conductor" in doc_text
+    assert f"{MAX_ITEMS_PER_CONDUCTOR} open items per conductor" in doc_text
+    assert f"{MAX_STORED_ITEMS_PER_CONDUCTOR} items stored per conductor in total" in doc_text
     assert f"depth is capped at {MAX_DEPTH}" in doc_text
 
 

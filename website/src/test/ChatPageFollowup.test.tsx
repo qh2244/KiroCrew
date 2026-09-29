@@ -11,6 +11,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { ReactNode } from 'react'
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { composerValue, setComposerValue, awaitComposer } from './helpers'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -55,6 +56,10 @@ vi.mock('../api/client', () => ({
     // so answer them so the notice does not compete with the assertions below.
     chatFolders: vi.fn().mockResolvedValue([]),
     tagColumns: vi.fn().mockResolvedValue([]),
+    // Same for the settings read behind the sidebar's folder order: unanswered,
+    // it fails and the sidebar renders a second `role="alert"` beside the
+    // worktree-failure notice the assertions below look up by role.
+    kirocrewConfig: vi.fn().mockResolvedValue({}),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -122,6 +127,7 @@ async function renderPage(store: ReturnType<typeof makeStore>) {
     )
   })
   await waitFor(() => expect(screen.getByText('Add rate limits')).toBeTruthy())
+  await awaitComposer()
 }
 
 beforeEach(() => {
@@ -134,7 +140,7 @@ beforeEach(() => {
 })
 
 describe('ChatPage follow-up worktree orchestration', () => {
-  const composer = () => screen.getByLabelText('Message input') as HTMLTextAreaElement
+  const composer = () => composerValue()
 
   it('creates the worktree, scopes the new session, then hands the prompt to it', async () => {
     const store = makeStore()
@@ -155,7 +161,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     // channel before the switch, then applied (and cleared) by the slot-restore
     // effect when that slot activates.
     await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2'))
-    await waitFor(() => expect(composer().value).toBe(ITEM.prompt))
+    await waitFor(() => expect(composer()).toBe(ITEM.prompt))
     expect(sessionStorage.getItem('kirocrew_prefill')).toBeNull()
     // NOT asserted here: the final card-clear. It runs after `switchSlot(...)`
     // resolves, and that thunk does not settle under this harness (it wants
@@ -221,7 +227,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     // The failed session was never published, so no unscoped slot is left behind.
     expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2')
     // No prefill into the wrong composer, and the suggestion survives for a retry.
-    expect(composer().value).toBe('')
+    expect(composer()).toBe('')
     expect(store.getState().chat.followups['chat-1']).toBeDefined()
   })
 
@@ -232,7 +238,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     fireEvent.click(screen.getByRole('button', { name: /start in new worktree/i }))
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/Branch already exists/i))
     expect(api.createChatSlot).not.toHaveBeenCalled()
-    expect(composer().value).toBe('')
+    expect(composer()).toBe('')
     expect(store.getState().chat.followups['chat-1']).toBeDefined()
   })
 
@@ -240,7 +246,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     const store = makeStore()
     await renderPage(store)
     fireEvent.click(screen.getByRole('button', { name: /add to this session/i }))
-    await waitFor(() => expect(composer().value).toBe(ITEM.prompt))
+    await waitFor(() => expect(composer()).toBe(ITEM.prompt))
     expect(api.createWorktree).not.toHaveBeenCalled()
     expect(store.getState().chat.followups['chat-1']).toBeUndefined()
   })
@@ -250,9 +256,20 @@ describe('ChatPage follow-up worktree orchestration', () => {
     // would discard whatever the user was mid-way through typing.
     const store = makeStore()
     await renderPage(store)
-    fireEvent.change(composer(), { target: { value: 'half-written thought' } })
+    await setComposerValue('half-written thought')
     fireEvent.click(screen.getByRole('button', { name: /add to this session/i }))
-    await waitFor(() => expect(composer().value).toContain(ITEM.prompt))
-    expect(composer().value).toBe(`half-written thought\n\n${ITEM.prompt}`)
+    await waitFor(() => expect(composer()).toContain(ITEM.prompt))
+    expect(composer()).toBe(`half-written thought\n\n${ITEM.prompt}`)
+  })
+
+  it('a redaction card pre-fill appends to an unsent draft instead of destroying it', async () => {
+    const store = makeStore()
+    await renderPage(store)
+    await setComposerValue('half-written thought')
+    act(() => {
+      window.dispatchEvent(new CustomEvent('mc:prefill-composer', { detail: { text: 'Please rotate the key.' } }))
+    })
+    await waitFor(() => expect(composer()).toContain('Please rotate the key.'))
+    expect(composer()).toBe('half-written thought\n\nPlease rotate the key.')
   })
 })

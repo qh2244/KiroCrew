@@ -18,13 +18,13 @@ import stat
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from itertools import batched, zip_longest
+from itertools import batched, islice, zip_longest
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable, Iterable, Iterator, NamedTuple
+from typing import Callable, Iterable, Iterator, Literal, NamedTuple
 
 from kiro_crew import hooks as hooks_module
 from kiro_crew import pinned_fs, skill_trust
@@ -46,8 +46,11 @@ from kiro_crew.hooks import (
 from kiro_crew.memory_recall import recall_terms
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform_compat import (
+    PinnedDirectory,
     ensure_owner_rwx_dirs,
+    file_lock,
     is_link_or_junction,
+    pinned_directory,
     rmtree_force,
 )
 from kiro_crew.project_scope import project_scope_satisfied
@@ -64,7 +67,7 @@ from kiro_crew.skill_search_index import (
     body_fingerprint,
 )
 from kiro_crew.skill_usage import SKILL_USAGE_FILENAME, SkillUsageLedger
-from kiro_crew.skills_script_validator import validate_scripts
+from kiro_crew.skills_script_validator import MAX_SCRIPT_BYTES, validate_scripts
 from kiro_crew.trigger_match import MIN_TRIGGER_OVERLAP, trigger_score, words_of
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,34 @@ SKILLS_DIR_NAME = "skills"
 # submitted work so a large catalog cannot create one thread/future per skill.
 _CATALOG_READ_WORKERS = 8
 _CATALOG_READ_BATCH = 64
+
+
+# A SKILL.md whose body is a saved web page is not a skill: its markup would
+# land in the prompt. The bounded cache warns about each path about once.
+@functools.lru_cache(maxsize=256)
+def _warn_html_skill(path: str) -> bool:
+    logger.warning("Skipping skill whose SKILL.md body is HTML, not markdown: %s", path)
+    return True
+
+
+def _html_skill_refused(meta: dict, path: object) -> bool:
+    # The key holds a colon, so no front-matter line can set it.
+    return bool(meta.get("_html:body")) and _warn_html_skill(str(path))
+
+
+# One script-entry population budget for the pending verdict and API reports.
+# Reports may additionally retain ONE fixed truncation-summary entry.
+_PENDING_SCRIPT_MAX_ENTRIES = 64
+# Depth bound shared by BOTH pinned traversals of a pending candidate -- the
+# verdict walk and the detail read. A candidate tree is written directly by an
+# agent, so a nesting chain is free to produce; bounding well below Python's
+# recursion limit keeps it from turning a read into a crash. One constant because
+# the two walks must agree: a tree the verdict already declines to judge must not
+# be one the detail read still descends.
+_PENDING_SCRIPT_MAX_DEPTH = 8
+_VALIDATION_REPORT_MAX_FINDINGS = 16
+_VALIDATION_REPORT_MAX_STRING_CHARS = 1024
+_VALIDATION_REPORT_TRUNCATION_KEY = "<truncated>"
 #: Re-exported from ``trigger_match``, which owns the value and the grammar
 #: it belongs to. Kept as a module name because tests and call sites here
 #: reference it.
@@ -318,6 +349,45 @@ AUTO_ARCHIVE_DIRNAME = ".archive"
 # from discovery — pending candidates never trigger. Layout:
 # ``auto/.pending/<slug>/{SKILL.md, scripts/, .meta.json}``.
 AUTO_PENDING_DIRNAME = ".pending"
+
+# One lock file for the whole auto slug space, held across an availability test
+# and the claim it authorizes. Dot-prefixed and a plain file, so discovery skips
+# it (``_iter_skill_files`` skips dot-dirs and reads only ``<name>/SKILL.md``).
+# It lives at the skills root rather than inside ``auto/`` so taking it does not
+# create the auto namespace as a side effect of a refused claim.
+AUTO_SLUG_CLAIM_LOCK_NAME = ".auto-slug-claim.lock"
+
+# The critical section is one directory test plus a small write, so a holder that
+# has not released within seconds is stuck rather than busy. This overrides
+# ``file_lock``'s own default ceiling downward, because the default suits a caller
+# whose work may legitimately run long and a claim path's does not: refusing early
+# and letting the next consolidation pass retry beats waiting on a dead holder.
+AUTO_SLUG_CLAIM_LOCK_TIMEOUT_SECS = 5.0
+
+
+@dataclass
+class ClaimRefusal:
+    """Whether a claim path's ``None`` was the lock, and so is worth retrying.
+
+    Both claim paths return ``None`` for several unrelated reasons, and only one of
+    them is transient. An invalid slug, an over-long procedure and an exhausted
+    sibling walk are properties of the CANDIDATE: the same input refused once is
+    refused forever, so a retry is waste. An unacquired claim lock is a property of
+    the MOMENT -- another process held it, or could not be coordinated with -- and
+    the comment above, plus :meth:`SkillsLoader._auto_slug_claim_lock`, both promise
+    that the next pass retries. That promise is only keepable by a caller that can
+    tell the two apart, and a bare ``None`` cannot.
+
+    Pass an instance to a claim path to learn which it was. It is deliberately a
+    mutable out-parameter rather than a raise or a changed return type: the lock
+    helper documents that it never raises, because an escaping error would abort a
+    consolidation pass mid-way, and every existing caller that does not care about
+    the distinction keeps reading the same ``str | None``.
+    """
+
+    #: True only when the refusal was an unacquired claim lock.
+    retryable: bool = False
+
 
 # Per-skill version history. A dot-prefixed dir *inside* a live auto-skill
 # (``auto/<slug>/.versions/v<N>-SKILL.md``) so it is pruned from skill discovery
@@ -1280,6 +1350,216 @@ def _verified_unchanged_fingerprint(dest_dir: Path, src_dir: Path | None) -> str
     return dest_fingerprint
 
 
+SKILL_INSTALL_IN_SYNC = "in-sync"
+SKILL_INSTALL_BEHIND = "behind"
+SKILL_INSTALL_EDITED = "edited"
+SKILL_INSTALL_UNVERIFIABLE = "unverifiable"
+
+
+@dataclass(frozen=True)
+class InstalledSkillCurrency:
+    """One installed builtin skill judged against the packaged tree it came from."""
+
+    name: str
+    source: Path
+    state: str
+
+
+def _first_linked_skill_component(base: Path, name: str) -> Path | None:
+    """First directory strictly BETWEEN *base* and ``base / name`` that is a link.
+
+    A skill name may be nested (``kirocrew-dev/prepare-pr``), so testing the
+    leaf alone leaves the directories above it unscreened while every probe of
+    the leaf still resolves through them. A link at ``<skills>/kirocrew-dev``
+    then makes the fingerprint hash a tree outside the skills directory and
+    report it as this install, which is the verdict the leaf screen exists to
+    refuse.
+
+    Components are tested ROOT-FIRST and the walk stops at the first hit, so
+    each ``lstat`` runs only after the component above it is known not to be a
+    link and the walk itself never traverses one.
+
+    A link here is operator-made: these are directories the sync creates itself,
+    exactly as the leaf is. A flat name has no components between the two paths
+    and costs no stat at all.
+    """
+    current = base
+    for part in PurePosixPath(name).parts[:-1]:
+        current = current / part
+        if is_link_or_junction(current):
+            return current
+    return None
+
+
+def installed_skill_currency() -> list[InstalledSkillCurrency]:
+    """Judge each installed skill against the packaged tree the sync would pick.
+
+    The question this answers is currency: does the install still correspond to
+    the package this process is running. A script can report its own identity
+    but not its own currency, because currency is a relation between the
+    install and the package, and only one side of it is visible from inside a
+    shipped file. Both sides are visible here.
+
+    No new provenance data is needed, because the marker already holds the
+    answer. ``_ensure_builtin_skills`` records the fingerprint of the PACKAGED
+    tree (not of the copy it wrote), and ``_tree_entries`` hashes relative
+    paths, modes, link targets and file bytes while excluding mtime entirely.
+    The recorded value is therefore a portable content identity of the package
+    the install came from, and comparing it against a fresh fingerprint of the
+    packaged tree needs no version constant inside any shipped file, no marker
+    format change, and no network call.
+
+    What makes staleness silent today is the update gate, not the marker: it
+    compares mtimes, so an installed copy carrying an mtime newer than anything
+    the package ships is judged up to date, no copy happens, and nothing says
+    so. This function reads the same two trees the gate reads and reports the
+    comparison the gate throws away.
+
+    ``SKILL_INSTALL_BEHIND`` states that the two sides disagree, not which is
+    older: a content hash cannot order two revisions, exactly as
+    :func:`deployed_cron_script_sources` reports divergence without a
+    direction. "Behind" names the actionable direction in practice because the
+    packaged side is the code this process is running.
+
+    ``SKILL_INSTALL_EDITED`` takes precedence over a currency verdict when both
+    apply. The marker still identifies the package an edited install came from,
+    but the edit is the fact that has to be reconciled first: while it stands,
+    the sync quarantines the directory rather than updating it, so reporting
+    the install merely as behind would name a remedy that does not apply.
+
+    Source roots are consulted in the sync's own order, project skills before
+    packaged ones, and the first root to ship a name owns it. Comparing a
+    project skill against a packaged tree of the same name would otherwise
+    report every shadowing skill as behind the builtin it deliberately
+    replaces.
+
+    An installed directory that NO source root ships is ABSENT from the result
+    rather than reported: with no packaged tree there is nothing to be out of
+    step with, and a skill the operator installed themselves must not be
+    described as stale. Likewise a name that is packaged but not installed --
+    the sync installs it on the next run, and an absent directory has no
+    currency to judge.
+
+    Every read failure yields ``SKILL_INSTALL_UNVERIFIABLE`` rather than a
+    comparison: an unmarked install (pre-provenance, or user-authored by
+    assumption), a destination that is itself a link or junction, a skills
+    directory that is itself linked, a linked directory between the skills
+    directory and a nested install, and a tree over the fingerprint ceilings
+    all land there. Unverifiable never reads as agreement, because an
+    instrument whose read failed must not report the two sides equal.
+
+    POSIX only, and that gate is the first thing here rather than a detail.
+    Every read below reaches its target by name, and the link test guarding each
+    one is a separate syscall from the read it guards, so a concurrent writer to
+    the skills directory can substitute a link in between. On POSIX the cost of
+    losing that race is a wrong verdict. On Windows a junction whose target is a
+    UNC share turns the next local-looking stat into an outbound connection that
+    authenticates as this process, which nothing afterwards can take back, and
+    the descriptor-pinned walk that would close it is unavailable there:
+    :func:`kiro_crew.pinned_fs.supports_pinned_walk` requires ``O_NOFOLLOW`` and
+    ``os.open`` in ``os.supports_dir_fd``, and Windows offers neither. So this
+    reports nothing on Windows rather than reading unsafely, and the doctor
+    section says the check does not run instead of printing verdicts it cannot
+    stand behind. Tracked separately, with the core primitive it needs.
+    """
+    if os.name == "nt":
+        return []
+    base = skills_dir()
+    # Screened BEFORE the first stat, because every probe below is built from
+    # this path. A link here makes each local-looking stat a read of whatever
+    # the link targets, and the sync only ever creates this directory for real,
+    # so a link is operator-made and its target is not this gateway's install
+    # tree. A fingerprint taken through it would describe some other tree and
+    # be reported as this install.
+    base_readable = not is_link_or_junction(base)
+    if base_readable and not base.is_dir():
+        return []
+
+    results: list[InstalledSkillCurrency] = []
+    supplied: set[str] = set()
+    for src_root in (_project_skills_dir(), _BUILTIN_SKILLS_DIR):
+        if not src_root or not src_root.exists():
+            continue
+        for name, src_file in _iter_skill_files(src_root):
+            # First source root to ship a name owns it, mirroring the sync.
+            if name in supplied:
+                continue
+            supplied.add(name)
+            src_dir = src_file.parent
+            if not base_readable:
+                # Nothing under an unreadable base can be judged, and presence
+                # is the first thing that cannot be tested. Reported rather than
+                # skipped: a section that printed nothing would read as a
+                # gateway with no installs, and unverifiable must never read as
+                # agreement.
+                results.append(
+                    InstalledSkillCurrency(
+                        name=name,
+                        source=src_dir,
+                        state=SKILL_INSTALL_UNVERIFIABLE,
+                    )
+                )
+                continue
+            dest_dir = base / name
+            if _first_linked_skill_component(base, name) is not None:
+                # Screened before the leaf, for the same reason the base is
+                # screened before this loop: a nested name's intermediate
+                # directories are resolved through by every probe below,
+                # including the link test on the leaf itself, so a link there is
+                # traversed by whichever probe runs first. Reported rather than
+                # skipped, because presence is the first thing that cannot be
+                # tested and an omitted name would read as not installed.
+                results.append(
+                    InstalledSkillCurrency(
+                        name=name,
+                        source=src_dir,
+                        state=SKILL_INSTALL_UNVERIFIABLE,
+                    )
+                )
+                continue
+            # Order is the safety property, not a style choice. The link test is
+            # local to dest_dir, while the SKILL.md stat resolves THROUGH it, so
+            # testing the link first means a linked install is never traversed.
+            # Reversed, the stat reads the link's target before anything has
+            # judged the path, and a tree outside the skills directory then
+            # decides whether this install is present.
+            if not is_link_or_junction(dest_dir) and not (dest_dir / "SKILL.md").is_file():
+                # Not installed: nothing on disk to judge. A link IS judged even
+                # when its SKILL.md does not resolve, because a dangling one is
+                # an install whose currency cannot be established, not an
+                # absence -- and the state check refuses to read any link's
+                # target, so reaching it costs no traversal.
+                continue
+            results.append(
+                InstalledSkillCurrency(
+                    name=name,
+                    source=src_dir,
+                    state=_skill_currency_state(dest_dir, src_dir),
+                )
+            )
+    return sorted(results, key=lambda entry: entry.name)
+
+
+def _skill_currency_state(dest_dir: Path, src_dir: Path) -> str:
+    """Compare one installed skill tree against the packaged tree it came from."""
+    if is_link_or_junction(dest_dir):
+        # The sync only ever creates real directories, so a link here is
+        # user-made and its target must not even be read.
+        return SKILL_INSTALL_UNVERIFIABLE
+    recorded = _recorded_fingerprint(dest_dir)
+    if recorded is None:
+        return SKILL_INSTALL_UNVERIFIABLE
+    installed = _skill_tree_fingerprint(dest_dir)
+    if installed is None:
+        return SKILL_INSTALL_UNVERIFIABLE
+    if installed != recorded:
+        return SKILL_INSTALL_EDITED
+    packaged = _skill_tree_fingerprint(src_dir, assume_owner_rwx_dirs=True)
+    if packaged is None:
+        return SKILL_INSTALL_UNVERIFIABLE
+    return SKILL_INSTALL_IN_SYNC if recorded == packaged else SKILL_INSTALL_BEHIND
+
+
 # A cron script body is one file, not a tree, so its ceiling sits far below the
 # whole-tree budget above. A body over this size reads as unverifiable rather
 # than being compared -- the same fail-safe direction an unprovable tree takes.
@@ -2097,6 +2377,30 @@ def _fingerprint_mtime_and_size(fingerprint: str) -> tuple[float | None, int]:
         return int(parts[3]) / 1_000_000_000, int(parts[4])
     except ValueError:
         return None, 0
+
+
+class PendingApprovalRefused(Exception):
+    """A pending-candidate approval was refused, with a machine-readable reason.
+
+    ``reason`` is one of: ``not_found`` (no such candidate), ``live_exists``
+    (a live skill already holds the name), ``kind_mismatch`` (an update
+    candidate reached the new-skill approve variant, which would promote it
+    fresh while its live target stays unchanged), ``script_validation_failed``
+    (``report`` carries the redacted ``{filename: [findings]}`` map from
+    ``validate_scripts``), ``target_missing`` (an update candidate whose live
+    target is gone), ``stale_base`` (an update merged against an older live
+    version), ``invalid_layout`` (symlink / unexpected candidate entry),
+    ``redaction_failed``, or ``promotion_failed`` (an OS-level I/O failure —
+    a read or write — after all checks passed). Raised by the ``*_checked`` approve variants so
+    the dashboard can tell the user WHY the click did nothing; the legacy
+    ``approve_pending_skill`` / ``approve_pending_update`` wrappers keep the
+    ``None``-on-failure contract for existing callers.
+    """
+
+    def __init__(self, reason: str, report: dict | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.report = report
 
 
 class SkillsLoader:
@@ -3390,6 +3694,8 @@ class SkillsLoader:
             if changed is not None:
                 changed_metadata.append(changed)
             skill_reads += reads
+            if _html_skill_refused(meta, skill_file):
+                continue
             skills.append(
                 {
                     # Internal: lets a later re-read (see _rank_key) reuse the root
@@ -3824,6 +4130,8 @@ class SkillsLoader:
                 # Decoded explicitly: an implicit read would use the platform's
                 # locale encoding and mangle non-ASCII bodies on Windows.
                 content = _decode_skill_text(raw, strict=False)
+                if _html_skill_refused(self._parse_frontmatter_text(content), skill_file):
+                    break
                 self._emit_lazy_load_metric(_t0, hit=True)
                 return content
         self._emit_lazy_load_metric(_t0, hit=False)
@@ -3863,7 +4171,8 @@ class SkillsLoader:
             return None
         if raw is None:
             return None
-        return _decode_skill_text(raw, strict=max_bytes is None)
+        text = _decode_skill_text(raw, strict=max_bytes is None)
+        return None if _html_skill_refused(self._parse_frontmatter_text(text), path) else text
 
     @staticmethod
     def _emit_lazy_load_metric(t0: float, *, hit: bool) -> None:
@@ -4283,11 +4592,16 @@ class SkillsLoader:
         triggers: str,
         procedure_md: str,
         provenance: AutoSkillProvenance,
+        refusal: ClaimRefusal | None = None,
     ) -> str | None:
         """Write a new auto-generated skill under ``auto/<slug>/SKILL.md``.
 
-        Returns the full skill name (``auto/<slug>``) on success, or
-        ``None`` if the slug is invalid or the skill already exists.
+        Returns the full skill name (``auto/<slug>``) on success, or ``None`` if
+        the slug is invalid, a live skill of that name exists, or a NEW candidate
+        of that slug is awaiting review in the pending queue (publishing over a
+        queued candidate's promotion destination would strand it). A pending
+        UPDATE candidate does not hold the slug, since it is promoted over the
+        live target named in its metadata.
 
         Caller is responsible for:
         - Running ``find_similar()`` first to avoid near-duplicates.
@@ -4308,9 +4622,6 @@ class SkillsLoader:
             return None
         name = f"{AUTO_SKILL_NAMESPACE}/{slug}"
         skill_dir = self._dir / name
-        if skill_dir.exists():
-            logger.info("Auto skill %s already exists, skipping", name)
-            return None
         content = _build_auto_skill_content(
             slug=slug,
             description=description,
@@ -4318,7 +4629,43 @@ class SkillsLoader:
             procedure_md=procedure_md,
             provenance=provenance,
         )
-        skill_dir.mkdir(parents=True, exist_ok=True)
+        # Test and claim under ONE lock, shared with ``stage_skill_candidate``:
+        # the two paths allocate in different directories, so nothing an atomic
+        # mkdir can do makes the cross-namespace pair safe on its own.
+        with self._auto_slug_claim_lock() as locked:
+            if not locked:
+                if refusal is not None:
+                    refusal.retryable = True
+                logger.info("Auto skill %s not created: the slug claim lock is unavailable", name)
+                return None
+            if skill_dir.exists():
+                logger.info("Auto skill %s already exists, skipping", name)
+                return None
+            if not self._auto_slug_available(slug, claim="live"):
+                # The pending queue holds this slug for a NEW candidate, so
+                # ``auto/<slug>`` is that candidate's promotion destination.
+                # Publishing over it strands it for good: ``approve_pending_skill``
+                # refuses it while the live directory stands, and TTL pruning then
+                # deletes it unreviewed. One side of the collision has to lose, and
+                # the publish is the cheaper loss: it goes back to the caller as a
+                # ``None`` the caller audits as a rejection, whereas the queued
+                # candidate is immutable, human-gated work that would disappear with
+                # no record at all. Consolidation advances its message offset
+                # whatever one candidate's outcome, so neither side is retried from
+                # the same sessions; the choice is which loss leaves a trail.
+                logger.info(
+                    "Auto skill %s not created: that slug is awaiting review in the pending queue",
+                    name,
+                )
+                return None
+            try:
+                skill_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                # A concurrent writer holding no lock owns this directory (the
+                # lock is advisory, so the mkdir is the real claim). Refusing is
+                # the safe side: overwriting destroys their content.
+                logger.info("Auto skill %s claimed concurrently, skipping", name)
+                return None
         (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
         self._invalidate_iter_cache()  # new skill visible to trigger matching now
         logger.info("Created auto skill: %s", name)
@@ -4628,6 +4975,12 @@ class SkillsLoader:
         """Restore an archived auto-skill back to ``auto/<slug>``.
 
         Returns the restored skill name, or None if not found / name clash.
+
+        A restore is a THIRD claim on the live half of the slug space, so it runs
+        the same availability test under the same lock as a publish and a staging
+        walk: moving an archived skill onto a queued NEW candidate's promotion
+        destination strands that candidate exactly as a publish would, and an
+        unacquired lock is a refusal rather than a licence to claim uncoordinated.
         """
         if not self._is_pending_slug_safe(slug):
             return None
@@ -4636,11 +4989,20 @@ class SkillsLoader:
             return None
         name = f"{AUTO_SKILL_NAMESPACE}/{slug}"
         dest = self._dir / name
-        if dest.exists():
-            logger.warning("Cannot restore %s: a live skill already exists", name)
-            return None
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest))
+        with self._auto_slug_claim_lock() as locked:
+            if not locked:
+                logger.warning("Cannot restore %s: the slug claim lock is unavailable", name)
+                return None
+            if dest.exists():
+                logger.warning("Cannot restore %s: a live skill already exists", name)
+                return None
+            if not self._auto_slug_available(slug, claim="live"):
+                logger.warning(
+                    "Cannot restore %s: that slug is awaiting review in the pending queue", name
+                )
+                return None
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
         self._invalidate_iter_cache()
         logger.info("Restored auto skill: %s", name)
         return name
@@ -4741,6 +5103,138 @@ class SkillsLoader:
     def _pending_root(self) -> Path:
         return self._dir / AUTO_SKILL_NAMESPACE / AUTO_PENDING_DIRNAME
 
+    @contextmanager
+    def _auto_slug_claim_lock(self) -> Iterator[bool]:
+        """Hold one exclusive lock across an availability test and its claim.
+
+        Yields whether the lock was ACQUIRED. Every claim path must refuse when it
+        was not: the two paths allocate in DIFFERENT directories, ``auto/<slug>``
+        and ``auto/.pending/<slug>``, so an atomic ``mkdir`` makes each half safe
+        on its own but cannot make the CROSS-namespace pair safe. Two processes
+        sharing one skills home can each pass the other half's test and then create
+        their own directory, which strands the queued candidate:
+        ``approve_pending_skill`` refuses it while the live directory stands and TTL
+        pruning then deletes it unreviewed. Proceeding unlocked would reopen exactly
+        that window, so an unacquired lock is a refusal, not a licence.
+
+        A refusal is cheap and leaves a record, which is why this never raises:
+        both claim paths return ``None``, which their callers audit as a rejection,
+        and the next consolidation pass reaches the same code with the lock free.
+        An escaping error would instead abort the caller mid-pass. Acquisition fails
+        in two ways, and both yield ``False``: the lock file cannot be opened (a
+        read-only or full home, which would fail the skill write too) and the
+        acquire does not win within the ceiling. The body's own errors still
+        propagate, so a failed write is never mistaken for a failed acquire.
+
+        That "next pass" is not automatic, and the ``None`` alone does not deliver
+        it: skill detection records a ``(rotation_generation, message_count)``
+        marker per session and skips a pass whose pair is unchanged, so a session
+        that goes quiet right after a stall would not be re-judged until a further
+        message or a gateway restart. A claim path therefore reports a lock refusal
+        through :class:`ClaimRefusal`, and the detection pass RETRACTS its marker
+        when it sees one -- which is what makes the retry above real. Only the
+        marker is retracted; the consolidation offset that history, semantic and
+        lesson extraction share is left advanced on purpose, because holding it
+        back would re-summarize an already-consolidated tail into duplicate
+        entries.
+        """
+        lock_path = self._dir / AUTO_SLUG_CLAIM_LOCK_NAME
+        fd: int | None = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            fd = None
+        if fd is None:
+            logger.warning("Auto slug claim lock cannot be opened at %s", lock_path)
+            yield False
+            return
+        try:
+            # ``file_lock`` owns the platform matrix, the bounded wait and the
+            # single-shot refusal for an on-loop caller, and it fails closed by
+            # raising. Enter it EXPLICITLY so the acquire is the only failure that
+            # means "unlocked": wrapping the whole block in one ``except OSError``
+            # would read a failed write as a failed acquire and run the body twice.
+            guard = None
+            try:
+                guard = file_lock(fd, exclusive=True, timeout=AUTO_SLUG_CLAIM_LOCK_TIMEOUT_SECS)
+                guard.__enter__()
+            except OSError:
+                logger.warning(
+                    "Auto slug claim lock not acquired within %.0fs; refusing the claim",
+                    AUTO_SLUG_CLAIM_LOCK_TIMEOUT_SECS,
+                )
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                guard.__exit__(None, None, None)
+        finally:
+            os.close(fd)
+
+    def _auto_slug_available(
+        self,
+        slug: str,
+        *,
+        claim: Literal["live", "pending-new", "pending-update"] = "live",
+    ) -> bool:
+        """True when ``slug`` is free for the allocation named by ``claim``.
+
+        The live tree and the pending queue are two halves of ONE slug space: a
+        queued NEW candidate's promotion destination is ``auto/<slug>``, so a
+        claim that consults only its own half can take a name the other half
+        depends on, and the losing side goes silently. ``approve_pending_skill``
+        refuses a candidate whose live name is occupied (``live_exists``) for as
+        long as that directory stands, and TTL pruning then deletes the candidate
+        unreviewed. Both claim paths test a name here, under
+        :meth:`_auto_slug_claim_lock`, before allocating it.
+
+        The halves are not symmetric, so ``claim`` names which allocation is
+        under test:
+
+        - ``"live"`` — creating ``auto/<slug>``. Free when no live directory
+          stands there and no pending NEW candidate is queued under that slug.
+        - ``"pending-new"`` — queueing a new candidate at
+          ``auto/.pending/<slug>``. Free when that pending directory is absent
+          and ``auto/<slug>`` is unoccupied, since a queued candidate whose live
+          name is taken is unapprovable.
+        - ``"pending-update"`` — queueing an UPDATE candidate. Free when the
+          pending directory is absent; the live tree does not constrain it,
+          because ``approve_pending_update`` promotes over the live ``target``
+          named in the candidate's metadata and never consults
+          ``auto/<candidate-slug>``.
+
+        A pending UPDATE candidate reserves NOTHING in the live tree, which is
+        why the ``"live"`` test reads the queued candidate's ``kind``. An update
+        is queued under a name derived from its target (``<target-slug>-update``)
+        and promotes to ``auto/<target-slug>``, so treating it as a reservation
+        would hold ``auto/<target-slug>-update`` against an unrelated skill that
+        slugifies to that name and drop it for good, since consolidation advances
+        its message offset whatever one candidate's outcome. The kind test FAILS
+        CLOSED: a pending directory whose metadata is missing, unreadable, or
+        silent about ``kind`` keeps its slug reserved.
+
+        The slug pattern is re-checked because a caller may DERIVE the name by
+        suffixing (``<slug>-2``), which can push a long slug past the length the
+        pattern allows. ``list_pending_skills`` skips a pending directory whose
+        name is not canonical and ``prune_pending`` walks that same list, so a
+        non-canonical claim is invisible to the queue, to the dashboard, and to
+        pruning alike — a candidate written there can never be reviewed and is
+        never cleaned up.
+        """
+        if not _AUTO_NAME_PATTERN.match(slug):
+            return False
+        pending_dir = self._pending_root() / slug
+        live_dir = self._dir / AUTO_SKILL_NAMESPACE / slug
+        if claim != "live":
+            if pending_dir.exists():
+                return False
+            return claim == "pending-update" or not live_dir.exists()
+        if live_dir.exists():
+            return False
+        return not pending_dir.exists() or self._read_pending_meta(slug).get("kind") == "update"
+
     def stage_skill_candidate(
         self,
         slug: str,
@@ -4754,13 +5248,18 @@ class SkillsLoader:
         kind: str = "new",
         target: str | None = None,
         base_version: int | None = None,
+        refusal: ClaimRefusal | None = None,
     ) -> str | None:
         """Write a skill candidate to the pending queue (not live).
 
         Layout: ``auto/.pending/<slug>/{SKILL.md, scripts/*, .meta.json}``.
         Scripts are written **non-executable** — the executable bit is only set
-        on approval. Returns ``auto/<slug>`` on success, else ``None`` (invalid
-        slug, oversized procedure). Caller passes already-redacted content.
+        on approval. Returns the queued name on success, which is ``auto/<slug>``
+        or a sibling ``auto/<slug>-N`` when the natural slug is taken. Returns
+        ``None`` when nothing is queued: an invalid slug, an oversized procedure,
+        or no free name across the live and pending namespaces. A ``None`` means
+        the candidate is NOT staged and the caller must take its rejection
+        branch. Caller passes already-redacted content.
 
         ``kind`` distinguishes a brand-new candidate (``"new"``, the default,
         approved via ``approve_pending_skill``) from an UPDATE proposal against
@@ -4781,8 +5280,8 @@ class SkillsLoader:
         root = self._pending_root()
         root.mkdir(parents=True, exist_ok=True)
         # Atomically CLAIM a pending dir. mkdir(exist_ok=False) closes the TOCTOU
-        # between an exists() check and the create. If the natural slug is already
-        # awaiting review we must NOT overwrite it (the queued candidate is
+        # between the availability test and the create. If the natural slug is
+        # already awaiting review we must NOT overwrite it (the queued candidate is
         # immutable until approved/dismissed) — but we also must NOT silently drop
         # THIS candidate: consolidation advances its message offset regardless of
         # per-candidate outcome, so a distinct skill that merely slugifies the
@@ -4790,70 +5289,96 @@ class SkillsLoader:
         # slug (<slug>-2, -3, …) so it still gets queued. Genuine re-detections of
         # the SAME skill are suppressed upstream by the metadata dedupe before
         # staging, so this does not flood the queue with duplicates.
-        pdir = root / slug
-        try:
-            pdir.mkdir(exist_ok=False)
-        except FileExistsError:
-            claimed: "Path | None" = None
-            for _n in range(2, 51):
-                cand_dir = root / f"{slug}-{_n}"
+        #
+        # Every name on the walk is tested against BOTH namespaces and the slug
+        # pattern, so the queue only ever accepts a claim it can serve: a NEW
+        # candidate whose live name is occupied is unapprovable, and an over-long
+        # suffixed name is dropped from ``list_pending_skills`` and with it from
+        # the dashboard and from pruning.
+        _claim: Literal["pending-new", "pending-update"] = (
+            "pending-update" if (kind or "new") == "update" else "pending-new"
+        )
+        pdir: Path | None = None
+        # Same lock the live publish takes, for the same reason: the pending
+        # mkdir is atomic within this namespace, but only a shared lock keeps a
+        # live create from claiming the name this walk just accepted. The lock is
+        # held until ``.meta.json`` is committed, because ``kind`` is the field a
+        # live publish reads to decide whether this claim reserves its name: a
+        # publish seeing the claimed directory without that file fails closed and
+        # refuses a name an UPDATE candidate never reserves.
+        with self._auto_slug_claim_lock() as locked:
+            if not locked:
+                if refusal is not None:
+                    refusal.retryable = True
+                logger.warning(
+                    "Pending skill %s not staged: the slug claim lock is unavailable", slug
+                )
+                return None
+            for _cand in (slug, *(f"{slug}-{_n}" for _n in range(2, 51))):
+                if not self._auto_slug_available(_cand, claim=_claim):
+                    continue
+                _cand_dir = root / _cand
                 try:
-                    cand_dir.mkdir(exist_ok=False)
+                    _cand_dir.mkdir(exist_ok=False)
                 except FileExistsError:
                     continue
-                claimed = cand_dir
+                pdir = _cand_dir
                 break
-            if claimed is None:
-                logger.warning("Too many pending candidates for slug %s; deferring re-stage", slug)
-                return name
-            pdir = claimed
-            slug = claimed.name
-            name = f"{AUTO_SKILL_NAMESPACE}/{slug}"
-            logger.info("Slug in use; staging distinct candidate as %s", name)
-        try:
-            content = _build_auto_skill_content(
-                slug=slug,
-                description=description,
-                triggers=triggers,
-                procedure_md=procedure_md,
-                provenance=provenance,
-            )
-            (pdir / "SKILL.md").write_text(content, encoding="utf-8")
-            script_names: list[str] = []
-            clean_scripts = [s for s in (scripts or []) if isinstance(s, dict)]
-            if clean_scripts:
-                sdir = pdir / "scripts"
-                sdir.mkdir(exist_ok=True)
-                for s in clean_scripts:
-                    fn = str(s.get("filename", "")).strip()
-                    # Guard the script filename against traversal / nesting.
-                    if not fn or "/" in fn or "\\" in fn or ".." in fn:
-                        continue
-                    (sdir / fn).write_text(str(s.get("content", "")), encoding="utf-8")
-                    script_names.append(fn)
-            meta = {
-                "slug": slug,
-                "name": name,
-                "source": source,
-                "created_at": provenance.created_at or AutoSkillProvenance.now_iso(),
-                "description": description,
-                "triggers": triggers,
-                "has_scripts": bool(script_names),
-                "scripts": script_names,
-                "kind": kind or "new",
-            }
-            if target is not None:
-                meta["target"] = target
-            if base_version is not None:
-                meta["base_version"] = base_version
-            (pdir / ".meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        except Exception:
-            # A partial write (e.g. disk full) must not leave a CLAIMED but empty
-            # dir behind: a later stage would see it exists and report the slug as
-            # "already awaiting review" while no reviewable candidate exists.
-            # Roll back the atomic claim so the slug can be re-staged cleanly.
-            shutil.rmtree(pdir, ignore_errors=True)
-            raise
+            if pdir is None:
+                # Nothing is written, so the caller MUST take its rejection branch: a
+                # name returned from here is recorded as a staged candidate that does
+                # not exist, and consolidation's offset advance makes that loss
+                # permanent and invisible.
+                logger.warning("No free pending slug for %s; candidate not staged", slug)
+                return None
+            if pdir.name != slug:
+                slug = pdir.name
+                name = f"{AUTO_SKILL_NAMESPACE}/{slug}"
+                logger.info("Slug in use; staging distinct candidate as %s", name)
+            try:
+                content = _build_auto_skill_content(
+                    slug=slug,
+                    description=description,
+                    triggers=triggers,
+                    procedure_md=procedure_md,
+                    provenance=provenance,
+                )
+                (pdir / "SKILL.md").write_text(content, encoding="utf-8")
+                script_names: list[str] = []
+                clean_scripts = [s for s in (scripts or []) if isinstance(s, dict)]
+                if clean_scripts:
+                    sdir = pdir / "scripts"
+                    sdir.mkdir(exist_ok=True)
+                    for s in clean_scripts:
+                        fn = str(s.get("filename", "")).strip()
+                        # Guard the script filename against traversal / nesting.
+                        if not fn or "/" in fn or "\\" in fn or ".." in fn:
+                            continue
+                        (sdir / fn).write_text(str(s.get("content", "")), encoding="utf-8")
+                        script_names.append(fn)
+                meta = {
+                    "slug": slug,
+                    "name": name,
+                    "source": source,
+                    "created_at": provenance.created_at or AutoSkillProvenance.now_iso(),
+                    "description": description,
+                    "triggers": triggers,
+                    "has_scripts": bool(script_names),
+                    "scripts": script_names,
+                    "kind": kind or "new",
+                }
+                if target is not None:
+                    meta["target"] = target
+                if base_version is not None:
+                    meta["base_version"] = base_version
+                (pdir / ".meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            except Exception:
+                # A partial write (e.g. disk full) must not leave a CLAIMED but empty
+                # dir behind: a later stage would see it exists and report the slug as
+                # "already awaiting review" while no reviewable candidate exists.
+                # Roll back the atomic claim so the slug can be re-staged cleanly.
+                shutil.rmtree(pdir, ignore_errors=True)
+                raise
         logger.info("Staged pending skill candidate: %s (scripts=%d)", name, len(script_names))
         # Notify any registered observer (the gateway wires a bell-feed
         # notification + a ``skills.pending_changed`` WS event) so a candidate
@@ -4918,23 +5443,38 @@ class SkillsLoader:
             if not _AUTO_NAME_PATTERN.match(child.name):
                 continue
             meta = self._read_pending_meta(child.name)
-            out.append(
-                {
-                    "slug": child.name,
-                    "name": meta.get("name", f"{AUTO_SKILL_NAMESPACE}/{child.name}"),
-                    "description": meta.get("description", ""),
-                    "triggers": meta.get("triggers", ""),
-                    "has_scripts": bool(meta.get("has_scripts")),
-                    "created_at": meta.get("created_at", ""),
-                    "source": meta.get("source", ""),
-                    "kind": meta.get("kind", "new"),
-                    "target": meta.get("target"),
-                    "base_version": meta.get("base_version"),
-                    # NB: no on-disk ``path`` — this dict is API-facing (feeds
-                    # /api/skills/-/pending) and must not leak the server's home
-                    # / directory layout to dashboard clients.
+            # Same verdict the approve path will reach, so the card can carry a
+            # warning badge WITHOUT the user expanding the row first. The
+            # verdict walk is self-defending — descriptor-pinned, budgeted,
+            # fail-closed (see _pending_scripts_verdict) — so no candidate-wide
+            # pre-walk runs here: an unbudgeted os.walk before the budgeted one
+            # would itself be the unbounded per-poll traversal the budgets
+            # exist to prevent. ``None`` means the platform cannot compute a
+            # trustworthy verdict; the field is omitted rather than serving a
+            # false all-clear.
+            verdict = self._pending_scripts_verdict(child)
+            entry = {
+                "slug": child.name,
+                "name": meta.get("name", f"{AUTO_SKILL_NAMESPACE}/{child.name}"),
+                "description": meta.get("description", ""),
+                "triggers": meta.get("triggers", ""),
+                "has_scripts": bool(meta.get("has_scripts")),
+                "created_at": meta.get("created_at", ""),
+                "source": meta.get("source", ""),
+                "kind": meta.get("kind", "new"),
+                "target": meta.get("target"),
+                "base_version": meta.get("base_version"),
+                # NB: no on-disk ``path`` — this dict is API-facing (feeds
+                # /api/skills/-/pending) and must not leak the server's home
+                # / directory layout to dashboard clients.
+            }
+            if verdict is not None:
+                v_ok, v_report = verdict
+                entry["script_validation"] = {
+                    "ok": v_ok,
+                    "report": self._redact_validation_report(v_report),
                 }
-            )
+            out.append(entry)
         return out
 
     @staticmethod
@@ -4970,15 +5510,28 @@ class SkillsLoader:
 
     @staticmethod
     def _candidate_has_symlink(pdir: Path) -> bool:
-        """True if the candidate dir itself or any entry under it is a symlink —
+        """True if the candidate dir itself or any entry under it is a link —
         so the read/approve paths never follow an LLM-planted link to a
         sensitive file. (Scripts always require human review before going live;
-        this is defense-in-depth, not the primary control.)"""
-        if os.path.islink(str(pdir)):
+        this is defense-in-depth, not the primary control.)
+
+        "Link" is :func:`platform_compat.is_link_or_junction`, not
+        ``os.path.islink``: a Windows directory junction is a reparse point
+        ``islink`` reports as a plain directory, so the fence answered False for
+        one AND ``os.walk`` descended through it -- the read path then reached
+        whatever it pointed at, which is the exact escape this refuses.
+        Directories are tested before files because a topdown walk offers a
+        directory in ``dirs`` before descending into it, so answering there is
+        what keeps this from ever walking THROUGH a link to reach its verdict.
+        """
+        if is_link_or_junction(pdir):
             return True
         for root, dirs, files in os.walk(pdir):
-            for nm in list(dirs) + list(files):
-                if os.path.islink(os.path.join(root, nm)):
+            for nm in list(dirs):
+                if is_link_or_junction(os.path.join(root, nm)):
+                    return True
+            for nm in files:
+                if is_link_or_junction(os.path.join(root, nm)):
                     return True
         return False
 
@@ -5023,35 +5576,551 @@ class SkillsLoader:
                         continue
         return out
 
+    _ALLOWED_CANDIDATE_TOP = frozenset({"SKILL.md", ".meta.json", "scripts"})
+
+    def _collect_scripts_pinned(
+        self,
+        pinned: PinnedDirectory,
+        rel: tuple[str, ...],
+        out: list[dict],
+        budget: dict[str, int],
+    ) -> bool:
+        """Collect ``{filename, content}`` under *pinned*, refusing a link anywhere.
+
+        Returns False when the tree is not readable as plain files and directories, or
+        when it does not fit the budget, which the caller turns into a refusal of the
+        whole candidate. Relative filenames carry the platform separator, because they
+        are served through the API.
+
+        Every bound here is the verdict walk's bound, deliberately: the SAME
+        ``_PENDING_SCRIPT_MAX_ENTRIES`` entries and the same ``MAX_SCRIPT_BYTES`` per
+        file. Those two ARE the bound on what this accumulates -- at most
+        ``entries * per-file`` bytes -- so there is deliberately no third, aggregate
+        check: with both of the above in force it could never fire, and a guard that
+        cannot fire reads as protection while providing none. This runs per request
+        against a tree an agent writes directly, so reusing the verdict's numbers is
+        also what keeps the two from disagreeing about which candidates are readable.
+        *budget* is threaded through the recursion rather than recreated per directory,
+        or a planted tree of many small directories would each get a fresh allowance and
+        the total would be unbounded again. Names are enumerated LAZILY against the
+        entry cap for the same reason the verdict walk does it: an eager
+        ``sorted(names())`` spends the allocation before any budget can refuse it.
+
+        Depth is bounded by ``_PENDING_SCRIPT_MAX_DEPTH``, the same cap the verdict
+        walk uses, and bounded the SAME WAY: that walk refuses to descend when the
+        directory it is standing in is already at the cap, so it enumerates the level
+        AT the cap. The comparison here is ``>`` rather than ``>=`` for exactly that
+        reason -- one level tighter would refuse a tree the verdict judged fine, and
+        the detail read would answer 404 for a candidate that is waiting for review. The tree is written directly by an agent, so a nesting chain deep
+        enough to exhaust the interpreter's recursion limit is free to produce, and
+        the resulting ``RecursionError`` would surface as a failed request rather
+        than a refused candidate. Refusing at the cap also keeps the two traversals
+        in step: a tree the verdict declines to judge is not one this still reads.
+        """
+        if len(rel) > _PENDING_SCRIPT_MAX_DEPTH:
+            return False
+        listed = pinned.names_bounded(_PENDING_SCRIPT_MAX_ENTRIES)
+        if listed is None:
+            return False
+        for name in sorted(listed):
+            if pinned.is_link(name):
+                return False
+            budget["entries"] += 1
+            if budget["entries"] > _PENDING_SCRIPT_MAX_ENTRIES:
+                # Directories spend the entry budget too, so a planted tree of many
+                # nearly-empty ones cannot buy traversal the files could not.
+                return False
+            if pinned.is_dir(name):
+                sub = pinned.child_if_real_dir(name)
+                if sub is None:
+                    # The open refusing IS the protection: what is at the name is not
+                    # the real directory it screened as. Refuse the candidate.
+                    return False
+                with sub:
+                    if not self._collect_scripts_pinned(sub, (*rel, name), out, budget):
+                        return False
+                continue
+            try:
+                text = pinned.read_text(name, max_bytes=MAX_SCRIPT_BYTES)
+            except (OSError, UnicodeDecodeError):
+                # ONE refusal policy, so nothing here reasons about error classes.
+                # An entry that cannot be read as text is not shown to the reviewer,
+                # and this API exists for INFORMED approval -- silently omitting it
+                # would let a clean-looking detail stand for a candidate that approve
+                # then refuses, or worse, promotes unreviewed. A hardlink, a
+                # non-regular entry and one over the per-file cap arrive here too,
+                # each refused by the read itself.
+                return False
+            out.append(
+                {
+                    "filename": os.path.join(*rel, name) if rel else name,
+                    "content": text,
+                }
+            )
+        return True
+
+    def _read_candidate_pinned(self, pdir: Path) -> tuple[str, dict, list[dict]] | None:
+        """Read a candidate's ``SKILL.md``, ``.meta.json`` and scripts through ONE pin chain.
+
+        The traversal both judges and reads. The screen-then-read shape this replaces
+        refused a link that was PRESENT at the check, so a candidate tree the LLM can
+        write needed only to have the link absent at the screen and present by the
+        ``read_text`` a few statements later, and the contents of a file of its
+        choosing were served -- the redaction passes cover credential and exfil-URL
+        shapes only, so anything else came back intact. Here every open refuses a link
+        at the name itself, so there is no gap between the judgement and the read.
+
+        Returns None when the candidate cannot be read as a plain tree: a link
+        anywhere, a non-regular entry, or a directory replaced underneath. "Anywhere"
+        is the whole top level, not only the names this reads: the approve path
+        refuses an unexpected top-level entry outright, so a detail read that served
+        one would be MORE permissive than the approve it exists to inform.
+        """
+        try:
+            pinned = pinned_directory(pdir)
+        except OSError:
+            return None
+        with pinned:
+            # Screen the whole top level BEFORE a byte is read, so the refusal this
+            # docstring promises is structural rather than a side effect of which
+            # names happen to be read. `_collect_scripts_pinned` refuses a link
+            # anywhere under `scripts/`; this covers every OTHER top-level name --
+            # `.meta.json`, and an unexpected entry the approve path refuses outright,
+            # which nothing on this path opens and so nothing else would check. It
+            # does not REPLACE the per-name refusals below: it cannot see a swap that
+            # happens after it, which is what those catch.
+            #
+            # Enumeration is BOUNDED by the same entry budget the verdict walk spends,
+            # because this runs per request against a tree an agent writes directly: a
+            # planted crowd of names would otherwise be materialized in one allocation
+            # here, before any later check could refuse it. Over budget refuses the
+            # candidate rather than serving a partial view of its directory.
+            listed = pinned.names_bounded(_PENDING_SCRIPT_MAX_ENTRIES)
+            if listed is None:
+                return None
+            names = set(listed)
+            if any(pinned.is_link(name) for name in names):
+                return None
+            try:
+                body = pinned.read_text("SKILL.md", max_bytes=MAX_SCRIPT_BYTES)
+            except (OSError, UnicodeDecodeError):
+                return None
+            meta: dict = {}
+            if ".meta.json" in names:
+                try:
+                    raw = pinned.read_text(".meta.json", max_bytes=MAX_SCRIPT_BYTES)
+                except (OSError, UnicodeDecodeError):
+                    # Unreadable THROUGH THE PIN is a fence signal, not bad content:
+                    # the name is not the plain file it screened as, which is the same
+                    # class as SKILL.md failing above. Refuse the candidate rather
+                    # than serve it with empty metadata.
+                    return None
+                try:
+                    parsed = json.loads(raw)
+                except ValueError:
+                    # Malformed JSON is the agent writing nonsense, not a swap. The
+                    # reviewer still sees SKILL.md and the scripts.
+                    parsed = None
+                if isinstance(parsed, dict):
+                    # Recursively redact secrets from LLM-produced metadata before it
+                    # can surface via the pending detail API: the crystallize skill
+                    # writes ``.meta.json`` directly, bypassing the consolidation
+                    # redaction path, so a credential in ANY nested value is scrubbed.
+                    scrubbed = self._redact_deep(parsed)
+                    meta = scrubbed if isinstance(scrubbed, dict) else {}
+            scripts: list[dict] = []
+            if "scripts" in names:
+                if pinned.is_link("scripts"):
+                    # NOT redundant with the screen above, and the difference is
+                    # timing: that screen refuses a link PRESENT when the traversal
+                    # started, this one refuses a link swapped in while the reads
+                    # above were running. A tree written by an agent can change
+                    # between the two.
+                    return None
+                if pinned.is_dir("scripts"):
+                    sub = pinned.child_if_real_dir("scripts")
+                    if sub is None:
+                        return None
+                    # ONE budget for the whole subtree, spent the way the verdict walk
+                    # spends it: entries and aggregate bytes, same constants. Per-call
+                    # rather than per-directory, or a planted tree of many small
+                    # directories would each get a fresh allowance.
+                    budget = {"entries": 0}
+                    with sub:
+                        if not self._collect_scripts_pinned(sub, (), scripts, budget):
+                            return None
+            return body, meta, scripts
+
+    def _candidate_layout_findings_at(self, root_fd: int) -> list[str]:
+        """Top-level layout check mirroring ``_candidate_layout_ok``.
+
+        The approve path refuses a candidate whose ROOT layout is wrong — a
+        symlinked ``SKILL.md``/``.meta.json``, a non-regular one (promotion
+        reads their bytes, so a directory there is refused too), or any
+        unexpected top-level entry — so a verdict that only inspects
+        ``scripts/`` would read ``ok: true`` for a candidate approve is
+        guaranteed to refuse, which is the predict-the-refusal contract this
+        verdict exists to keep.
+
+        Operates on the ALREADY-OPEN candidate-root descriptor the caller
+        retains for the whole verdict — this function resolves no path at
+        all. Every entry is stat-ed RELATIVE to that descriptor, so nothing
+        a candidate does to the tree's names after the root was pinned can
+        redirect the scan: the descriptor IS the directory, whatever any
+        path now resolves to.
+
+        This is deliberately NOT the recursive candidate-wide pre-walk the
+        budgets removed: one capped scan of the top level plus a stat per
+        allowed name — no byte is read, nothing recurses (``scripts/``
+        internals stay the pinned walk's job). Findings use the same
+        ``invalid layout:`` vocabulary as the walk so the frontend renders
+        them identically.
+        """
+        names: list[str] = []
+        try:
+            with os.scandir(root_fd) as scanner:
+                for entry in scanner:
+                    names.append(entry.name)
+                    if len(names) > 16:
+                        # The valid top level has at most 3 entries; a
+                        # planted crowd must not grow this per-poll
+                        # scan without limit.
+                        return ["invalid layout: too many top-level entries"]
+        except OSError:
+            return ["verdict unavailable: candidate unreadable"]
+        findings: list[str] = []
+        for nm in sorted(names):
+            if nm not in self._ALLOWED_CANDIDATE_TOP:
+                findings.append(f"invalid layout: unexpected candidate entry {nm!r}")
+                continue
+            est = pinned_fs.stat_at(root_fd, nm)
+            if est is None:
+                findings.append(f"invalid layout: {nm!r} unreadable")
+            elif stat.S_ISLNK(est.st_mode):
+                findings.append(f"invalid layout: {nm!r} is a symlink")
+            elif nm != "scripts" and not stat.S_ISREG(est.st_mode):
+                # Promotion reads these files' bytes; a directory (or
+                # FIFO) named SKILL.md/.meta.json is refused at
+                # approve time, so the verdict must not read clean.
+                findings.append(f"invalid layout: {nm!r} is not a regular file")
+        return findings
+
+    def _pending_scripts_verdict(self, pdir: Path) -> tuple[bool, dict] | None:
+        """Cheap pre-approval validation verdict for the pending LIST path.
+
+        Takes the CANDIDATE ROOT: the top-level layout is prechecked against
+        the same rules the approve path enforces (see
+        :meth:`_candidate_layout_findings_at`) before the ``scripts`` walk, so a
+        symlinked ``SKILL.md`` or a stray top-level file fails the verdict
+        here exactly as approve would refuse it.
+
+        The candidate root is resolved EXACTLY ONCE: one
+        :func:`pinned_fs.open_dir_pinned` call pins it (``O_NOFOLLOW`` on the
+        root and every ancestor), and that descriptor is retained for the
+        whole verdict — the top-level layout scan reads through it, and the
+        ``scripts`` directory is opened RELATIVE to it (``dir_fd``), with an
+        identity check that the opened directory is the same inode the
+        layout scan stat-ed. No name under the candidate is ever re-resolved
+        from a path, so a candidate root swapped between any two steps —
+        whether for a symlink (refused at the pinned open) or for a
+        different REAL directory renamed over it (unreachable, because no
+        second resolution exists to land on it) — cannot redirect any part
+        of the verdict into another tree. Every entry below ``scripts`` is
+        likewise stat-ed, opened and read relative to the walk's own
+        descriptors.
+
+        The verdict fails CLOSED on everything the approve path would refuse:
+        a symlink entry is an invalid layout, an oversized script is flagged
+        from its size alone (its bytes are never loaded — this runs on every
+        dashboard poll, and a crystallize direct-write can plant files the
+        staging cap never saw), an unreadable or undecodable script is a
+        finding rather than a silent omission (approve refuses such a
+        candidate at redaction, so ``ok: true`` would be a false all-clear),
+        and an unexpected walk error degrades to a failing
+        verdict-unavailable finding rather than blanking the caller's whole
+        list. Small, decodable scripts get the real ``validate_scripts`` run,
+        matching the approve path's verdict.
+
+        Returns ``None`` on a platform without descriptor-relative opens,
+        BEFORE the candidate is touched at all. A link/junction check
+        followed by a by-name scan races with replacement of the candidate
+        root: even a refusal can expose the target's filenames. On Windows
+        the pre-click "fails validation" badge disappears entirely, because
+        no trustworthy verdict can be computed without descriptor-relative
+        opens. The caller omits the field; approve remains the authority at
+        click time.
+        """
+        if not pinned_fs.supports_pinned_walk():
+            return None
+        try:
+            root_fd = pinned_fs.open_dir_pinned(pdir, what="pending candidate root")
+        except pinned_fs.PinnedPathRefusal:
+            return False, {
+                "<candidate>": ["invalid layout: candidate root is not a real directory"]
+            }
+        except OSError:
+            return False, {"<candidate>": ["verdict unavailable: candidate unreadable"]}
+        try:
+            return self._pending_scripts_verdict_at(root_fd)
+        finally:
+            os.close(root_fd)
+
+    def _pending_scripts_verdict_at(self, root_fd: int) -> tuple[bool, dict] | None:
+        """The verdict body, entirely relative to the retained root descriptor."""
+        layout = self._candidate_layout_findings_at(root_fd)
+        if layout:
+            return False, {"<candidate>": layout}
+        sst = pinned_fs.stat_at(root_fd, "scripts")
+        if sst is None:
+            # No scripts directory at all — nothing to validate.
+            return True, {}
+        if stat.S_ISLNK(sst.st_mode) or not stat.S_ISDIR(sst.st_mode):
+            return False, {"<candidate>": ["invalid layout: 'scripts' is not a real directory"]}
+        if not pinned_fs.supports_pinned_tree_walk():
+            return None
+        try:
+            scripts_fd = os.open("scripts", pinned_fs.dir_flags(), dir_fd=root_fd)
+        except OSError:
+            return False, {"<candidate>": ["invalid layout: contains a symlink"]}
+        try:
+            # The OPENED directory must be the same inode the stat above
+            # described — a 'scripts' swapped between the stat and the open
+            # (even for another real directory; both live under the pinned
+            # root) fails the verdict closed instead of being walked as if
+            # it were the audited one.
+            ost = os.fstat(scripts_fd)
+            if (ost.st_ino, ost.st_dev) != (sst.st_ino, sst.st_dev):
+                os.close(scripts_fd)
+                return False, {"<candidate>": ["invalid layout: entry changed during scan"]}
+        except OSError:
+            os.close(scripts_fd)
+            return False, {"<candidate>": ["verdict unavailable: candidate unreadable"]}
+        scripts: list[dict] = []
+        extra: dict[str, list[str]] = {}
+        # Hard budgets for the whole walk: this runs on every dashboard poll,
+        # and a crystallize direct-write can plant MANY small files — or many
+        # nested directories — that the per-file size cap never bounds.
+        # Directories count against the same entry budget and recursion is
+        # depth-capped, so a planted tree can neither grow the traversal
+        # without limit nor raise RecursionError into the caller's degraded
+        # ok-true fallback. Exceeding any budget stops the walk immediately
+        # and OMITS the verdict (see the breach return below) — never a false
+        # refusal claim; the approve path remains the authority on the full
+        # set.
+        max_files = _PENDING_SCRIPT_MAX_ENTRIES
+        max_depth = _PENDING_SCRIPT_MAX_DEPTH
+        budget = {"files": 0, "bytes": 0, "breached": False}
+        max_total_bytes = max_files * MAX_SCRIPT_BYTES
+
+        def _breach(reason: str) -> None:
+            budget["breached"] = True
+            extra.setdefault("<candidate>", []).append(reason)
+
+        def _walk(fd: int, prefix: str, depth: int) -> None:
+            # Collect names LAZILY with a cap before sorting: an eager
+            # sorted(os.listdir(fd)) materializes an attacker-sized directory
+            # in one allocation before any budget applies, which is the exact
+            # per-poll exhaustion the budgets exist to prevent. Scanning stops
+            # at the entry budget, so at most max_files+1 names are ever held.
+            names: list[str] = []
+            with os.scandir(fd) as scanner:
+                for entry in scanner:
+                    names.append(entry.name)
+                    if len(names) > max_files:
+                        _breach(f"too many scripts: over {max_files} entries")
+                        return
+            for nm in sorted(names):
+                if budget["breached"]:
+                    return
+                rel = f"{prefix}{nm}"
+                try:
+                    est = os.stat(nm, dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    extra.setdefault(rel, []).append("unreadable script: stat failed")
+                    continue
+                if stat.S_ISLNK(est.st_mode):
+                    extra.setdefault(rel, []).append("invalid layout: entry is a symlink")
+                elif stat.S_ISDIR(est.st_mode):
+                    # Directories spend the same entry budget as files, and
+                    # recursion is depth-capped — a planted tree of many or
+                    # deeply nested dirs must not reintroduce the unbounded
+                    # per-poll traversal (or a RecursionError that the
+                    # caller's fallback would degrade to a false all-clear).
+                    budget["files"] += 1
+                    if budget["files"] > max_files:
+                        _breach(f"too many scripts: over {max_files} entries")
+                        return
+                    if depth >= max_depth:
+                        _breach(f"scripts tree too deep: over {max_depth} levels")
+                        return
+                    try:
+                        sub = os.open(nm, pinned_fs.dir_flags(), dir_fd=fd)
+                    except OSError:
+                        extra.setdefault(rel, []).append("invalid layout: entry is a symlink")
+                        continue
+                    try:
+                        _walk(sub, f"{rel}/", depth + 1)
+                    finally:
+                        os.close(sub)
+                elif stat.S_ISREG(est.st_mode):
+                    if est.st_size > MAX_SCRIPT_BYTES:
+                        extra.setdefault(rel, []).append(
+                            f"too large: {est.st_size} bytes > {MAX_SCRIPT_BYTES} cap"
+                        )
+                        continue
+                    budget["files"] += 1
+                    budget["bytes"] += est.st_size
+                    if budget["files"] > max_files or budget["bytes"] > max_total_bytes:
+                        _breach(
+                            f"too many scripts: over {max_files} entries or "
+                            f"{max_total_bytes} aggregate bytes"
+                        )
+                        return
+                    try:
+                        # O_NONBLOCK: O_NOFOLLOW rejects a swapped symlink but
+                        # NOT a swapped FIFO, and a blocking O_RDONLY open of a
+                        # writerless FIFO wedges this poll thread forever. For
+                        # a regular file O_NONBLOCK is a no-op on open and
+                        # read, so the flag costs nothing on the honest path.
+                        rfd = os.open(
+                            nm,
+                            os.O_RDONLY
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_NONBLOCK", 0),
+                            dir_fd=fd,
+                        )
+                    except OSError:
+                        extra.setdefault(rel, []).append("unreadable script: open failed")
+                        continue
+                    try:
+                        # The OPENED descriptor must be the same regular inode
+                        # the stat above described: a name swapped between the
+                        # stat and the open (FIFO, device, replaced file) fails
+                        # the verdict closed instead of being read as if it
+                        # were the audited entry.
+                        ost = os.fstat(rfd)
+                        if not stat.S_ISREG(ost.st_mode) or (ost.st_ino, ost.st_dev) != (
+                            est.st_ino,
+                            est.st_dev,
+                        ):
+                            extra.setdefault(rel, []).append(
+                                "invalid layout: entry changed during scan"
+                            )
+                            continue
+                        raw = os.read(rfd, MAX_SCRIPT_BYTES + 1)
+                    except OSError:
+                        extra.setdefault(rel, []).append("unreadable script: read failed")
+                        continue
+                    finally:
+                        os.close(rfd)
+                    try:
+                        scripts.append({"filename": rel, "content": raw.decode("utf-8")})
+                    except UnicodeDecodeError:
+                        extra.setdefault(rel, []).append("unreadable script: not valid UTF-8")
+
+        try:
+            try:
+                _walk(scripts_fd, "", 0)
+            finally:
+                os.close(scripts_fd)
+            if budget["breached"]:
+                # A breached budget means the LIST path declined to do the
+                # work, not that approve will refuse: approve's collector is
+                # unbudgeted, so a candidate with 65 small clean scripts
+                # approves fine. Claiming `ok: false` here makes the badge and
+                # hint over-promise a refusal that never comes — the honest
+                # verdict is NO verdict (the caller omits the field, exactly
+                # like a platform that cannot pin the walk). The exhaustion
+                # defense is unchanged: the walk already STOPPED at its budget.
+                return None
+            v_ok, v_report = validate_scripts(scripts)
+            if v_ok:
+                # Approve validates TWICE: raw, then again after redacting in
+                # place (a credential-shaped token redacts into broken
+                # syntax and is refused). Mirror the second stage on in-memory
+                # copies so a script that is clean raw but breaks under
+                # redaction does not read `ok: true` for a click approve
+                # refuses. Verdict-side only — nothing on disk is touched.
+                redacted = [
+                    {"filename": s["filename"], "content": self._redact_text(s["content"])}
+                    for s in scripts
+                ]
+                v_ok, v_report = validate_scripts(redacted)
+        except Exception:
+            # One broken candidate must not blank the caller's whole pending
+            # list, and an unvalidated candidate must not read clean: degrade
+            # to a failing verdict-unavailable finding.
+            return False, {"<candidate>": ["verdict unavailable: unexpected walk error"]}
+        for fn, findings in extra.items():
+            v_report.setdefault(fn, []).extend(findings)
+        return (v_ok and not extra), v_report
+
+    def pending_candidate_is_staged(self, slug: str) -> bool:
+        """Whether a candidate is still staged at *slug*, for CHOOSING A MESSAGE.
+
+        ``get_pending_skill`` answers None for two different situations -- there is no
+        such candidate, and there is one whose tree the pinned read refuses -- and a
+        caller that renders both as "approved or dismissed elsewhere" tells the user
+        their candidate is gone while it sits in the list. This separates them.
+
+        Deliberately a by-name probe, and deliberately not a security check: the pinned
+        read is the authority on whether anything may be READ, and this runs only after
+        that read already refused. Losing the race changes which refusal message a user
+        sees and can never turn a refusal into a read, which is why a second traversal
+        would be cost without a property.
+        """
+        if not self._is_pending_slug_safe(slug):
+            return False
+        return (self._pending_root() / slug / "SKILL.md").exists()
+
     def get_pending_skill(self, slug: str) -> dict | None:
         """Return full pending-candidate detail incl. SKILL.md body + script bodies."""
         if not self._is_pending_slug_safe(slug):
             return None
         pdir = self._pending_root() / slug
-        skill_file = pdir / "SKILL.md"
-        if not skill_file.exists():
+        if not (pdir / "SKILL.md").exists():
+            # The ordinary "no such candidate" answer. Not a security check -- the
+            # pinned read below is -- so probing by name here costs nothing.
             return None
-        # Reject any symlink in the candidate on the read path too (approval
-        # already rejects them) so the detail API can't be tricked into reading
-        # a sensitive file a candidate symlinked SKILL.md / a nested file to.
-        if self._candidate_has_symlink(pdir):
-            logger.warning("Refusing to read pending %s: candidate contains a symlink", slug)
+        # ONE descriptor-pinned traversal both validates and reads: the body, the
+        # metadata and every script come back from opens that refuse a link AT THE
+        # NAME, so there is no screen-then-read gap for a candidate to flip a name
+        # through and no way to point the detail API at a file outside the candidate.
+        read = self._read_candidate_pinned(pdir)
+        if read is None:
+            logger.warning(
+                "Refusing to read pending %s: candidate is not a plain tree of files", slug
+            )
             return None
-        meta = self._read_pending_meta(slug)
-        scripts = self._collect_scripts(pdir / "scripts")
+        body, meta, scripts = read
+        # Same hardened verdict as the pending LIST (descriptor-pinned walk,
+        # fail-closed on unreadable/oversized entries) — deriving it from the
+        # display collection instead would let a silently omitted unreadable
+        # script present a clean detail verdict while approve refuses. The
+        # display ``scripts`` list below is unchanged. ``None`` (platform
+        # cannot compute a trustworthy verdict) omits the field rather than
+        # serving a false all-clear.
+        verdict = self._pending_scripts_verdict(pdir)
         for s in scripts:
             s["filename"] = self._redact_text(s.get("filename", ""))
             s["content"] = self._redact_text(s.get("content", ""))
-        return {
+        detail = {
             "slug": slug,
             "name": meta.get("name", f"{AUTO_SKILL_NAMESPACE}/{slug}"),
             "meta": meta,
             "kind": meta.get("kind", "new"),
             "target": meta.get("target"),
             "base_version": meta.get("base_version"),
-            "content": self._redact_text(skill_file.read_text(encoding="utf-8")),
+            "content": self._redact_text(body),
             "scripts": scripts,
         }
+        if verdict is not None:
+            v_ok, v_report = verdict
+            detail["script_validation"] = {
+                "ok": v_ok,
+                "report": self._redact_validation_report(v_report),
+            }
+        return detail
 
     def _candidate_layout_ok(self, src: Path, name: str) -> bool:
         """Shared candidate-layout guard for BOTH approve paths.
@@ -5068,7 +6137,9 @@ class SkillsLoader:
         if self._candidate_has_symlink(src):
             logger.warning("Refusing to approve %s: candidate contains a symlink", name)
             return False
-        _allowed_top = {"SKILL.md", ".meta.json", "scripts"}
+        # One copy of the rule: the verdict's precheck reads this same set, so
+        # an entry added here is automatically predicted by the badge.
+        _allowed_top = self._ALLOWED_CANDIDATE_TOP
         for entry in src.iterdir():
             if entry.name not in _allowed_top:
                 logger.warning(
@@ -5082,17 +6153,20 @@ class SkillsLoader:
                 return False
         return True
 
-    def _validate_and_redact_candidate(self, src: Path, name: str) -> dict[Path, bytes] | None:
+    def _validate_and_redact_candidate(self, src: Path, name: str) -> dict[Path, bytes]:
         """Re-validate + redact a candidate's SKILL.md and scripts IN PLACE.
 
         Shared by ``approve_pending_skill`` and ``approve_pending_update`` so
         both enforce the identical discipline: validate every script (covers
         crystallize direct-writes), snapshot each target's ORIGINAL bytes, redact
         in place, then re-validate scripts (redacting a credential-shaped token
-        can break syntax). On ANY failure the originals are restored and ``None``
-        is returned so a rejected candidate is never left corrupted. On success
-        returns the ``{path: original_bytes}`` snapshot so the caller can restore
-        on a LATER failure (e.g. a failed move / snapshot).
+        can break syntax). On ANY failure the originals are restored and a
+        ``PendingApprovalRefused`` is raised naming the reason — a validation
+        failure carries the redacted ``{filename: [findings]}`` report so the
+        refusal can tell the reviewer WHAT was flagged — and a rejected
+        candidate is never left corrupted. On success returns the
+        ``{path: original_bytes}`` snapshot so the caller can restore on a
+        LATER failure (e.g. a failed move / snapshot).
         """
         sdir_src = src / "scripts"
         # Pre-redaction script validation.
@@ -5100,7 +6174,9 @@ class SkillsLoader:
             ok, report = validate_scripts(self._collect_scripts(sdir_src))
             if not ok:
                 logger.warning("Refusing to approve %s: script validation failed: %s", name, report)
-                return None
+                raise PendingApprovalRefused(
+                    "script_validation_failed", report=self._redact_validation_report(report)
+                )
         # Snapshot each target FIRST so an abort after partial in-place redaction
         # restores the candidate's ORIGINAL bytes.
         redact_targets = [src / "SKILL.md"]
@@ -5130,7 +6206,7 @@ class SkillsLoader:
                 logger.warning(
                     "Refusing to approve %s: could not redact %s before promotion", name, fp.name
                 )
-                return None
+                raise PendingApprovalRefused("redaction_failed")
         # Re-validate scripts AFTER redaction so a broken/altered helper never
         # goes live and the pending draft is not corrupted.
         if sdir_src.is_dir():
@@ -5140,8 +6216,51 @@ class SkillsLoader:
                 logger.warning(
                     "Refusing to approve %s: scripts invalid after redaction: %s", name, report
                 )
-                return None
+                raise PendingApprovalRefused(
+                    "script_validation_failed", report=self._redact_validation_report(report)
+                )
         return redact_backup
+
+    def _redact_validation_report(self, report: dict) -> dict:
+        """Bound and redact reports at retention for every pending HTTP surface.
+
+        Keep at most the verdict's script-entry budget, with independently
+        bounded finding lists and strings. Redact BEFORE shortening strings:
+        cutting first could turn a credential into an unrecognised fragment.
+        One fixed summary reports omitted entries (including redacted-key
+        collisions), findings within retained entries, and characters within
+        retained strings. Entries beyond the population cap are never redacted
+        or copied.
+        """
+        safe: dict[str, list[str]] = {}
+        omitted_entries = max(0, len(report) - _PENDING_SCRIPT_MAX_ENTRIES)
+        omitted_findings = 0
+        omitted_chars = 0
+        for fn, findings in islice(report.items(), _PENDING_SCRIPT_MAX_ENTRIES):
+            redacted_key = self._redact_text(str(fn))
+            key = redacted_key[:_VALIDATION_REPORT_MAX_STRING_CHARS]
+            # Redaction and shortening can collapse distinct filenames. Never
+            # overwrite a prior entry or let a filename steal the summary slot.
+            if key in safe or key == _VALIDATION_REPORT_TRUNCATION_KEY:
+                omitted_entries += 1
+                continue
+            omitted_chars += len(redacted_key) - len(key)
+            values: list[str] = []
+            omitted_findings += max(0, len(findings) - _VALIDATION_REPORT_MAX_FINDINGS)
+            for finding in islice(findings, _VALIDATION_REPORT_MAX_FINDINGS):
+                redacted = self._redact_text(str(finding))
+                value = redacted[:_VALIDATION_REPORT_MAX_STRING_CHARS]
+                omitted_chars += len(redacted) - len(value)
+                values.append(value)
+            safe[key] = values
+        if omitted_entries or omitted_findings or omitted_chars:
+            safe[_VALIDATION_REPORT_TRUNCATION_KEY] = [
+                "too large: validation report truncated; "
+                f"omitted {omitted_entries} script entries, "
+                f"{omitted_findings} findings from retained entries, "
+                f"{omitted_chars} characters from retained strings"
+            ]
+        return safe
 
     @staticmethod
     def _auto_slug_from_name(name: str) -> str:
@@ -5394,12 +6513,25 @@ class SkillsLoader:
         return highest + 1
 
     def approve_pending_update(self, slug: str) -> str | None:
+        """``approve_pending_update_checked`` with the legacy ``None`` contract.
+
+        Existing callers branch on ``None`` for "refused for any reason"; the
+        checked variant raises ``PendingApprovalRefused`` so the dashboard can
+        report WHY. This wrapper keeps their behaviour unchanged.
+        """
+        try:
+            return self.approve_pending_update_checked(slug)
+        except PendingApprovalRefused:
+            return None
+
+    def approve_pending_update_checked(self, slug: str) -> str:
         """Promote a pending UPDATE candidate over its live target auto-skill.
 
         Preconditions (all checked BEFORE any live mutation; a failure here
-        leaves BOTH the live skill and the candidate untouched, returns None):
-        the slug is safe, the candidate has a ``SKILL.md``, its ``.meta.json``
-        has ``kind == "update"``, and ``target`` names an EXISTING live auto
+        leaves BOTH the live skill and the candidate untouched and raises
+        ``PendingApprovalRefused`` with the reason): the slug is safe, the
+        candidate has a ``SKILL.md``, its ``.meta.json`` has
+        ``kind == "update"``, and ``target`` names an EXISTING live auto
         skill. Then: the shared symlink/unexpected-entry guard runs, scripts are
         re-validated, and SKILL.md + scripts are redacted in place (originals
         restored on failure).
@@ -5413,26 +6545,26 @@ class SkillsLoader:
         pending dir, and SEL-audit. Returns ``auto/<target>`` on success.
         """
         if not self._is_pending_slug_safe(slug):
-            return None
+            raise PendingApprovalRefused("not_found")
         src = self._pending_root() / slug
         if not (src / "SKILL.md").exists():
-            return None
+            raise PendingApprovalRefused("not_found")
         meta = self._read_pending_meta(slug)
         if meta.get("kind") != "update":
-            return None
+            raise PendingApprovalRefused("not_found")
         target = meta.get("target")
         if not isinstance(target, str) or not target:
-            return None
+            raise PendingApprovalRefused("target_missing")
         target_slug = self._auto_slug_from_name(target)
         if not self._is_pending_slug_safe(target_slug):
-            return None
+            raise PendingApprovalRefused("target_missing")
         live_dir = self._dir / AUTO_SKILL_NAMESPACE / target_slug
         live_skill = live_dir / "SKILL.md"
         if not live_skill.exists():
             logger.warning(
                 "Refusing to approve update %s: target %r is not a live auto skill", slug, target
             )
-            return None
+            raise PendingApprovalRefused("target_missing")
         target_name = f"{AUTO_SKILL_NAMESPACE}/{target_slug}"
         # The LIVE side is a write target here (unlike approve_pending_skill, which
         # moves into a fresh dest), so it needs its own symlink guard: a symlinked
@@ -5443,14 +6575,30 @@ class SkillsLoader:
                 "Refusing to approve update %s: live skill directory contains a symlink",
                 target_name,
             )
-            return None
+            raise PendingApprovalRefused("invalid_layout")
         # Shared symlink + unexpected-entry rejection.
         if not self._candidate_layout_ok(src, target_name):
-            return None
-        # Re-validate + redact the candidate in place (restores originals on fail).
+            raise PendingApprovalRefused("invalid_layout")
+        # One verdict, two surfaces: same consult as
+        # ``approve_pending_skill_checked`` — a computable failing verdict
+        # refuses with the badge's own report, so the update click can never
+        # disagree with the badge it stood behind.
+        _fold = self._pending_scripts_verdict(src)
+        if _fold is not None:
+            _fold_ok, _fold_report = _fold
+            if not _fold_ok:
+                logger.warning(
+                    "Refusing to approve update %s: the pending verdict this candidate's "
+                    "badge serves reports failing findings",
+                    target_name,
+                )
+                raise PendingApprovalRefused(
+                    "script_validation_failed",
+                    report=self._redact_validation_report(_fold_report),
+                )
+        # Re-validate + redact the candidate in place (restores originals on
+        # fail, raising PendingApprovalRefused with the reason).
         redact_backup = self._validate_and_redact_candidate(src, target_name)
-        if redact_backup is None:
-            return None
 
         def _restore_redacted() -> None:
             for _fp, _b in redact_backup.items():
@@ -5465,7 +6613,7 @@ class SkillsLoader:
             candidate_body = (src / "SKILL.md").read_text(encoding="utf-8")
         except OSError:
             _restore_redacted()
-            return None
+            raise PendingApprovalRefused("promotion_failed")
         current_version = self.get_auto_skill_version(target_name)
         # Snapshot under a number that is guaranteed free, so an earlier snapshot
         # can never be destroyed by drifted numbering.
@@ -5510,7 +6658,7 @@ class SkillsLoader:
                     "reason": "stale_base",
                 },
             )
-            return None
+            raise PendingApprovalRefused("stale_base")
         live_created_at = self._cached_frontmatter(live_skill, within=None).get("created_at", "")
         # Carry the live skill's pin forward: a pinned skill is exempt from the
         # lifecycle's inactivity / max-N archival, and silently dropping the flag
@@ -5548,7 +6696,7 @@ class SkillsLoader:
             logger.warning(
                 "Refusing to approve update %s: could not snapshot live version", target_name
             )
-            return None
+            raise PendingApprovalRefused("promotion_failed")
         # (f) Write candidate over live.
         try:
             atomic_write(live_skill, new_live_content)
@@ -5563,7 +6711,7 @@ class SkillsLoader:
             logger.warning(
                 "Refusing to approve update %s: could not write live SKILL.md", target_name
             )
-            return None
+            raise PendingApprovalRefused("promotion_failed")
         # (g) Promote candidate scripts into the live scripts/ dir (exec bit on
         # POSIX). COPY rather than move: the pending dir is deleted in (i), so a
         # move that fails partway would leave the approved script in neither
@@ -5636,7 +6784,7 @@ class SkillsLoader:
                     "Refusing to approve update %s: could not promote candidate scripts",
                     target_name,
                 )
-                return None
+                raise PendingApprovalRefused("promotion_failed")
         # (h) Prune version history to the cap.
         self._prune_versions(versions_dir)
         # (i) Remove the pending candidate.
@@ -5680,37 +6828,86 @@ class SkillsLoader:
         return target_name
 
     def approve_pending_skill(self, slug: str) -> str | None:
+        """``approve_pending_skill_checked`` with the legacy ``None`` contract.
+
+        Existing callers branch on ``None`` for "refused for any reason"; the
+        checked variant raises ``PendingApprovalRefused`` so the dashboard can
+        report WHY. This wrapper keeps their behaviour unchanged.
+        """
+        try:
+            return self.approve_pending_skill_checked(slug)
+        except PendingApprovalRefused:
+            return None
+
+    def approve_pending_skill_checked(self, slug: str) -> str:
         """Promote a pending candidate to a live auto-skill.
 
         Re-validates + redacts the candidate, then moves ``auto/.pending/<slug>``
         → ``auto/<slug>`` and marks any bundled scripts executable. Returns the
-        live name, or ``None`` if the candidate is missing, a live skill of that
-        name already exists, it contains a symlink, script validation fails, or
-        redaction fails. Every check runs BEFORE the move, so a rejected
-        candidate is left untouched in the pending queue.
+        live name; raises ``PendingApprovalRefused`` (with the reason, and the
+        redacted findings report for a validation failure) if the candidate is
+        missing, a live skill of that name already exists, it contains a
+        symlink, script validation fails, or redaction fails. Every check runs
+        BEFORE the move, so a rejected candidate is left untouched in the
+        pending queue.
         """
         if not self._is_pending_slug_safe(slug):
-            return None
+            raise PendingApprovalRefused("not_found")
         src = self._pending_root() / slug
         if not (src / "SKILL.md").exists():
-            return None
+            raise PendingApprovalRefused("not_found")
+        # An UPDATE candidate must never be consumed down this path: promoting
+        # it fresh would create ``auto/<candidate-slug>`` while its live target
+        # stays unchanged — the update silently never lands. The HTTP handler
+        # routes on the candidate detail's ``kind``, but a raising detail read
+        # drops that to ``None`` and defaults HERE, so the guard has to live at
+        # the consumption point. ``kind_mismatch`` (not ``not_found``): the
+        # candidate exists and is approvable via its own path, and the
+        # not-found recovery copy ("approved or dismissed elsewhere") would be
+        # a lie for a still-pending candidate.
+        if self._read_pending_meta(slug).get("kind") == "update":
+            logger.warning(
+                "Refusing to approve %s as a NEW skill: candidate metadata marks it an update",
+                slug,
+            )
+            raise PendingApprovalRefused("kind_mismatch")
         name = f"{AUTO_SKILL_NAMESPACE}/{slug}"
         dest = self._dir / name
         if dest.exists():
             logger.warning("Cannot approve %s: a live skill already exists", name)
-            return None
+            raise PendingApprovalRefused("live_exists")
         # Reject any symlink in the candidate + any unexpected top-level entry
         # (defense-in-depth on top of the mandatory human review); promotion +
         # chmod must only touch known, real files. Factored into a shared helper
         # so the update-approve path enforces the identical layout guard.
         if not self._candidate_layout_ok(src, name):
-            return None
+            raise PendingApprovalRefused("invalid_layout")
+        # One verdict, two surfaces: approve consults the SAME verdict function
+        # the pre-click badge serves. Where a verdict is computable, a failing
+        # one refuses HERE with the verdict's own report, so the badge and the
+        # click cannot disagree on any candidate the badge judged — an
+        # ``ok: false`` badge is a refusal by construction, not by parallel
+        # re-derivation. ``None`` (no pinned opens, or a budget breach) keeps
+        # this path's own machinery as the sole authority, exactly the
+        # authority split the verdict's contract documents.
+        _fold = self._pending_scripts_verdict(src)
+        if _fold is not None:
+            _fold_ok, _fold_report = _fold
+            if not _fold_ok:
+                logger.warning(
+                    "Refusing to approve %s: the pending verdict this candidate's badge "
+                    "serves reports failing findings",
+                    name,
+                )
+                raise PendingApprovalRefused(
+                    "script_validation_failed",
+                    report=self._redact_validation_report(_fold_report),
+                )
         # Re-validate every script + redact the body + scripts before going live;
         # snapshots each file first so a failure restores the ORIGINAL bytes and
-        # never leaves a corrupted pending draft. Shared with the update path.
+        # never leaves a corrupted pending draft (raising PendingApprovalRefused
+        # with the reason). Shared with the update path.
         redact_backup = self._validate_and_redact_candidate(src, name)
-        if redact_backup is None:
-            return None
 
         def _restore_redacted() -> None:
             for _fp, _b in redact_backup.items():
@@ -5739,7 +6936,7 @@ class SkillsLoader:
             logger.warning(
                 "Refusing to approve %s: could not read pending .meta.json before promotion", name
             )
-            return None
+            raise PendingApprovalRefused("promotion_failed")
         try:
             meta_path.unlink()
         except FileNotFoundError:
@@ -5750,7 +6947,7 @@ class SkillsLoader:
                 "Refusing to approve %s: could not remove pending .meta.json before promotion",
                 name,
             )
-            return None
+            raise PendingApprovalRefused("promotion_failed")
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Cutoff for notification resolution, captured BEFORE the candidate
         # leaves the pending queue: staging refuses to overwrite an existing
@@ -5771,7 +6968,7 @@ class SkillsLoader:
                     pass
             _restore_redacted()
             logger.warning("Refusing to approve %s: could not move candidate live", name)
-            return None
+            raise PendingApprovalRefused("promotion_failed")
         # Mark scripts executable now that a human approved them (recursively).
         sdir = dest / "scripts"
         if sdir.is_dir():
@@ -5908,14 +7105,27 @@ class SkillsLoader:
         is written; it returns ``None`` to keep the match. It is a callable, not
         a list, so the caller pays for it only when the match is being audited.
 
-        Returns up to ``max_triggered`` skills sorted by best overlap score.
+        Returns at most ``max_triggered`` matcher results sorted by best overlap
+        score; the cap does not apply to a list *select* returns, which replaces
+        them as given. A cap of zero (the shipped default) is the matcher
+        switched off: no skill is scanned or scored and no trigger audit row is
+        written; only *select* can still name skills.
         """
-        text_words = words_of(text)
         scored: list[tuple[str, float]] = []
         # Skills a negative trigger actively excluded — a permission DENY that
         # must still be audited (see the audit event below).
         negated_skills: list[str] = []
-        for name, skill_file, _within in self._iter_visible(project_dir):
+        # The cap is read BEFORE the scan. At zero every skill scored below would
+        # be sliced away, so the walk -- a frontmatter read, a repo-scope fence
+        # check and a trigger score per visible skill, on every message -- would
+        # buy nothing, and a `!` veto it recorded would be a DENY for a grant that
+        # could never have happened. Tokenizing the message feeds only that
+        # scoring, so it waits for the cap too. `select` still gets its turn: a
+        # selection point owns its own zero-cap refusal.
+        cap = self._max_triggered_now()
+        visible = self._iter_visible(project_dir) if cap > 0 else ()
+        text_words: set[str] = words_of(text) if cap > 0 else set()
+        for name, skill_file, _within in visible:
             meta = self._cached_frontmatter(skill_file, within=_within)
             if meta.get("always", "").strip().lower() == "true":
                 continue
@@ -5947,7 +7157,7 @@ class SkillsLoader:
                 scored.append((name, best_overlap))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        triggered = [name for name, _ in scored[: self._max_triggered_now()]]
+        triggered = [name for name, _ in scored[:cap]]
 
         # An external *select* runs BEFORE the audit below so the one row records
         # what is actually injected. Its three readings: a list replaces the
@@ -6897,7 +8107,11 @@ class SkillsLoader:
         Path signature because it has a legitimate non-skill caller (the Agent SOP
         description reader) that is not subject to skill confinement.
         """
-        return parse_frontmatter(content, SKILL_LOADER)
+        meta = parse_frontmatter(content, SKILL_LOADER)
+        body = SkillsLoader.strip_frontmatter(content.lstrip("\ufeff")).lstrip()[:10]
+        if re.match(r"<(?:!doctype|html)[\s>]", body, re.IGNORECASE):
+            meta["_html:body"] = "true"
+        return meta
 
     @staticmethod
     def strip_frontmatter(content: str) -> str:

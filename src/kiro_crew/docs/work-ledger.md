@@ -54,11 +54,28 @@ An item is the unit of dispatch. It holds:
 The conductor writes its half with `work_ledger_record` (one action per call:
 `goal`, `create`, `bind`, `decide`, `verdict`, `accept`, `close`) and reads the
 whole ledger back with `work_ledger_read`. A worker writes its half with
-`work_report` and reads its own item with `work_brief`.
+`work_report` and reads its own item with `work_brief`. A conductor whose ledger
+files read as damaged or missing rewrites them from the crew log with
+`work_ledger_rebuild`: every accepted write was recorded there, so the files are a
+cache of that record. It takes no arguments, acts only on the caller's own ledger,
+and is refused when the crew log is off.
 
 The two sets are disjoint, and that is enforced by the tools rather than by a
 rule: the reporting tool takes no parameter that names a conductor field, so a
 worker cannot write a verdict, a state, or its own acceptance condition.
+
+## The crew log must be on
+
+Every write here is recorded in the crew log, so the whole board depends on it.
+The crew log is on by default. With `KIROCREW_CREW_LOG` set to a falsy value (`0`,
+`false`, `no`, `off`) or to any value it does not recognise at gateway start, `work_ledger_record` and `work_report` both
+answer `409 crew_log_off`, and `work_ledger_rebuild` is refused for the same reason.
+Reads are unaffected. To switch it back on, unset the variable (or remove it from
+`~/.kiro/crew/.env`) and restart the gateway.
+
+A deployment that sets the flag off has no board writes at all, so leave it on
+wherever a conductor runs, rather than discovering the refusal from a worker that
+cannot report.
 
 **The acceptance condition is named before dispatch, not after.** It is one of
 three kinds: `pr_checks` (a pull request's checks are all green), `file` (a path
@@ -74,9 +91,20 @@ hand after looking at it. A worker's claimed `pr` is never read as the bar,
 because a worker that could fill in its own bar could point it at somebody
 else's already-green pull request.
 
-Limits: 32 items per conductor, and a conductor may dispatch a conductor only
-once — depth is capped at 2, so a second-level conductor's own children are
-workers. A worker holds one open item at a time.
+Limits: 32 open items per conductor (an item in a terminal state -- accepted,
+rejected, abandoned -- stays on the board, listed and readable, and does not count
+toward the open cap) and 256 items stored per conductor in total, open and closed
+together, which is also the crew log fold's per-board ceiling, so a board is
+always folded whole. The stored bound is measured against `created_total`, a
+monotonic counter in the conductor header of every item the board has created over
+its life: each create bumps it under the conductor lock, deleting or losing an item
+record does not reclaim capacity, and a create is refused rather than counted when
+the header cannot be read. A rebuild from the crew log sets the counter to the
+records the rebuilt board holds. Closed items stay on the board until that stored
+bound; a board at it refuses further creates (`item_store_full`) until the finished
+ledger is purged (see "Cleaning up finished ledgers"). A conductor may dispatch a
+conductor only once — depth is capped at 2, so a second-level conductor's own
+children are workers. A worker holds one open item at a time.
 
 ## Dispatch order: create, bind, seed
 
@@ -157,16 +185,17 @@ either. Confusing them is the common mistake:
 
 | | Work ledger | [Session ledger](session-ledger.md) | [Subagents](subagents.md) |
 |---|---|---|---|
-| Holds | work items shared by two sessions | one session's own goal, phase, next step | nothing durable |
+| Holds | work items shared by two sessions | one session's own goal, phase, next step | a task plus a retained transcript/result, but no shared acceptance ledger |
 | Who writes | a conductor and its workers, disjoint field sets | the session itself | n/a |
-| Survives | compaction, restart, and the worker's own session ending | compaction and restart | only the delivered result, for a grace window |
+| Survives | compaction, restart, and the worker's own session ending | compaction and restart | the retained conversation/result for its bounded grace window |
 | Unit | an item with an acceptance condition | a phase and a next step | a task string |
 | Completion | settled by the acceptance evaluator | the session marks its ledger finished | the parent reads the result |
-| Steerable | yes — each worker is its own session you can open | n/a | no, a subagent has no session of its own |
+| Steerable | yes — each worker is its own session you can open | n/a | yes while running via `spawn_steer`; follow-ups use `spawn_continue` while retained |
 
-Reach for subagents for fan-out that finishes inside one turn and needs no
-supervision. Reach for a conductor when each piece needs its own long-lived
-session, its own acceptance bar, and a record that outlives any one transcript.
+Reach for subagents for bounded background fan-out that needs no visible,
+long-lived workstream or shared acceptance record. Reach for a conductor when
+each piece needs its own long-lived session, its own acceptance bar, and a
+record that outlives any one transcript.
 
 A conductor keeps both ledgers: the work ledger for the items, and its own
 session ledger for its goal, its current round, and the approaches it already

@@ -141,8 +141,8 @@ class TestRegistry:
 
         An EC2 id stored under ``fargate`` would open a forward to a box and then
         show its dashboard port as a turn URL. The arm validates with the same
-        splitter connect_fargate reads with, so the stored target is one that
-        lane can open.
+        splitter the ``fargate`` transport reads with, so the stored target is
+        one that lane can open.
         """
         from kiro_crew.instances.registry import InstancesRegistry, InvalidInstanceError
 
@@ -322,6 +322,78 @@ class TestTunnelManager:
         assert params.tunnel_kwargs()["transport"] == "ssm"
         assert params.turn_url(5599) == "http://127.0.0.1:5599/v1/chat/completions"
 
+    def test_resolve_transport_refuses_an_ecs_target_under_ssm(self, tmp_path, monkeypatch):
+        """The registry arm refuses it on write; this is the read-side mirror.
+
+        A record filed as ``ssm`` with an ECS target before the registry refused
+        the shape still exists on disk. Without this guard it would forward and
+        fail at the mint with a generic error instead of naming the fix.
+        """
+        from kiro_crew.instances.registry import Instance
+        from kiro_crew.instances.validation import SsmValidationError
+
+        _reg, mgr, _minted = _mgr(tmp_path, monkeypatch)
+        inst = Instance(id="legacy", name="x", connection_method="ssm", ssm_target=_ECS_TARGET)
+        with pytest.raises(SsmValidationError) as exc:
+            mgr._resolve_transport(inst)
+        assert "fargate" in str(exc.value)
+        # The plain EC2 id is still accepted by the same arm.
+        params = mgr._resolve_transport(
+            Instance(id="ec2", name="x", connection_method="ssm", ssm_target=_EC2_TARGET)
+        )
+        assert params.method == "ssm" and params.ssm_target == _EC2_TARGET
+
+    @pytest.mark.asyncio
+    async def test_connect_refuses_a_stored_ssm_record_with_an_ecs_target(
+        self, tmp_path, monkeypatch
+    ):
+        """Public connect path for a pre-refusal record written straight to disk.
+
+        ``reg.add`` now refuses this shape, so the record is planted the way an
+        older build left it. Connect must answer an ERROR status naming the
+        fargate method, spawn no forwarder and mint nothing.
+        """
+        reg, mgr, minted = _mgr(tmp_path, monkeypatch)
+        spawned: list[str] = []
+
+        class _RecordingTunnel(_FakeTunnel):
+            def __init__(self, iid, *a, **k):
+                spawned.append(iid)
+                super().__init__(iid, *a, **k)
+
+        mgr._tunnel_factory = _RecordingTunnel
+        reg.path.write_text(
+            json.dumps(
+                {
+                    "instances": [
+                        {
+                            "id": "legacy",
+                            "name": "Legacy",
+                            "connection_method": "ssm",
+                            "ssm_target": _ECS_TARGET,
+                            "aws_profile": "dev",
+                            "aws_region": "eu-west-2",
+                            "remote_port": 5476,
+                        }
+                    ],
+                    "last_active_id": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert reg.get("legacy") is not None  # the record loads; only connect refuses it
+
+        status = await mgr.connect("legacy")
+
+        assert status.state.value == "error"
+        assert "fargate" in (status.error or "")
+        assert "invalid ssm settings" in (status.error or "")
+        assert "fargate" in (mgr.last_error("legacy") or "")
+        assert spawned == []
+        assert "legacy" not in mgr._tunnels
+        assert minted == []
+        await mgr.shutdown()
+
     @pytest.mark.asyncio
     async def test_an_ssm_status_carries_no_turn_url(self, tmp_path, monkeypatch):
         """The handler keys on ``turn_url``; only a fargate status may carry it."""
@@ -350,17 +422,37 @@ class TestTunnelManager:
 
 
 class _Req:
+    """Request double for the instances handlers.
+
+    ``_guard`` demands the positively-identified owner, and the predicate reads the
+    request as a MAPPING as well as calling ``.get`` -- ``"app" in request`` then
+    ``request["app"]`` -- so all three reads come from one claims dict. ``app`` is
+    "" because a browser session carries no app token.
+    """
+
     def __init__(self, state, *, match=None, query=None):
         self.app = {"state": state}
         self.headers = {}
         self.match_info = match or {}
         self.query = query or {}
+        self._claims = {"user": "owner", "app": ""}
 
     def get(self, key, default=None):
-        return {"user": "owner"}.get(key, default)
+        return self._claims.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._claims
+
+    def __getitem__(self, key):
+        return self._claims[key]
 
 
 class _State:
+    """Dashboard-state stand-in; ``owner_id`` matches ``_Req``'s caller because
+    ``_guard`` compares the subject against it."""
+
+    owner_id = "owner"
+
     def __init__(self, registry, manager):
         self.instances_registry = registry
         self.instances_manager = manager

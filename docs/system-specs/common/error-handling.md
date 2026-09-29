@@ -2,8 +2,9 @@
 
 ## Principles
 
-1. Custom exceptions in `acp/client.py` for ACP-protocol errors, and in
-   `acp/session_handle.py` for runtime/transport errors
+1. Custom exceptions in `acp/client.py` for ACP protocol/prompt errors, in
+   `acp/session_handle.py` for runtime/transport errors, and in `acp/runtime.py`
+   for runtime binding and session-start errors
 2. Error strings at CLI boundaries (never expose tracebacks to users)
 3. Graceful degradation — partial output returned on timeout
 
@@ -17,17 +18,29 @@ AcpError (base, acp/client.py)          — carries `transient`, the retry verdi
 ├── AcpTimeoutError        — prompt timed out, has partial_output
 ├── AcpPermissionNeeded    — tool approval required
 ├── AcpProcessDied         — kiro-cli exited unexpectedly
+│   └── AcpRegistrationRateLimited — the death's stderr shows a throttled
+│                            dynamic registration (HTTP 429); transient, so the
+│                            retry ladders recover it instead of surfacing a
+│                            terminal generic death. Classified only while the
+│                            session has produced no text and run no tool, so
+│                            the verdict can never license a replay that
+│                            repeats side effects
 ├── AcpAuthRequired        — kiro-cli not authenticated; non-retryable
+├── AcpSandboxInitFailed   — an OS sandbox refused to initialize; non-retryable
 ├── AcpToolGateUnroutable  — tool calls would bypass the PreToolUse gate;
 │                            non-retryable, wraps acp_tool_gate.ToolGateUnroutable
+├── PiGateExtensionTampered — the shipped Pi gate extension failed its digest check
 ├── AcpModelUnavailable    — requested model not entitled; non-retryable
 └── AcpPromptBusy          — a prompt is already in flight on this session
 
 AcpRuntimeError (base, acp/session_handle.py)
 ├── AcpRuntimeDead            — the underlying process has died
 ├── AcpRequestTimeout         — a request's response missed its budget
-└── AcpWorkspaceBindingError  — a descriptor-bound runtime cannot serve another
-                                cwd (acp/runtime.py)
+│   └── AcpSessionStartTimeout — `session/new` timed out while a collector owns
+│                                the possible late result (acp/runtime.py)
+└── AcpWorkspaceBindingError  — descriptor-bound runtime cannot serve another cwd
+    └── AcpToolSurfaceBindingError — a shared runtime cannot safely serve the
+                                     requested tool surface (acp/runtime.py)
 ```
 
 `AcpToolGateUnroutable` is a distinct type rather than a transport error because
@@ -55,7 +68,7 @@ instead of the row simply disappearing.
 | ACP → CLI | Catch `AcpError`, print user-friendly message, `sys.exit(1)` |
 | JSON-RPC read | Non-JSON lines silently skipped (kiro-cli debug output) |
 | Config load | Invalid JSON → log warning, return defaults |
-| Process spawn | `shutil.which` check before spawn; clear error if missing |
+| Process spawn | Backend-specific executable resolver, including trusted-path checks where required; clear error if missing |
 | asyncio loop callback | A Windows Proactor reset repeated by its `connection_lost` close callback is warning-only; task-level connection resets and other exceptions remain ERRORs with crash breadcrumbs |
 
 ## Dashboard Error Codes
@@ -88,6 +101,28 @@ never drift. Notable terminal (non-retryable) classes:
   backend through the prompt transport everywhere, even on Slack, which also
   offers `!compact` as its own alias. The same rule governs the sibling
   prompt-busy branch, which for the same reason now names no command at all.
+- **Unsupported image history**: Kiro's `IMAGE_FORMAT_UNSUPPORTED` /
+  `ImageValidationError` is terminal and structural. The exception also carries
+  the narrower `image_format_unsupported` tag. A current attachment is left in
+  place with remove-or-re-encode guidance; a dashboard turn with no new
+  attachments may discard the native resume SID once and retry from Kiro Crew's
+  bounded text transcript, which excludes native binary image blocks.
+  "No new attachment" is read as TWO facts, because empty dashboard attachment
+  lists do not prove the turn shipped no image: a channel turn (and a dashboard
+  turn that types a path) carries its image as a bare path inside the message
+  text, which `build_prompt_blocks` inlines as a CURRENT-turn image block. So the
+  recovery additionally requires that the raw message match none of
+  `image_refs._PATH_RE` — the builder's own scanner on the builder's own
+  haystack — and otherwise falls through to the terminal guidance rather than
+  clearing a healthy conversation and re-inlining the same bytes.
+  The queued recovery turn is gated at DISPATCH, not only at enqueue: the
+  conversation discard and the pending-reset consume are awaited between the two,
+  and a soft Stop in that window preserves the queue while `_stopping` snaps back
+  to idle. The slot therefore records the recovery's queue id plus the slot- and
+  session-scoped stop generations at enqueue, and the queue drain drops the entry
+  (refunding the shared one-shot) when either counter moved, when user input
+  queued behind it, or when the slot was rebound to another session — the same
+  guard the model-access and refusal replays carry.
 - **Usage limit** and **model not entitled**: allowance spent, or the plan lacks
   the model; also terminal, with guidance to switch model or tier.
 

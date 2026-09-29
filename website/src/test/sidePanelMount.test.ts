@@ -12,6 +12,11 @@ const S = (activityOpen: boolean, hasLiveAppTab: boolean, searchOpen = false, ha
   ({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen })
 
 describe('side panel mount decision', () => {
+  it('keeps dashboard documents and answer drafts mounted when closed or searching', () => {
+    const input = { ...S(false, false, true), hasTaskDashboard: true }
+    expect(shouldMountSidePanel(input)).toBe(true)
+    expect(isSidePanelHidden(input)).toBe(true)
+  })
   it('mounts while open, with or without an app tab', () => {
     expect(shouldMountSidePanel(S(true, false))).toBe(true)
     expect(shouldMountSidePanel(S(true, true))).toBe(true)
@@ -86,7 +91,9 @@ describe('side panel mount decision', () => {
     // already names the fullscreen icon.
     expect(panel).toContain('active: visible = true')
     expect(panel).toContain('if (!visible) return')
-    expect(panel).toContain('}, [visible, fullscreen, onClose])')
+    // Close and exit-fullscreen go through the comment-draft guard, so those
+    // guarded callbacks are the deps rather than `onClose` itself.
+    expect(panel).toContain('}, [visible, fullscreen, exitFullscreen, requestClose, active])')
   })
 
   describe('find pane claims the dock', () => {

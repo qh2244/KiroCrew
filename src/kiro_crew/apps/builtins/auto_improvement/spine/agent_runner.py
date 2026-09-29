@@ -46,6 +46,10 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
     hooks_config_from_config_dict,
 )
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import SIGKILL, kill_process_tree
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
@@ -1357,7 +1361,15 @@ class SessionAgentRunner:
         allowed_tools=None,
         session_key=None,
         provider=None,
+        governance_agent: str = "",
     ) -> AgentResult:
+        # ``governance_agent`` is the identity the platform governance gate judges
+        # tool requests under; it defaults to ``self.agent_name``. A crew member
+        # runs on a shared TEMPLATE (``self.agent_name`` selects the provider and
+        # the tool set) but is governed under its own member ALIAS, which the
+        # dashboard and messaging paths also key their profiles on — so a member
+        # whose alias carries a task-scoped profile is held to that profile here too.
+        governance_agent = governance_agent or self.agent_name
         # Build a provider for THIS task. The factory's FIRST positional is the
         # session_key (namespaces the provider's work dir); ``agent`` selects the
         # KIRO AGENT — which is what scopes the tool set. Passing the app's
@@ -1501,7 +1513,7 @@ class SessionAgentRunner:
                     # (~/.aws/~/.ssh) blocks that the dashboard/Slack paths honor. This
                     # unattended runner must not rely only on the app-local checks below.
                     gov = _governance_denial(
-                        ev, session_key=session_key, agent=self.agent_name, tool_kind=tool
+                        ev, session_key=session_key, agent=governance_agent, tool_kind=tool
                     )
                     if gov:
                         logger.warning("refusing tool %r — governance: %s", tool, gov)
@@ -1655,7 +1667,7 @@ class SessionAgentRunner:
                 source="auto_improvement_loop",
                 tool_name=tool or "tool",
                 tool_kind=tool,
-                outcome="auto_approved",
+                outcome=OUTCOME_PENDING_APPROVAL,
                 request_id=rid,
                 metadata={"unattended": True, "containment": "worktree+allowlist+gate"},
                 critical=True,
@@ -1676,7 +1688,20 @@ class SessionAgentRunner:
             # unattended loop is exactly the caller that must not buy a blanket exemption
             # with its first approval; re-deciding per call is the whole point of routing
             # through here.
-            await provider.approve_tool(rid)
+            approval_sent = await provider.approve_tool(rid)
+            outcome = (
+                OUTCOME_REJECTED_TRANSPORT_FLOOR if approval_sent is False else "auto_approved"
+            )
+            sel().log_tool_invocation(
+                session_key=session_key or "auto-improvement",
+                agent="auto-improvement",
+                source="auto_improvement_loop",
+                tool_name=tool or "tool",
+                tool_kind=tool,
+                outcome=outcome,
+                request_id=rid,
+                metadata={"unattended": True, "containment": "worktree+allowlist+gate"},
+            )
         except Exception:  # noqa: BLE001
             pass
 

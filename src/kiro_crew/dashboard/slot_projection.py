@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
+
+from kiro_crew.safety_override import safety_override, yolo_policy_permits
 
 
 def resolved_row_identity(slot: Any) -> str:
@@ -30,6 +32,25 @@ def resolved_row_identity(slot: Any) -> str:
     if getattr(slot, "is_remote", False) and instance_id and remote_slot:
         return f"{instance_id}:{remote_slot}"
     return str(getattr(slot, "key", "") or "")
+
+
+def live_trust_scope(slot: Any) -> str:
+    """The slot's ``SafetyOverride`` scoped-grant key while that grant is live, else "".
+
+    Display only. It answers whether the scope the slot carries still has time on
+    it, through ``scope_remaining_secs`` -- a pure read -- because this runs on
+    every slots poll and must never expire a grant or write a SEL record. It
+    applies the same policy mask ``is_scope_active`` applies first, so a grant
+    the approval ceiling denies never shows as Trust. The approval paths decide
+    through ``is_scope_active``; nothing reads this value back into ``_trust`` or
+    into a stored approval policy.
+    """
+    scope = str(getattr(slot, "_trust_scope", "") or "")
+    if not scope:
+        return ""
+    if not yolo_policy_permits():
+        return ""
+    return scope if safety_override().scope_remaining_secs(scope) > 0 else ""
 
 
 class SlotProjection:
@@ -144,8 +165,17 @@ class SlotProjection:
         resolve_effective_agent: Callable[[str, str | None], str],
         budget_source_links: Callable[[list[dict]], list[dict]],
         project_source_links: Callable[[list[dict], bool], list[dict]],
+        coordinator_pending: Sequence[dict] = (),
     ) -> dict:
-        """Serialize the ordered public slot summary without owning slot state."""
+        """Serialize the ordered public slot summary without owning slot state.
+
+        ``coordinator_pending`` is the list of live ``ApprovalCoordinator``
+        records whose ``slot`` is this slot -- a sub-agent spawn gate or a tool
+        approval raised inside a running sub-agent. Their futures live on the
+        state-level registry, not on ``slot._approval_futures``, so without this
+        input the slot reads as idle while its owner is parked on an approval.
+        Oldest first; the projection reads only the first one for the card.
+        """
         last_ts = slot.messages[-1].get("ts", "") if slot.messages else ""
         last_msg = ""
         has_options = False
@@ -186,9 +216,10 @@ class SlotProjection:
             if found_conv and last_msg and last_activity_ts:
                 break
 
-        pending_approval = any(not future.done() for future in slot._approval_futures.values())
+        slot_pending = any(not future.done() for future in slot._approval_futures.values())
+        pending_approval = slot_pending or bool(coordinator_pending)
         last_turn_ts = last_ts
-        if slot.running:
+        if slot.turn_running:
             prompt_ts = next(
                 (
                     message.get("ts") or ""
@@ -203,30 +234,69 @@ class SlotProjection:
                 last_turn_ts = latest_transcript_ts(prompt_ts, queued_ts) or queued_ts
 
         waiting_for_input = (
-            not slot.running
+            not slot.turn_running
             and not has_options
             and not pending_approval
             and bool(slot.messages)
             and last_conv_role == "assistant"
         )
         needs_input = bool(slot._question_pending)
-        interrupted = not slot.running and is_turn_interrupted(slot.messages)
+        interrupted = not slot.turn_running and is_turn_interrupted(slot.messages)
 
         pending_approval_info: dict[str, str] | None = None
-        if pending_approval:
+        if slot_pending:
+            # The transcript row is consulted only for a SLOT-registry future:
+            # a coordinator approval writes no row, and a stale unresolved row
+            # from an earlier turn must not describe it.
             for message in reversed(slot.messages):
                 if message.get("role") != "permission":
                     continue
                 meta = parse_cls_meta(message.get("cls") or "") or {}
                 if meta.get("resolved"):
                     continue
+                request_id = meta.get("approval_id", meta.get("request_id", ""))
+                if not isinstance(request_id, str):
+                    continue
+                future = slot._approval_futures.get(request_id)
+                if future is None or future.done():
+                    continue
+                request_mid = slot.approval_instance(request_id, message)
+                if not request_mid:
+                    continue
                 pending_approval_info = {
+                    "origin": "native",
                     "tool": redact(message.get("content") or ""),
                     "tool_input": redact(meta.get("tool_input", "")),
                     "tool_kind": redact(meta.get("tool_kind", "")),
-                    "request_id": redact(meta.get("approval_id", meta.get("request_id", ""))),
+                    "request_id": redact(request_id),
+                    "request_mid": request_mid,
                 }
+                if meta.get("tool_purpose"):
+                    pending_approval_info["tool_purpose"] = redact(meta["tool_purpose"])
                 break
+        if pending_approval_info is None and coordinator_pending:
+            # No unresolved permission row supplied the card: the pending
+            # approval is a coordinator one, whose record never reaches the
+            # transcript. Its fields were redacted at registration; the redact
+            # here keeps this branch on the same wire contract as the row above.
+            record = coordinator_pending[0]
+            approval_id = str(record.get("id") or "")
+            pending_approval_info = {
+                "origin": "coordinator",
+                "tool": redact(str(record.get("tool") or "")),
+                "tool_input": redact(str(record.get("tool_input") or "")),
+                "tool_kind": "spawn" if approval_id.startswith("spawn:") else "",
+                "request_id": redact(approval_id),
+            }
+            if record.get("tool_purpose"):
+                # Import after state initialization: chat_utils itself imports state.
+                from kiro_crew.dashboard.chat_utils import _MAX_TOOL_PURPOSE, _redact_tool_field
+
+                # Redact the full source before the display cap. Native metadata
+                # is already capped upstream; recapping would split its notice.
+                pending_approval_info["tool_purpose"] = _redact_tool_field(
+                    redact(str(record["tool_purpose"])), limit=_MAX_TOOL_PURPOSE
+                )
 
         return {
             "key": slot.key,
@@ -283,7 +353,7 @@ class SlotProjection:
             "row_identity": resolved_row_identity(slot),
             "artifact": slot._artifact,
             "messages": len(slot.messages),
-            "running": slot.running,
+            "running": slot.turn_running,
             "orchestrating": slot._in_stage_execution,
             "queue_depth": slot.queue_depth,
             "stopping": slot._stopping,
@@ -314,6 +384,7 @@ class SlotProjection:
             "options": [redact(option) for option in options],
             "prompt_preview": prompt_preview,
             "trust": slot._trust,
+            "trust_scope": live_trust_scope(slot),
             "trust_reads": slot._trust_reads,
             "trusted_patterns_count": len(slot._trusted_patterns),
             "slack_linked": slot._slack_linked,

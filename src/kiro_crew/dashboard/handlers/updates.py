@@ -19,7 +19,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import __version__ as _local_version
-from kiro_crew import dep_sync, shutdown_event
+from kiro_crew import dep_sync, platform_compat, shutdown_event
 from kiro_crew.changelog import Release, base_version, build_release_list, release_of_build
 from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
@@ -30,7 +30,10 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.dashboard.chat_utils import run_config_write
-from kiro_crew.dashboard.handlers._shared import read_capped_response
+from kiro_crew.dashboard.handlers._shared import (
+    read_capped_response,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.state import DashboardState, chat_message_frame
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
 from kiro_crew.executors import subprocess_executor
@@ -71,7 +74,11 @@ from kiro_crew.platform.update_layout import detect_install_layout
 from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_layout import set_release_channel, wheel_update_command
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
-from kiro_crew.platform_compat import reexec_launcher, reexec_python_module
+from kiro_crew.platform_compat import (
+    exit_after_failed_restart_exec,
+    reexec_launcher,
+    reexec_python_module,
+)
 from kiro_crew.safety_override import flush_breadcrumb_writes
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -149,10 +156,6 @@ _last_update_check: float = 0.0
 #: coordinator, so every caller consumes one completed verdict.
 _check_task: asyncio.Task[None] | None = None
 _check_task_generation: int | None = None
-
-#: Release channels the installer publishes. Anything else in the channel file (a
-#: hand-edit, junk, a lane this build predates) falls back to ``stable``.
-_RELEASE_CHANNELS = ("stable", "insider", "nightly")
 
 #: ``schema`` every CLI artifact manifest carries. A payload without it is not a
 #: manifest and must not be read as one.
@@ -1240,6 +1243,9 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
 
 async def api_update_auto(request: web.Request) -> web.Response:
     """POST /api/update/auto — toggle auto-update on/off."""
+    owner_denied = await require_owner_dashboard_request(request, "update.auto")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1254,18 +1260,31 @@ async def api_update_auto(request: web.Request) -> web.Response:
         return data
 
     # `update_config_locked` holds the advisory lock across the READ and the write, so no
-    # other process can land between them -- the whole point, since the in-process
-    # `_get_config_lock()` does not serialize against the CLI or a second gateway.
+    # other process can land between them -- that is what stopped the CLI and a second
+    # gateway interleaving here.
     #
-    # Offloaded because that lock is blocking: called inline from this coroutine it would
-    # stall every session and the liveness heartbeat while contended, which is what the
-    # repo's `no-blocking-call-on-event-loop` rule forbids.
+    # But the flock is only ONE of the two generations that guard config.json. The legacy
+    # dashboard writers -- the agents endpoint, core.py's theme/settings PUT, security.py,
+    # messaging.py, mcp.py, computer_use.py -- do a read-modify-write of this same file
+    # while holding ONLY the loop-side `_get_config_lock()`, which the sidecar flock does
+    # not exclude. So a theme save landing between this endpoint's read and its write
+    # commits from a snapshot taken before it, and silently reverts the auto-update flag
+    # the user just toggled -- or this write reverts their theme. Nothing errors and the
+    # response still reports success, because it is built from `enabled` rather than from
+    # a re-read of what actually landed.
+    #
+    # `run_config_write` is the one entry point that holds BOTH: it takes the loop-side
+    # lock on the event loop and then runs the blocking writer in a worker, so the flock
+    # wait still never stalls the loop -- the property the bare `to_thread` was there for,
+    # unchanged. Nothing here holds a config lock already, so this introduces no nesting;
+    # the handler is a flat coroutine and `run_config_write` is its only lock acquisition.
     #
     # The read still fails CLOSED (`on_corrupt` defaults to "fail"): treating an unreadable
     # config as {} would write back a single-key file and wipe every other setting the user
-    # has (see read_config_for_update).
+    # has (see read_config_for_update). `run_config_write` propagates the writer's
+    # exceptions unchanged, so that contract is untouched.
     try:
-        await asyncio.to_thread(update_config_locked, config_path(), mutate=_set_auto_update)
+        await run_config_write(update_config_locked, config_path(), mutate=_set_auto_update)
     except ConfigReadError:
         logger.exception("Refusing to toggle auto-update: config is unreadable")
         return web.json_response(
@@ -1459,7 +1478,9 @@ async def _restart_gateway(
     Restart is a process-wide transition.  Two callers must never both drain
     sessions and race separate successors for the same listener/lock, so the
     claim is made synchronously before the first await.  A successful exec does
-    not return; a refused, failed, or test-double exec releases the claim.
+    not return; a refused or test-double exec releases the claim.  An exec the
+    kernel refuses does not: by then the sessions are closed, so it exits the
+    process rather than release a claim nothing can use.
     """
     if state._gateway_restart_in_progress:
         logger.info("Gateway restart already in progress; coalescing duplicate request")
@@ -1484,7 +1505,19 @@ async def _restart_gateway(
 
                 resolver = respawn_executable
             exe = await asyncio.to_thread(resolver)
-            if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+            # ONE hop for both syscalls, the contract this helper's docstring
+            # states: the pathname can be a stalled mount, and this function is
+            # on the event loop -- the await above proves it -- so a bare stat
+            # here would hold every session while the restart decides.
+            if not await asyncio.to_thread(platform_compat.execv_target_available, exe):
+                # The interpreter this process ran under is gone, which is what an
+                # apply that prunes the previous versioned tree leaves behind.
+                # REFUSE HERE, while this process is still serving: the drain
+                # below is the point of no return, and main reached its exec only
+                # after ``close_all()``, where the failure left the gateway alive
+                # with admission shut and nothing able to reopen it. Refusing
+                # before the drain keeps every session answerable and leaves the
+                # operator a repair-then-relaunch they can actually perform.
                 state.push_update_progress(
                     "error", "Cannot restart: invalid Python executable path"
                 )
@@ -1526,10 +1559,18 @@ async def _restart_gateway(
         except Exception:
             logger.debug("Breadcrumb flush before restart failed", exc_info=True)
         await asyncio.sleep(0.5)
-        if launcher is not None:
-            reexec_launcher(launcher, sys.argv[1:])
-        else:
-            reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        # Same point of no return as the orchestrator path: the refusal above
+        # removed the reachable failures, but only the kernel can refuse the
+        # image itself, and the sessions closed above do not come back. Exit on
+        # that rather than fall through to ``return True``, which reports a
+        # restart that did not happen from a process that cannot serve.
+        try:
+            if launcher is not None:
+                reexec_launcher(launcher, sys.argv[1:])
+            else:
+                reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        except OSError:
+            await exit_after_failed_restart_exec(launcher or exe)
         return True
     finally:
         state._gateway_restart_in_progress = False
@@ -1537,6 +1578,9 @@ async def _restart_gateway(
 
 async def api_update_apply(request: web.Request) -> web.Response:
     """POST /api/update — git pull, rebuild, restart gateway."""
+    owner_denied = await require_owner_dashboard_request(request, "update.apply")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
 
     # A policy-defined provider OWNS the update on this host. Checked before the
@@ -1901,7 +1945,10 @@ def apply_log_level(level_name: str, *, source: str) -> bool:
 
     The one place the runtime level changes, shared by the dashboard endpoint
     and the ``agent.log_level`` config applier so a ``kirocrew config set`` or
-    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle.
+    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle. The
+    logger is the single level gate for every sink, ``gateway.log`` included:
+    the file handler and the queue handler ``cli._setup_cli_logging`` installs
+    carry no level of their own, so this one change reaches the file too.
     """
     name = str(level_name or "").upper()
     if name not in _LOG_LEVELS:
@@ -2008,10 +2055,15 @@ async def _safe_ws_send(ws: web.WebSocketResponse, msg: str, state: DashboardSta
     would fall back to a synchronous manifest read.
     """
     try:
-        if not ws.get("_is_dashboard_user", False):
-            if not state._ws_client_allowed(ws, "log", {}):
-                state._ws_log_subscribers.discard(ws)
-                return
+        # Every socket kind goes through the predicate: for a dashboard user it
+        # answers True at once and records the grant under the reserved
+        # dashboard-user auditee, so the live stream leaves the same record as
+        # the ring replay that ``subscribe_logs`` admitted it to. Skipping the
+        # call for that socket kind was the one place the log stream's grant to
+        # the owner went unrecorded.
+        if not state._ws_client_allowed(ws, "log", {}):
+            state._ws_log_subscribers.discard(ws)
+            return
         await ws.send_str(msg)
     except Exception:
         state._ws_log_subscribers.discard(ws)
@@ -2258,6 +2310,9 @@ async def api_update_channel(request: web.Request) -> web.Response:
     own right — the profile parser fails closed on unknown keys, so a new key has
     to be rolled out before it can be set.
     """
+    owner_denied = await require_owner_dashboard_request(request, "update.channel")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2380,6 +2435,9 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
     git checkout. Restart has no such precondition — it is valid on every
     layout, including a desktop bundle's embedded gateway.
     """
+    owner_denied = await require_owner_dashboard_request(request, "update.restart")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
 
     # Coalesce repeat clicks/requests BEFORE the response-flush sleep below.
