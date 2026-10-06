@@ -16,6 +16,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ReactNode } from 'react'
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { composerValue, setComposerValue } from './helpers'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -51,7 +52,6 @@ vi.mock('../api/client', () => ({
     setSlotColor: vi.fn().mockResolvedValue({ ok: true }),
     setSlotFolder: vi.fn().mockResolvedValue({ ok: true }),
     dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false }),
-    planAction: vi.fn().mockResolvedValue({ ok: true }),
     // The sidebar's folder and board-column reads now report a failure through
     // an ErrorNotice (with a Retry button); an absent mock reads as a failure,
     // so answer them so the notice does not compete with the assertions below.
@@ -81,12 +81,8 @@ import { api } from '../api/client'
 /** The marker has to close its own line for OPTION_MARKER_RE to match. */
 const ASSISTANT_WITH_OPTIONS = 'Ready to proceed.\n\n[OPTIONS: Deploy | Roll back | Retry]'
 
-/** A plan needs BOTH the header and a stage line for parseOptions to set isPlan;
- *  the footer mirrors the plan pipeline's normalized template exactly. */
+/** Plan-shaped text (header, stage line, Go/Go All/Cancel footer): an ordinary options message. */
 const ASSISTANT_WITH_PLAN = '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTION: Go | Go All | Cancel]'
-
-/** Plan-SHAPED but carrying non-protocol labels — must keep the composer path. */
-const ASSISTANT_PLAN_SHAPED_CUSTOM = '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTIONS: Approve it | Revise stage 2]'
 
 function makeStore(content = ASSISTANT_WITH_OPTIONS, mode = '', slot = 'chat-1') {
   return configureStore({
@@ -114,11 +110,7 @@ function makeStore(content = ASSISTANT_WITH_OPTIONS, mode = '', slot = 'chat-1')
   })
 }
 
-/** Render with real timers so the queries settle, then hand back to the caller.
- *  `slot` is the active slot key: a test that DISPATCHES a plan action must pass
- *  a key no other test in this file dispatches on, because the hook's per-slot
- *  latches are module-level and a successful dispatch stays latched until the
- *  transcript acknowledges — which these static-store fixtures never simulate. */
+/** Render with real timers so the queries settle, then hand back to the caller. */
 async function renderPage(content = ASSISTANT_WITH_OPTIONS, mode = '', settleChip = 'Deploy', slot = 'chat-1') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   ;(api.chatSlots as ReturnType<typeof vi.fn>).mockResolvedValue([{ key: slot, messages: 1, running: false, mode, project: '/repo' }])
@@ -134,9 +126,11 @@ async function renderPage(content = ASSISTANT_WITH_OPTIONS, mode = '', settleChi
     )
   })
   await waitFor(() => expect(screen.getByRole('button', { name: settleChip })).toBeTruthy())
+  // The composer is lazy-loaded; wait for its editable root + handle to attach.
+  await waitFor(() => expect(document.querySelector('[data-composer-input]')).not.toBeNull())
+  await act(async () => {})
 }
 
-const composer = () => screen.getByLabelText('Message input') as HTMLTextAreaElement
 /** Exact-name match: the send-now segment is a sibling button named "Send now: <option>". */
 const chip = (option: string) => screen.getByRole('button', { name: option })
 
@@ -159,7 +153,7 @@ describe('ChatPage follow-up option toggle', () => {
     await renderPage()
     vi.useFakeTimers()
     await act(async () => { clickOption('Deploy') })
-    expect(composer().value).toBe('Deploy')
+    expect(composerValue()).toBe('Deploy')
   })
 
   it('toggles off when the second click lands before React commits the first', async () => {
@@ -171,7 +165,7 @@ describe('ChatPage follow-up option toggle', () => {
       clickOption('Deploy')
       clickOption('Deploy')
     })
-    expect(composer().value).toBe('')
+    expect(composerValue()).toBe('')
   })
 
   it('does not commit between those two clicks (control for the case above)', async () => {
@@ -182,22 +176,22 @@ describe('ChatPage follow-up option toggle', () => {
     let betweenClicks = 'unobserved'
     await act(async () => {
       clickOption('Deploy')
-      betweenClicks = composer().value
+      betweenClicks = composerValue()
       clickOption('Deploy')
     })
     // The single-click case proves a committed first click reads "Deploy", so an
     // empty value here can only mean no commit had landed when click two ran.
     expect(betweenClicks).toBe('')
-    expect(composer().value).toBe('')
+    expect(composerValue()).toBe('')
   })
 
   it('still toggles off when a render does land between the clicks', async () => {
     await renderPage()
     vi.useFakeTimers()
     await act(async () => { clickOption('Deploy') })
-    expect(composer().value).toBe('Deploy')
+    expect(composerValue()).toBe('Deploy')
     await act(async () => { clickOption('Deploy') })
-    expect(composer().value).toBe('')
+    expect(composerValue()).toBe('')
   })
 
   it('accumulates distinct options clicked in one uncommitted window', async () => {
@@ -208,7 +202,7 @@ describe('ChatPage follow-up option toggle', () => {
       clickOption('Roll back')
       clickOption('Retry')
     })
-    expect(composer().value).toBe('Deploy, Roll back, Retry')
+    expect(composerValue()).toBe('Deploy, Roll back, Retry')
   })
 
   it('removes a middle option without corrupting its neighbours', async () => {
@@ -222,33 +216,63 @@ describe('ChatPage follow-up option toggle', () => {
       clickOption('Retry')
     })
     await act(async () => { clickOption('Roll back') })
-    expect(composer().value).toBe('Deploy, Retry')
+    expect(composerValue()).toBe('Deploy, Retry')
   })
 
   it('unselecting removes the appended option, not a matching substring in the draft', async () => {
     // Regression: `indexOf(', ' + option)` matched the ", Go" inside
     // "Please, Google" before the option the handler appended at the end.
     await renderPage('Ready to proceed.\n\n[OPTIONS: Go | Stay]', '', 'Go')
-    fireEvent.change(composer(), { target: { value: 'Please, Google' } })
+    await setComposerValue('Please, Google')
     vi.useFakeTimers()
     await act(async () => { clickOption('Go') })
-    expect(composer().value).toBe('Please, Google, Go')
+    expect(composerValue()).toBe('Please, Google, Go')
     await act(async () => { clickOption('Go') })
-    expect(composer().value).toBe('Please, Google')
+    expect(composerValue()).toBe('Please, Google')
   })
 
   it('leaves earlier draft text alone when the user already deleted the appended option', async () => {
     await renderPage('Ready to proceed.\n\n[OPTIONS: Go | Stay]', '', 'Go')
-    fireEvent.change(composer(), { target: { value: 'Discuss, Go home' } })
+    await setComposerValue('Discuss, Go home')
     vi.useFakeTimers()
     await act(async () => { clickOption('Go') })
-    expect(composer().value).toBe('Discuss, Go home, Go')
+    expect(composerValue()).toBe('Discuss, Go home, Go')
 
     // The chip remains selected, but the user removes its generated tail by hand.
     // Unselecting must not fall back to the earlier ", Go" inside their draft.
-    fireEvent.change(composer(), { target: { value: 'Discuss, Go home' } })
+    await setComposerValue('Discuss, Go home')
     await act(async () => { clickOption('Go') })
-    expect(composer().value).toBe('Discuss, Go home')
+    expect(composerValue()).toBe('Discuss, Go home')
+  })
+
+  it('un-toggle removes only the chip-owned suffix, not user text inserted mid-draft (#7616)', async () => {
+    // Removal keys on WHAT THE CHIP APPENDED, not the picked-set content. A
+    // user edit between two appends re-baselines ownership: un-toggling Stay
+    // strips only the owned ", Stay" and keeps "Go and more". The pre-fix
+    // content search removed the wrong span.
+    await renderPage('Ready to proceed.\n\n[OPTIONS: Go | Stay]', '', 'Go')
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(composerValue()).toBe('Go')
+    await setComposerValue('Go and more')
+    await act(async () => { clickOption('Stay') })
+    expect(composerValue()).toBe('Go and more, Stay')
+    await act(async () => { clickOption('Stay') })
+    expect(composerValue()).toBe('Go and more')
+  })
+
+  it('un-toggle leaves a user-rewritten tail equal to the suffix untouched (#7616)', async () => {
+    // The endsWith() bug: after the chip appends ", Go", the user rewrites the
+    // whole draft to different text still ENDING with ", Go". The pre-fix
+    // endsWith(', Go') would splice it to 'other'; ownership preserves it.
+    await renderPage('Ready to proceed.\n\n[OPTIONS: Go | Stay]', '', 'Go')
+    await setComposerValue('note')
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(composerValue()).toBe('note, Go')
+    await setComposerValue('other, Go')
+    await act(async () => { clickOption('Go') })
+    expect(composerValue()).toBe('other, Go')
   })
 
   it('re-adds the option on a third click', async () => {
@@ -259,7 +283,7 @@ describe('ChatPage follow-up option toggle', () => {
       clickOption('Deploy')
       clickOption('Deploy')
     })
-    expect(composer().value).toBe('Deploy')
+    expect(composerValue()).toBe('Deploy')
   })
 
   it('does not quick-send a second option while a selection is already open', async () => {
@@ -273,57 +297,32 @@ describe('ChatPage follow-up option toggle', () => {
       clickOption('Roll back')
     })
     expect(api.sendChat).not.toHaveBeenCalled()
-    expect(composer().value).toBe('Deploy, Roll back')
+    expect(composerValue()).toBe('Deploy, Roll back')
   })
 })
 
-describe('ChatPage plan follow-ups (issue #5893 parity)', () => {
-  // Each test that DISPATCHES uses its OWN slot key. The hook's per-slot
-  // latches are module-level and survive vi.clearAllMocks(), and a SUCCESSFUL
-  // dispatch stays latched until the transcript acknowledges — which these
-  // static-store fixtures never simulate. Unique keys make the collision
-  // structurally impossible, so no reset hook (and no production-facing
-  // release escape hatch on the hook) is needed.
-
-  it('a plan chip in orchestrator mode dispatches the plan action and never touches the composer', async () => {
-    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-dispatch')
+describe('ChatPage plan-shaped follow-ups', () => {
+  // A Go / Go All / Cancel footer is an ordinary options row: the chip edits the
+  // composer or sends its text, whatever the slot's (legacy) mode says.
+  it('a single click appends the chip text to the composer, even on a legacy orchestrator-mode slot', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go')
     vi.useFakeTimers()
     await act(async () => { clickOption('Go') })
-    expect(api.planAction).toHaveBeenCalledTimes(1)
-    expect(api.planAction).toHaveBeenCalledWith('chat-plan-dispatch', 'Go')
-    expect(composer().value).toBe('')
+    expect(composerValue()).toBe('Go')
     expect(api.sendChat).not.toHaveBeenCalled()
   })
 
-  it('a plan-shaped message with NON-protocol labels keeps the composer path (allowlist gate)', async () => {
-    // The endpoint accepts only go / go all / cancel; a plan-shaped message
-    // quoting a plan while offering its own choices must compose text, not
-    // fire a dispatch the server would 400 (which also skips the append —
-    // a dead chip). This pins the allowlist ON THE MAIN SURFACE, so a future
-    // server-side action added without updating isPlanAction fails a test
-    // here instead of silently degrading to composer text.
-    await renderPage(ASSISTANT_PLAN_SHAPED_CUSTOM, 'orchestrator', 'Approve it', 'chat-plan-allowlist')
-    vi.useFakeTimers()
-    await act(async () => { clickOption('Approve it') })
-    expect(composer().value).toBe('Approve it')
-    expect(api.planAction).not.toHaveBeenCalled()
-  })
-
-  it('double-click on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
-    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-dbl')
+  it('double-click sends the chip text as a chat message', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, '', 'Go')
     fireEvent.doubleClick(chip('Go'))
-    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
-    expect(api.planAction).toHaveBeenCalledWith('chat-plan-dbl', 'Go')
-    expect(api.sendChat).not.toHaveBeenCalled()
-    expect(composer().value).toBe('')
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    expect(JSON.stringify((api.sendChat as ReturnType<typeof vi.fn>).mock.calls[0])).toContain('"Go"')
   })
 
-  it('Send now on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
-    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-sendnow')
+  it('Send now sends the chip text as a chat message', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, '', 'Go')
     fireEvent.click(screen.getByRole('button', { name: 'Send now: Go All' }))
-    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
-    expect(api.planAction).toHaveBeenCalledWith('chat-plan-sendnow', 'Go All')
-    expect(api.sendChat).not.toHaveBeenCalled()
-    expect(composer().value).toBe('')
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    expect(JSON.stringify((api.sendChat as ReturnType<typeof vi.fn>).mock.calls[0])).toContain('"Go All"')
   })
 })

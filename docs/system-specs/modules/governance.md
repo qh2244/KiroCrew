@@ -1,7 +1,7 @@
 # Governance Model (two-level Policy ∩ Profile)
 
 The `kiro_crew.platform.governance` + `kiro_crew.platform.governance_profiles`
-modules implement KiroCrew's **two-level security governance model**. Governance
+modules implement Kiro Crew's **two-level security governance model**. Governance
 is resolved by a single rule — *the tightest boundary wins*:
 
 - **Level 1 — POLICY** (`GovernanceCeiling`): the enterprise security ceiling,
@@ -13,11 +13,16 @@ is resolved by a single rule — *the tightest boundary wins*:
 The effective permission for any item is `policy ∩ profile`. This spec is the
 implementation companion to the design doc (Pippin `kirocrew/MVTDhLpm2SSW`).
 
-> Scope: this governs **KiroCrew's own** security boundaries — what the host
+> Scope: this governs **Kiro Crew's own** security boundaries — what the host
 > performs on behalf of the agent across every surface (CLI, dashboard, Slack,
 > cron, heartbeat, sub-agents, apps). The underlying kiro-cli agent config
-> (`~/.kiro/agents/*.json`) is **out of scope**: KiroCrew enforces its own
-> ceiling at its own gate even when the kiro side grants more.
+> (`~/.kiro/agents/*.json`) is **out of scope**: Kiro Crew enforces its own
+> ceiling at its own gate even when the kiro side grants more. The one place a
+> kiro-cli spec field is READ at a Crew gate is the spawn gate's honouring of
+> the parent agent's `toolsSettings.subagent.availableAgents` — an
+> intersection with `capabilities.spawn.scopes.agents` that only ever narrows
+> (see [subagent](subagent.md) § Parent agent spec allowlist); it is not a
+> governance scope and never widens what this model denies.
 
 Subagent admission checks explicit target names. When execution resolves an
 omitted name from the original conversation or parent session, the runner also
@@ -241,12 +246,70 @@ pins ride in the policy file for it:
   (a glob so one pin covers a mirror set, and so non-URL remote shapes —
   SCP-style, local path — are pinnable). Empty = unpinned. A checkout whose
   remote cannot be resolved is **denied when a pin exists**: an admin's pin must
-  not be satisfied by "we could not tell".
-- **`min_version`** — the minimum version the fleet may run. A host below it
-  takes a **mandatory** update, overriding the user's `auto_update=false`
-  (user config sits under the enterprise ceiling). It never refuses to *boot*:
-  bricking a fleet on a policy typo would remove the surface an admin needs to
-  fix it. An unparseable floor imposes none, for the same reason.
+  not be satisfied by "we could not tell". The `cli.sh` managed venv's update
+  checks the same pin against the feed and download URLs, so a git-only glob
+  blocks that install's updates, mandatory ones included.
+- **`min_version`** — the minimum version the fleet may run. On an install
+  whose gateway updates itself, a host below it takes a **mandatory** update,
+  overriding the user's `auto_update=false` (user config sits under the
+  enterprise ceiling). It never refuses to *boot*: bricking a fleet on a policy
+  typo would remove the surface an admin needs to fix it. An unparseable floor
+  imposes none, for the same reason. What "takes the update" means depends on
+  the install (`slack/gateway.py` `_check_for_updates` and
+  `_check_for_updates_via_provider`):
+  - **A policy provider** (`check_command` below) applies whenever the check
+    reports a version.
+  - **A git checkout** on a primary branch applies only toward a build whose
+    `__version__` outranks the running one AND that the checkout can take
+    cleanly (behind-only, or already pulled and awaiting a restart). Below the
+    floor with nothing newer, or with a diverged checkout that a reset would
+    strip of local commits, it notifies and refreshes the badge instead of
+    resetting to every new upstream commit, released or not
+    ([#15796](https://github.com/kirodotdev/KiroCrew/issues/15796)). A no-op
+    apply (the required code already on disk) leaves a restart pending without
+    arming a reload. A non-primary branch never applies, floor or not.
+  - **The `cli.sh` managed venv** re-runs the installer when the feed has a
+    newer build that `source` permits. With nothing newer it writes a log line
+    and does not reinstall; About can still read "up to date".
+  - **pip and pipx installs** only light the update badge, even when the feed
+    has nothing newer.
+  - **Docker and the desktop app's bundled gateway** (without a provider) do
+    not apply from the backend; a container needs a newer image. The app's own
+    updater does not act on the floor: with the app's update switch off, the
+    floor only makes the update-found prompt undismissable, and with it on (the
+    default) the floor has no effect.
+  - A mandatory apply waits for idle like any other
+    ([configuration.md → Updates](../../../src/kiro_crew/docs/configuration.md#when-the-gateway-checks))
+    and is never forced: the grace period (`_MANDATORY_UPDATE_MAX_DEFER_SECS`)
+    only logs.
+- **`check_command`** / **`apply_command`** — select the command update
+  provider (`platform/update_provider.py` `CommandProvider`), which then owns
+  the check, the badge and the Update button, and is resolved before any
+  layout's own updater or deferral. `check_command` exits 0 and prints the
+  available version on stdout when an update is available, and exits non-zero
+  when up to date; exit 0 with empty output is a failed check. `apply_command`
+  exits 0 on success; non-zero means the apply failed and the install is intact.
+  One run may take `_APPLY_TIMEOUT_SECS` (600 s), its exit included: a command
+  still running past it, even one that redirects its own output, is stopped and
+  the apply reported failed.
+  Applying needs both. They run unsandboxed as the gateway through a trusted
+  `sh -c` with a system-only `PATH`, so name binaries absolutely. On Windows they
+  never run (`_shell_exec_args` returns `None`), so a Windows host with a
+  provider never updates from the gateway. A packaged desktop app with a provider is
+  treated as policy-managed: `_arm_packaged_app` refuses with "updates on this
+  host are managed by policy".
+- **`platform_commands`** — per-platform overrides of those two commands, keyed
+  `{sys.platform}-{machine}` (`linux-x86_64`, `darwin-arm64`, `win32-x86_64`;
+  an unrecognised machine keeps its raw lowercased name). A matching entry
+  overrides each non-empty field it sets. Any command in any entry selects the
+  provider on every host, so a host whose platform has no command then never
+  checks or applies.
+
+These five are the only keys `updates` accepts (`UpdatePins.from_dict`). Any
+other key, or a non-string value, **fails closed** (`_reject_unknown_keys`); what
+an unparsable file does at boot is in [Loading + precedence](#loading--precedence).
+The desktop marker's camelCase names (`checkCommand`, `updateCommand`) are
+**not** valid here.
 
 **Not an archetype, by design.** Every archetype answers "is X permitted?"; a
 remote URL and a version number are *values the core consumes*. So they ride
@@ -594,6 +657,11 @@ document does, since a merely *large* finite value (`1e12`) passes the finitenes
 floats now (an int has no non-finite values), and the value is stored without a `float()`
 round-trip, which would have raised three lines later.
 
+A declared `distribution.source` must also be representable as strict UTF-8. JSON accepts a
+lone surrogate, but the cache-provenance digest encodes the source during boot; rejecting that
+input during composition keeps the failure inside the platform error contract instead of leaking
+a `UnicodeEncodeError` from the distribution engine.
+
 **A DECLARED source may not carry a credential.** `PolicyDistribution.from_dict` refuses
 userinfo (`https://user:pass@host/…`) and any query string in a `distribution.source` that
 comes from a *document*. This block is cached verbatim — the bytes have to be identical for
@@ -907,11 +975,64 @@ unconditional rebuild would rewrite a file kiro-cli watches every refresh interv
 Two details make that bound safe rather than merely cheap. The baseline is seeded by
 `prime_ceiling_projection` **before the poller starts**, because the first poll can itself
 install a new ceiling and a first-call baseline would record that generation and skip the very
-rebuild it needed. And the memo advances **only after a successful rebuild**: a failure raises
-through the hook runner, which logs and moves on, so marking the generation synchronised would
-lose the retry the next poll gives and leave forbidden auto-approvals on disk for the process
-lifetime. An unseeded baseline rebuilds once rather than skipping — a redundant rewrite costs a
-file write, a skipped one costs the tighten.
+rebuild it needed. And the memo advances **only after a confirmed write**: the hook calls
+`rebuild_agent_config_reporting()`, which returns `(path, wrote)` from the same single
+evaluation that gates the write. A failure still raises through the hook runner, which logs
+and moves on — and a **refused** rebuild (an instance the shared-home write guard declines:
+non-default `KIROCREW_HOME`, pod, or foreign-pinned specs) returns `wrote=False` and holds the
+memo the same way, logging the pending projection at WARNING once per generation. So does a
+rebuild in which a conductor installer **left its spec on disk unwritten** — because the file
+could not be read for a reason that may clear on retry (`conductor_agents._governed_grants`),
+or because the installer's write raised and the rebuild logged it rather than propagating it:
+that spec's `allowedTools` were not re-derived either, so the installers report whether they
+wrote and the rebuild reports the hold through its private `_held_out` out-parameter, which
+the hook reads beside `wrote`. The hold is deliberately NOT folded into `wrote=False`:
+`kirocrew.json` was written, and the dashboard's default-model applier reads `wrote=False` as
+a change that did not land — a held conductor spec would otherwise announce every model
+change as failed and retry it forever. Either way,
+marking the generation synchronised would lose the retry the next poll gives and leave
+forbidden auto-approvals on disk for the process lifetime; holding the memo means every later
+poll retries and the projection lands the moment the failure or refusal clears. The verdict
+comes from inside the rebuild itself, never a separate guard probe, which would race a
+concurrent default-home rewrite and record a projection that never landed. An unseeded
+baseline rebuilds once rather than skipping — a redundant rewrite costs a file write, a
+skipped one costs the tighten. Boot is the one place the hold would otherwise be lost: the
+boot rebuild is a bare `rebuild_agent_config()`, and `prime_ceiling_projection` runs after
+it, so a conductor spec that rebuild left unwritten still carries the list the *previous*
+ceiling wrote while a seeded baseline would say the current generation is projected — and
+the hook, skipping an unchanged generation, would never retry it for the process lifetime.
+The rebuild therefore records its installers' verdict in a module memo
+(`agent._conductor_spec_held`, the last rebuild's `_held_out` kept for the readers that did
+not run it), and `prime_ceiling_projection` **seeds nothing while it is set**, logging once
+at WARNING: the first poll rebuilds against the unseeded baseline, reports its own hold, and
+the memo advances only once every spec is rewritten. A host **without central distribution
+has no poll**: `start_refresher` starts nothing unless the active policy names a source and
+an interval, the ceiling there is installed at boot alone (`set_context` is called by the
+platform bootstrap and by `apply_ceiling`; nothing watches `security_policy.json`), and so a
+local tightening takes effect at the next boot — and a conductor spec THAT boot's rebuild
+held would keep the previous ceiling's list for the process lifetime, with the hook never
+called. `agent.retry_held_conductor_specs` is that host's retry: the gateway's **hourly
+maintenance wake** (the loop that already hosts the scratch, work-root and session-dir sweeps
+rather than a scheduler of its own) calls it first, off the event loop; it is a no-op unless
+the memo is set, otherwise one reporting rebuild, so the memo is rewritten where the four
+installers' verdicts settle and clears only when every spec was written — a persistent hold
+is retried every wake and warned about each time. The hold itself is reached only after a
+**bounded read retry**: the installer attempts a read that failed in the reader's transient
+class (a plain `OSError` from the metadata probe or the read) three times, 50 ms and 100 ms
+apart (`conductor_agents._TRANSIENT_READ_BACKOFF_SECS`), because the pause costs less than an
+hour of the previous ceiling's list; a path shape or bytes that can never be a spec are not
+retried, and a failure that outlasts the attempts holds the spec with the attempt count in the
+warning.
+
+A builtin can also be governed by a **capability** rather than by its name:
+`BUILTIN_TOOL_CAPABILITIES` maps `use_subagent` to `capabilities.spawn`. A capability is not
+a `tools` rule, so the name check cannot see it, and an auto-approved spawn raises no
+permission request, so the per-spawn check at the gate never runs for it. `may_skip_gate`
+therefore also withholds the grant while that capability restricts anything at the level
+asked (off, or any scope; an enabled gate with no scopes permits every use). Every writer asks
+this one predicate, so the grant is withheld on every backend and channel alike: kiro-cli's
+own spec, the KAS wire projection, and the `permissions` block written to disk. With no such
+policy nothing changes.
 
 What no hook can do is narrow a session **already negotiated**: kiro-cli holds the grants it
 was given, and nothing reaches into a running one. That limit has the same shape as an
@@ -1338,20 +1459,27 @@ This is enforced solely by adding them to `security._SENSITIVE_HOME_DIRS`
 read+write gate across every surface. `assert_governance_paths_protected()` is a
 boot integrity check that fails closed if a refactor ever drops them.
 
-**`~/.kiro/agents/*.json` and `~/.kiro/settings/mcp.json` are NOT on the floor
-today** — an honest gap worth stating here because it bounds what the ceiling can
-claim. Verified on the current tree: `is_sensitive_path("~/.kiro/agents/kirocrew.json")`
-is `False` and `echo x > ~/.kiro/agents/kirocrew.json` is not blocked. Since
+**`~/.kiro/agents/*.json` and `~/.kiro/settings/mcp.json` are on the WRITE-ONLY
+tier of the file-tool floor, and the shell route is still open** — the split is
+worth stating here because it bounds what the ceiling can claim. Both leaves are in
+`_WRITE_PROTECTED_HOME_PATHS`, so `is_sensitive_write_path` refuses an agent
+file-edit write to either at every spelling, including the `KIRO_HOME` relocation
+and a `$HOME` symlinked further down the path; `is_sensitive_path` still answers
+`False` for both, because the gateway's own readers need them. What remains
+unfenced is `echo x > ~/.kiro/agents/kirocrew.json`:
+`is_sensitive_bash_command` does not match sensitive PATHS in command text — a
+documented design choice — so the shell route rests on the OS sandbox, which seals
+the agents dir and not yet the registry leaf.
+
+That residual matters for the same reason the whole gap did. Since
 `hooks.on_tool_call` runs **only** from the `EVENT_PERMISSION_REQUEST` branch (the
 `EVENT_TOOL_CALL` branch is documented informational-only — "the tool is already
 running (auto-approved by kiro-cli). Hook results cannot block execution"), an
 agent that writes itself into `allowedTools` makes kiro-cli stop sending
 permission requests and **Plane A never runs at all** for that tool. This affects
-every governed capability, not just computer use. Hardening those paths is
-deliberately deferred to its own PR (it changes a path floor every legitimate
-writer — `agent.py`, `handlers/mcp.py`, `handlers/agents.py`, `apps/backend.py` —
-touches, and deserves review on its own merits). Until it lands, a capability
-whose only enforcement is Plane A can be skipped this way. Computer use no longer
+every governed capability, not just computer use. So a capability whose only
+enforcement is Plane A can still be skipped by a shell-capable agent, though no
+longer by its file tools. Computer use no longer
 relies on either plane — it is not governed at all, and rests on the keystone enable
 being agent-unwritable. See [computer-use.md](computer-use.md) → "Known limitations".
 
@@ -1387,7 +1515,7 @@ without re-implementing it.
 **`host` surface (in-process host actions).** A governance check that is not
 driven by a user-facing surface — app activation
 (`apps.manager._app_activation_denied`), Slack workspace admission
-(`slack.enterprise`), non-Slack transport startup
+(`slack.enterprise`), transport startup
 (`slack.gateway._channel_transport_permitted`), and the selectable-ACP-harness
 narrowing (`agent_backend_governance.narrow_selectable_backends`) — runs under
 the `_host` sentinel session key, which classifies to surface `host`. Operators can bind a
@@ -1419,6 +1547,22 @@ disposition:
   (no reply), matching how an unauthorized user is ignored; `PlatformCompositionError`
   propagates. Default OSS build (no `channels` policy) permits, so inbound handling
   is byte-identical to today.
+  One OUTBOUND send consults this same inbound ceiling:
+  `messaging/spawn_approval_delivery.py` checks it before invoking any channel's
+  spawn-approval delivery hook, because the press that would answer that prompt is
+  inbound and is dropped on a denied channel (only an explicit reject is exempt on
+  a channel's callback path). A prompt posted under a deny is unanswerable, so its
+  deny-by-default wait elapses and the spawn gate reads the elapsed wait as a
+  refusal the operator never made; a deny therefore falls through and leaves the
+  spawn answerable on Slack or the dashboard instead. The check sits at that seam,
+  not inside each dispatcher, so a channel hook written without it is gated too.
+  The same ceiling is consulted a SECOND time for one prompt: the spawn gate holds
+  a spawn for as long as its approval takes, so a deny can land while the prompt is
+  already pending, and from that moment the press that would answer it is dropped.
+  A hook whose wait elapsed with no press therefore asks the seam
+  (`unpressed_wait_answer`) what the elapsed wait means, and a deny makes it a
+  fall-through rather than a refusal in the operator's name. An explicit reject,
+  which this gate exempts from the drop, stays a real denial either way.
   **Audit disposition:** a GOVERNED allow is audit-or-deny (`critical=True` — a SEL
   persistence failure denies the inbound, so a governed channel never receives
   unaudited); every DENY is recorded best-effort. The **ungoverned default-permit
@@ -1620,11 +1764,16 @@ caller served one resolves `profile=None` and `governance_permits` returns its
 `ungoverned` **default-permit** — a fail-OPEN that `fail_closed=True` cannot catch,
 because the default-permit is a normal return rather than an exception.
 
-`_ensure_fresh` **never blocks** — it takes the reload lock with
-`acquire(blocking=False)` only, because it is reachable on the event loop (the
+`_ensure_fresh` **never blocks on the event loop** — it takes the reload lock with
+`acquire(blocking=False)` there, because it is reachable on the loop (the
 synchronous PreToolUse gate) and waiting there on another thread's filesystem I/O
 would wedge the gateway (a slow first profile load in a worker plus a concurrent
-dashboard tool approval is exactly that stall). It returns whether the snapshot is
+dashboard tool approval is exactly that stall). Off the loop, and ONLY while the
+store is still unprimed, it waits a bounded `_COLD_LOAD_WAIT_S` for the sibling
+that owns the first load, so the loser of a cold-load race authorizes against real
+profiles instead of a deny-all. `_on_event_loop()` decides which of the two applies,
+and the `and` short-circuits so a loop-thread caller never reaches the timed
+acquire. It returns whether the snapshot is
 **resolved**, i.e. safe to authorize against, and a caller that loses the lock
 does not wait:
 
@@ -1755,24 +1904,43 @@ read-your-writes should add it deliberately, with its own tests.
   STILL denied when the enterprise ceiling pins the equivalent pattern —
   tightest-wins. The call sites thread `session_key`/`agent` (they default to
   `""`, so non-governed callers are unaffected).
-- **Plane B — kiro agent JSON**: out of scope (v1). KiroCrew no longer writes
+- **Plane B — kiro agent JSON**: out of scope (v1). Kiro Crew no longer writes
   `deniedCommands` into `~/.kiro/agents/*.json` at all — the
   `agent._enforce_denied_commands` injection path is retired — so the hooks gate
   is the SOLE denied-command enforcement point, not a secondary layer. The gate
-  is authoritative; KiroCrew does not regenerate `~/.kiro/agents/*.json`.
+  is authoritative; Kiro Crew does not regenerate `~/.kiro/agents/*.json`.
 - **Plane C — out-of-band executors**: the cron `command` (runs via `sh -c`
   outside the ACP flow) is gated in `mcp_cron._vet_command_governance`; the
   cron *capability* on/off gate in `mcp_cron._vet_cron_capability_governance`.
   Both run at `cron_add` (authoring) AND again at fire time — for EVERY job
   kind — via the shared `mcp_cron.vet_job_at_fire_time(job)` entry point
   called from `slack.gateway._cron_callback` immediately before execution:
-  `command` jobs re-run the capability gate + the `commands` ceiling, `script`
+  `command` jobs re-run the capability gate + the `commands` ceiling + the
+  command-body COMPOSITION scan (`mcp_cron._vet_shell_command`, audited under
+  the `cron_command_body` scope), `script`
   jobs re-run the capability gate + the script-body scan
   (`mcp_cron._vet_script_file`) on the freshly re-resolved path (so a script
   file edited on disk after authoring is re-checked too), and `message` (LLM)
   jobs re-run the capability gate before the session dispatch. A policy
   tightened after a job was scheduled therefore denies that job's next run
-  instead of only affecting jobs authored after the change. Denial at
+  instead of only affecting jobs authored after the change. The same entry
+  point also asks, for every job kind, whether the APP that installed the job
+  is still enabled (`mcp_cron._vet_app_owner_enabled`, ownership read from the
+  `created_by` stamp `apps.cron_sdk.owner_tag` writes, never a name prefix): an
+  app's crons are COPIES in the global store, and an app disable removes them
+  only when a cron service is reachable at that moment, so a disable that could
+  not reach the store left them firing. Only a definite `enabled: true`
+  authorizes: app metadata that cannot be READ is no licence to run an app's
+  code either, the same closed reading `apps.backend` takes before it spawns
+  one, and the gate persists nothing so the next fire re-asks.
+
+  The ceiling and the composition scan are DISTINCT decisions and both are
+  re-run: the ceiling authorizes who may run the command, while the scan judges
+  what the command COMPOSES at run time, and only the second moves when
+  `mcp_cron`'s refusals change. Re-running only the ceiling left a command
+  stored before a refusal existed running after it — the case this whole entry
+  exists to prevent — so a composition refusal added to `mcp_cron` now reaches
+  the installed base rather than only jobs authored afterwards. Denial at
   fire time marks the run `last_status="error"`, emits a SEL
   `outcome="denied"` event keyed `cron:<job.id>`, and does not delete or pause
   a RECURRING job — deliberately including the consecutive-failure auto-pause
@@ -1839,7 +2007,7 @@ either level permits. In particular:
   settings, credentials, hooks, native personas/agents, raw instructions, and
   runtime state are never imported.
 - The strict settings allowlist excludes governance and security controls.
-  Preserving an existing KiroCrew value on collision cannot be overridden by
+  Preserving an existing Kiro Crew value on collision cannot be overridden by
   foreign precedence.
 - Imported workspace references grant no filesystem permission. Any later tool
   use is evaluated by the ordinary filesystem scopes and sensitive-path
@@ -1892,6 +2060,35 @@ real arguments** the ACP event carries:
 - `tool_kind == "edit"` + `raw_params["path"]` → `filesystem.write`.
 - `tool_kind == "fetch"` + `raw_params["url"]` → `network.egress` (the host is
   extracted from the URL so the `host` matcher applies).
+
+Because the item under test is that extracted host, a `host`-matcher pattern
+that carries a character or shape no host can hold never matches. The checks run
+in this order, and the first to hold names the reason: a `/` (a scheme, a path or
+a CIDR mask), an `@` (userinfo), IPv6 brackets (the pattern starts with `[` and
+`_url_host` of the pattern yields an address holding a `:`, as `[::1]` and
+`[::1]:443` both yield `::1`; `_url_host` unwraps them, so the item never has
+them), or a port, meaning exactly one colon with a
+non-empty text before it and only digits after. Exactly one colon is what tells a
+port from an IPv6 literal, which always has two or more, so a bare `::1` or
+`2001:db8::1` stays silent and so does a single-label `server`, while `server:443`
+warns. The text before the colon must also hold no `*`, `?` or `[`: a glob can
+absorb a colon, so `*:443` matches the item `fe80::443` that
+`https://[fe80::443]/x` yields, and `*:443` or `web*:443` stays silent. Any other bracket is an fnmatch character class, which `_match_host`
+honours, so `[ab].example.com`, `[a:].example.com` or
+`web[0-9][0-9].corp.example` is live and stays silent: a colon inside a class
+does not make it IPv6, since `_url_host` finds no host in `[a:].example.com`. Otherwise deadness is read off the pattern, not off `_url_host`: that function cuts a
+bare IPv6 literal at its last colon (`::1` gives `:`) and a netloc at the first
+`?` (`api?.skills.sh` gives `api`), so comparing its output to the pattern would
+condemn live rules. The entry is dead: in deny mode the scope permits exactly what
+the operator wrote it to block, and in allow mode it refuses it.
+`ScopedRuleset.from_dict` therefore logs a warning (beside the Rule-1 dead-deny
+one) naming the scope and the entry's position, such as `deny[0]`. It never logs
+the pattern itself, because a pasted URL can carry userinfo, a signature or an
+`?api_key=` query, and the warning fires on every boot. Only the list the mode
+reads is checked: `allow` in allow mode, `deny` in deny mode. The warning names
+the dead entry and its reason and offers no replacement host. It warns rather than
+raising: refusing the document would turn one stale entry into a boot failure on
+upgrade for a policy that loads today.
 
 `on_tool_call(..., tool_kind=, raw_params=)` carries these from the ACP event
 (`AcpEvent.tool_kind` / `.raw_tool_params`); the call sites thread them
@@ -1986,12 +2183,12 @@ a form that silently does nothing, and cannot save config that would never take
 effect. **Slack is governed like every other channel** (it is NOT exempt): its
 inbound message + tool-approval + review-action + OPTIONS-choice chokepoints call
 `channel_inbound_permitted("slack")`, so a `channels` policy denying `slack`
-blocks it and the row is marked "Off by admin" to match. (The connection-time gate
-+ the direct cron/heartbeat outbound posts are a separate follow-up; outbound
-sends via the messaging tool already pass `_vet_channel_governance`. The non-Slack
-transports are additionally gated at connect time by
-`slack.gateway._channel_transport_permitted`.) Default OSS build (no policy) →
-every channel permitted → nothing greyed.
+blocks it and the row is marked "Off by admin" to match. (The direct
+cron/heartbeat outbound posts remain a separate follow-up; outbound sends via the
+messaging tool already pass `_vet_channel_governance`. Every transport is also gated
+at connect time by `slack.gateway._channel_transport_permitted`; Slack calls it from
+`_connect_slack` because it owns its socket-client lifecycle.) Default OSS build (no
+policy) → every channel permitted → nothing greyed.
 
 **Gate placement — BEFORE side effects, not just before the turn.** The inbound
 gate for the native Slack path lives in `slack.events._route_message`, placed
@@ -2241,7 +2438,7 @@ denials leave the same forensic trail.
 
 > **Capability `profile-absence` semantics (deliberate deviation from spec A.4
 > rule 8).** The spec says a profile that OMITS a capability defaults it to
-> `false`. KiroCrew instead treats an omitted scope as *not governed by the
+> `false`. Kiro Crew instead treats an omitted scope as *not governed by the
 > profile* (truth-table "not-governed" → bounded by policy alone), because the
 > stricter reading would turn every minimal profile (e.g. one that governs only
 > `tools`) into a near-deny-all of all capabilities. To disable a capability a
@@ -2252,11 +2449,12 @@ The **enforced** scopes in v1 are: `tools`, `mcp`, `commands` (host gate + cron
 command body + the enterprise force-pin for built-in denied-command rules, see
 below), `filesystem.read` / `filesystem.write` / `folders.*` and
 `network.egress` (host gate via tool kind + args), `channels` (per-transport at
-the messaging chokepoint AND at non-Slack transport startup), `apps` (app
+the messaging chokepoint AND at transport startup), `apps` (app
 activation), `agent_backend` (which ACP harness a deployment may select —
-materialised by narrowing the `acp_backends` registry at boot and on every
-runtime ceiling install, see below), `sandbox.min_level` (ordinal
-floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
+materialised by narrowing the `acp_backends` registry at gateway start),
+`approval_modes` (currently the `yolo` dashboard mode), `yolo_duration`
+(the `permanent` and `until_shutdown` no-expiry choices), `sandbox.min_level`
+(ordinal floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
 gate — `capabilities.spawn`, `capabilities.messaging`, `capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
 `capabilities.browse` (the native `browser` MCP tool's dispatch chokepoint —
@@ -2287,7 +2485,9 @@ descriptor. Every decision, list and mint alike, is SEL-audited through
 entry; the method rows themselves come from the `mobile_connect` CPP seam —
 see `platform-context.md`), and
 `capabilities.telemetry` (the anonymous beacon: send gate + both write
-chokepoints — **policy layer only**, see below), and
+chokepoints — **policy layer only**, see below), `capabilities.tailnet_origin`
+(the tailnet CLI/origin derivation, publish action, and enabling config writes —
+**policy layer only**, see below), and
 `capabilities.social_share` (the dashboard's "Share as image" entry — read
 through `GET /api/dashboard/config`, every layer honoured, every decision
 audited; see below), and `capabilities.feature_videos_download` (fetching the
@@ -2475,7 +2675,7 @@ ungoverned):
 **Recorded maintainer decision (2026-07-24, PR #107):** "consent =
 surprise-prevention UX, not authorization" is **accepted as the v1
 contract** for installed-pack personas, and `capabilities.theme_persona`
-ships `capability_default=True`. Rationale: KiroCrew is a single-user,
+ships `capability_default=True`. Rationale: Kiro Crew is a single-user,
 self-hosted tool where the pack installer is the machine owner; the persona is
 tone-only, content-bound (sha256), and enterprise-disableable via the row
 above — while a default-off would make every installed persona silently dead
@@ -2569,7 +2769,7 @@ rather than weaker:
 - A bare not-permitted test is **wrong in a way no `except` can catch**:
   `resolve_active_scope` returns a synthetic deny-all *profile*
   (`_deny_all_unloaded:…`) when the profile store is unprimed and another thread
-  holds its non-blocking reload lock. That is a transient race on a host with **no
+  holds its reload lock and the caller is on the event loop, where it cannot wait. That is a transient race on a host with **no
   policy at all**, and it arrives as an ordinary `Decision`, not an exception — so
   reading it as a pin would make the CLI, the 403, and the UI note all blame an
   administrator who does not exist. `TestGovernancePin` pins both directions.
@@ -2726,6 +2926,32 @@ never approved, so the ceiling stands ABOVE the keystone rather than beside it.
 Governed by the `capabilities.decisions` `SCOPE_CATALOG` capability row
 (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
 change, mirroring the rows above).
+
+**A local preset has its own row: `capabilities.decisions_local`.** The row above
+exists because the seam's state reaches a paid third party; a local preset model
+(`decisions/local_models.py`) answers on this machine and sends nothing off it, so a
+fleet that permits hosted Jev may still want to withdraw local models on its own.
+The local row only NARROWS: a local preset is permitted only while BOTH
+`capabilities.decisions` and `capabilities.decisions_local` permit
+(`capability.is_decisions_denied(local=True)` evaluates the hosted row first). Before
+this row existed, pinning `capabilities.decisions` off withdrew the whole seam, local
+models included, and an upgrade keeps that reach: the hosted row permits while
+absent, so a denial there is always an explicit pin (or the fail-closed degrade).
+`capabilities.decisions_local` (`capability_default=True`, data only) governs the seam
+only while the gateway's own runtime runs the configured preset on its port
+(`capability.is_local_preset`, the runtime's attestation: `config.json` has other
+writers, so a route-built address there proves nothing about what listens on it). A
+hand-written loopback address, which can be a tunnel to hosted Jev, stays under
+`capabilities.decisions`. A preset-shaped address the gateway does not run answers
+under BOTH rows, denied if either denies, so pinning this row off also stops a server
+started by hand on a preset's port from answering. Both
+chokepoints select the row from the configured provider and the runtime, never from
+the request. `PUT /api/decisions/provider`
+refuses a switch to a withdrawn side with `403 decisions_capability_denied`, and its
+`GET` reports `hosted_permitted` / `local_permitted` so the picker greys that side
+out. `decisions_enabled` is `true` while EITHER side permits, so the card is withheld
+only when `capabilities.decisions` is pinned off (which covers both sides) or both
+rows are. A fleet that permits hosted Jev but wants no local model pins this row.
 
 **Two chokepoints, because either alone is a half-control.**
 `PUT /api/decisions/consent` refuses an ENABLING write with
@@ -3033,6 +3259,25 @@ binding app activation and the messaging host gates use — see
 The Security panel picks the row up automatically — `api_governance_policy`
 iterates `SCOPE_CATALOG`.
 
+### Auto-approve grant lifetime — `yolo_duration`
+
+`agent.yolo_duration` accepts timed ad-hoc choices (`30m`, `1h`, `6h`, `12h`,
+`24h`) plus `until_shutdown`; the timed default is `6h`. The `yolo_duration`
+`SCOPE_CATALOG` row is a `ScopedRuleset` on the `identifier` matcher and governs
+only the two no-expiry members: `permanent` (the standing
+`agent.dangerously_skip_permissions` declaration) and `until_shutdown` (an ad-hoc
+grant with no timed expiry). Timed choices remain bounded by the ordinary config
+and `SafetyOverride` ceilings rather than this scope.
+
+Both decisions resolve against `HOST_SESSION_KEY` with `fail_closed=True`. Denying
+`permanent` makes `grant_declared_yolo()` fall back to the configured ad-hoc
+lifetime; denying `until_shutdown` makes `resolve_configured_duration()` fall back
+to the default 6-hour TTL. The resolver reads live config on each ad-hoc activation,
+so a saved duration change applies to the next grant without a gateway restart.
+`/api/status` reports the configured label and whether `until_shutdown` is
+permitted; the Settings UI can therefore withhold a no-expiry choice that the
+server would refuse.
+
 ### Which tool-approval modes a deployment may select — `approval_modes`
 
 The dashboard approval-mode picker offers four modes: `normal` (interactive —
@@ -3173,7 +3418,7 @@ either one now aborts governance boot (see the `_MATCHERS` note above).
 **What replaced it.** One operator opt-in on the keystone `computer_use.json`,
 which `security._SENSITIVE_HOME_DIRS` fences the agent away from. The agent cannot
 read or write that file, so it cannot enable its own desktop automation — and it
-cannot drive KiroCrew's own window either (`computer_use/policy.py`), so it cannot
+cannot drive Kiro Crew's own window either (`computer_use/policy.py`), so it cannot
 click the toggle in the UI. Those two facts are the entire boundary.
 
 **What this costs, stated plainly.** There is no way to express "computer use is
@@ -3259,7 +3504,8 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 - `agent_backend_governance.py` — the `agent_backend` scope: `SCOPE`,
   `narrow_selectable_backends` (the registry recompute, plus its host-bound,
   both-directions audit), driven from `platform/bootstrap.py::bootstrap_context`
-  and `platform/policy_distribution.py::apply_ceiling`.
+  at gateway start. Runtime ceiling installs deliberately leave the registry
+  unchanged until the next start.
 - `acp_backends.py` — the selectable registry the scope narrows:
   `GOVERNANCE_FLOOR_BACKEND`, `POLICY_ID_BY_BACKEND`, the baseline/effective
   split (`registered_backends` / `selectable_backends`) and
@@ -3270,7 +3516,6 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
   (`_cu_read_only_auto_approve`, which reads the action-class table rather than a
   governance row).
 - `sel.py` — `log_governance_decision`.
-- chokepoints: `sandbox.py`, `mcp_cron.py`, `subagent.py`, `mcp_core.py`.
 - `messaging/identity.py` — `channel_inbound_permitted` (the per-message inbound
   `channels` gate) + its SEL audit disposition.
 - `executors.py` — `governance_executor` (`mc-gov`), the bounded pool the

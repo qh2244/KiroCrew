@@ -1,13 +1,14 @@
 # Frontend testing
 
-Three test layers cover the dashboard. Pick the cheapest one that can actually
-observe the thing you changed.
+Three automated test layers cover the dashboard. Component stories are a separate
+visual review surface. Pick the cheapest surface that can actually observe the thing
+you changed.
 
-| Layer | Runner | Environment | Lives in |
+| Surface | Runner | Environment | Lives in |
 |---|---|---|---|
-| Unit and integration | vitest | `happy-dom`, network mocked by MSW | `integration/**/*.test.tsx`, `src/**/*.test.tsx` |
+| Unit and integration | vitest | `happy-dom`, network mocked by MSW | `integration/**/*.test.{ts,tsx}`, `src/**/*.test.{ts,tsx}` |
 | Browser end-to-end | Playwright | real Chromium against a real gateway | `playwright/*.spec.ts` |
-| Desktop shell | node:test | Node, no DOM | `electron/test/` |
+| Desktop shell | node:test | Node, no DOM | `electron/test/`, `electron/mochi/test/`, `electron/crew-companion/test/` |
 | Component stories | Storybook | real Chromium, no gateway, every shipped theme | `src/**/*.stories.tsx`, config in `.storybook/` |
 
 ## Commands
@@ -108,21 +109,22 @@ making the same modules cheaper to parse buys nothing, which is why Vite's
 `json.stringify` (on by default above 10 KB) does not help. Count modules, not
 kilobytes, when you judge a setup import.
 
-The test path is also heavier than the production bundle: `en-XA.json` is 1.33 MiB
+The test path is also heavier than the production bundle: `en-XA.json` is 1.89 MiB
 and DEV-only, and `import.meta.env.DEV` is true under vitest, so it loads here and
 is dropped from a release build.
 
-That is why `src/i18n/index.ts` imports **English only** (726,947 bytes, 5.9% of the
-12,242,932 authored bytes), `src/i18n/catalogs.ts` owns every catalog import, and
-`src/i18n/all.ts` is the entry that registers them. Three rules hold that split in
-place:
+That is why `src/i18n/index.ts` imports **English only** (1,027,227 bytes, 5.9% of the
+17,508,449 authored bytes), `src/i18n/catalogs.ts` owns every catalog import, and
+`src/i18n/all.ts` is the entry that registers them all. The browser boots through
+`src/i18n/lazy.ts` instead, which fetches one non-English catalog on demand. Three
+rules hold that split in place:
 
 - **No non-English catalog import in `src/i18n/index.ts`** — that is the module
   `integration/setup.ts` and ~600 components import.
 - **No all-catalogs import in `integration/setup.ts`**: neither `src/i18n/all` nor
   `src/i18n/catalogs`, and not transitively through a helper it pulls in.
-- **A page entry point imports `initI18n` from `src/i18n/all`**, never from
-  `src/i18n/index`. Both export the same signature so `tsc` accepts either, but
+- **A page entry point imports `initI18n` from `src/i18n/lazy` or `src/i18n/all`**,
+  never from `src/i18n/index`. Both export the same signature so `tsc` accepts either, but
   through the English-only module the dashboard renders English to a user who
   picked Japanese: i18next falls back, nothing throws, no key renders raw.
 
@@ -131,8 +133,8 @@ import graph, because none of them changes a test result on its own.
 
 A test that needs a language other than English imports `src/i18n/all`; a test that
 audits the whole catalog set imports `CATALOGS` from `src/i18n/catalogs`. Either way
-a single file pays the load. None of this defers a load — `t()` is synchronous on
-every path — it only settles which module owns the import.
+a single file pays the load. `t()` is synchronous on every path: the lazy entry
+registers a catalog before anything renders in its language.
 
 Weigh anything else you put in the setup graph the same way: multiply it by the
 file count first.
@@ -172,6 +174,25 @@ are in
 [../../docs/system-specs/common/testing-conventions.md](../../docs/system-specs/common/testing-conventions.md).
 The short version holds here too: never fix a flake with a rerun, a longer timeout,
 or a weakened assertion. Poll for the condition you actually care about.
+
+### Two front-end gates scan the WHOLE tree, so a diff-relevance run misses them
+
+`website/electron/test/port-owner-self-asserted-identity.test.js` requires every call
+site of the two port probes, and every use of the port-verdict vocabulary, to be
+declared in one of its lists; an unclassifiable site fails rather than passing. The
+i18n style tests under `website/src/i18n/style/` scan the whole catalog the same way.
+
+Neither is selected by a test run scoped to your diff, so a new probe call or a new
+catalog value passes locally and reds **every open pull request** on the round after
+it merges. If your change adds a port verdict, run that electron test explicitly; if
+it adds a catalog value, run the style tests with `I18N_BASE_REF` set so their
+diff-scoped halves actually evaluate. Registering a site is one line and the failure
+message names the list it belongs in.
+
+The general shape of this mistake, and the two other ways a deterministic gate ends
+up billing a stranger, are in
+[the testing spec](../../docs/system-specs/common/testing-conventions.md) under "A
+gate that reds on someone else's pull request".
 
 ## Determinism: establish the state you assert on
 
@@ -244,6 +265,54 @@ into a deterministic local failure. Keep the forced delay in place while you ver
 the fix, then remove it: a fix that only passes once the delay is gone has not been
 shown to fix anything.
 
+### Rules every test keeps
+
+The cases below are where these rules came from. Each one is a rule for every new or
+changed test, and `AUTOSDE.yaml`'s `frontend-tests-are-deterministic` holds review to
+them.
+
+- **Time.** A test whose output reads the clock pins it with `vi.setSystemTime(...)`,
+  set after the last real-timer wait (with fake timers, see the fake-timer rule below).
+  Restore it with `vi.useRealTimers()` where a timed-out test still reaches it: an
+  `afterEach` or `onTestFinished`, or a `finally` only when the pinned section awaits
+  nothing a fake clock can stall (no `waitFor` or `findBy*`), because a timed-out test
+  never reaches its `finally`. Without fake timers `setSystemTime` still mocks `Date`
+  for the rest of the file until that call. An Electron `node:test` file pins `Date`
+  with `mock.timers.enable({ apis: ['Date'] })` and resets a top-level `mock.timers` the
+  same way; a test-context `t.mock.timers` is reset by the runner. A relative age ("3
+  minutes ago") is computed from the pinned instant, never from the real `Date.now()`.
+- **Locale and zone.** An expectation built with `toLocale*String()` names its locale:
+  vitest pins `TZ=UTC` but not the locale, and the Electron suite pins neither, so an
+  Electron test names the zone too.
+- **Barriers.** No promise-sleep (`await new Promise(r => setTimeout(r, N))`, N > 0) as
+  a barrier before an assertion. Wait for the state with `findBy*`, `waitFor` or an
+  awaited mock call. The forced delay in *Reproduce before you fix* is a probe, removed
+  before the change lands.
+- **Randomness.** Stub `Math.random` and `crypto.randomUUID`
+  (`vi.spyOn(...).mockReturnValue(...)`) whenever the asserted output depends on them.
+- **A `findBy*` on one element does not settle a sibling query** whose content comes
+  from a different async source (another query, an effect, a timer or a fetch). Wait
+  for every such value the assertion reads, in the file's `…Ready()` helper.
+- **An `act()` warning is a finding.** "not wrapped in act(...)" means a state update
+  landed after the test's last barrier. Fix the barrier; never add the warning to a
+  filter. `vite.config.ts`'s `onConsoleLog` drops that line from the run log today, so
+  the shard will not show it to you.
+- **No absolute time budget under `--coverage`.** Instrumentation multiplies every
+  executed line, so `expect(elapsed).toBeLessThan(N)` measures the instrumentation and
+  the host. Assert the work (calls, items, frames) instead.
+- **Playwright.**
+  - Use web-first assertions (`await expect(locator).toBeVisible()`), `expect.poll` for
+    backend state and `waitForResponse` for a request; never a `page.waitForTimeout`
+    barrier.
+  - `locator.isVisible({ timeout })` ignores its timeout and samples once, so never
+    branch on it.
+  - Keep the count of flaky specs at zero. CI's `retries` let a flaky spec pass, and the
+    reports' `flaky` count is where that shows up; a spec that passes only on a retry is
+    broken and gets fixed, never given more retries
+    ([e2e-gate](../../docs/ci/e2e-gate.md)).
+  - A spec cleans up only the ids it created. A global reset races every other spec
+    sharing the gateway.
+
 ### What five full runs under load found
 
 Five back-to-back `vitest run --coverage` passes on a Windows host that was also
@@ -258,6 +327,8 @@ one is a rule:
   chunk. When the element you query sits behind a dynamic import, pass an explicit
   timeout (`{ timeout: 5000 }`) **and say which lazy boundary it is waiting for** in a
   comment, so the next reader knows the wait is a chunk load and not a guess.
+  `ChatInput.lexical.test.tsx` uses `LEXICAL_READY` for the
+  `LexicalComposerInput` chunk; its caret checks start only after that editor mounts.
 - **Expensive engines built per test hit the 15s `testTimeout`.**
   `approvalOneShotDecisionRule.test.ts` constructed a new `ESLint` instance — which
   re-parses `eslint.config.js` and the whole plugin graph — inside `lint()`, for 17

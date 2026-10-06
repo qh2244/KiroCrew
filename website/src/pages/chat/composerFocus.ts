@@ -1,3 +1,5 @@
+import { isChatPageSurface } from '../../utils/channelOrigin'
+import { activeElementIsEditable } from '../../utils/editableTarget'
 import { isTouchDevice } from '../../utils/isTouchDevice'
 
 /**
@@ -40,12 +42,23 @@ import { isTouchDevice } from '../../utils/isTouchDevice'
  * attribute is invisible to assistive tech and never translated, which leaves
  * the label free to localize.
  *
+ * And it is the hook ALONE, with no element name in front of it: the composer
+ * is a `<textarea>` only on the plain-textarea path (and the chunk-load
+ * fallback); the Lexical composer every chat surface now mounts by default is
+ * a contenteditable `<div>` carrying the same hook. A `textarea[...]` selector
+ * matched nothing there, and every intent below — Alt+Enter, `/`,
+ * quote-to-compose, widget prefill, the post-create focus, search-close —
+ * silently no-op'd. Callers only ever `focus()` / `scrollIntoView()` the
+ * result, which both elements support, hence `HTMLElement`.
+ *
  * Steps 1 and 2 are `focusedPane()` below, shared with the pending-approval
  * lookup so both chords agree about which pane they are in.
  */
-export function queryComposer(): HTMLTextAreaElement | null {
+const COMPOSER_SELECTOR = '[data-composer-input]'
+
+export function queryComposer(): HTMLElement | null {
   const pane = focusedPane()
-  const scoped = pane?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
+  const scoped = pane?.querySelector<HTMLElement>(COMPOSER_SELECTOR)
   if (scoped) return scoped
   /**
    * Document-wide fallback, EXCLUDING the side chat's own composer.
@@ -69,9 +82,9 @@ export function queryComposer(): HTMLTextAreaElement | null {
    * `[data-side-chat-input]` is the marker ChatPage already uses to find that
    * composer (`handleAsk`'s mount probe), not one invented here.
    */
-  const all = document.querySelectorAll<HTMLTextAreaElement>('textarea[data-composer-input]')
-  for (const ta of all) {
-    if (!ta.closest('[data-side-chat-input]')) return ta
+  const all = document.querySelectorAll<HTMLElement>(COMPOSER_SELECTOR)
+  for (const el of all) {
+    if (!el.closest('[data-side-chat-input]')) return el
   }
   return null
 }
@@ -130,9 +143,9 @@ export function requestComposerExpand(): boolean {
  * synchronous: when the composer is already there the callback runs before this
  * returns, so neither caller loses the ordering its own comment relies on.
  */
-export function queryComposerOrExpand(then: (ta: HTMLTextAreaElement) => void): void {
-  const ta = queryComposer()
-  if (ta) { then(ta); return }
+export function queryComposerOrExpand(then: (el: HTMLElement) => void): void {
+  const el = queryComposer()
+  if (el) { then(el); return }
   if (!requestComposerExpand()) return
   requestAnimationFrame(() => {
     const revealed = queryComposer()
@@ -246,6 +259,226 @@ export function focusComposerAfter(created: Promise<unknown>): void {
 }
 
 /**
+ * The slice of the store the quick-search helpers read: which slot is active,
+ * and which `switchSlot` currently owns the claim on it (`pending` takes the
+ * claim, the owning `fulfilled` or `rejected` clears it). Structural, so the
+ * callers pass the app store (`useAppStore()`) and a test passes a stub, and so
+ * this module stays a page-level import with no dependency on the store's own
+ * types. `subscribe` is the plain Redux one: it returns the unsubscribe.
+ */
+export interface ActiveSlotStore {
+  getState(): { chat: { activeSlot: string | null; slotSwitchRequestId: string | null; slotSwitchTarget: string | null } }
+  subscribe(listener: () => void): () => void
+}
+
+/**
+ * Put the caret in the composer after a quick-search surface -- the Cmd/Ctrl+K
+ * Command Bar, or the legacy palette it falls back to -- opened a session
+ * (#15732). The outcome a sidebar click already has.
+ *
+ * Why those surfaces cannot lean on ChatInput's autoFocusKey effect the way the
+ * sidebar does: that effect fires on a slot-key TRANSITION, and declines without
+ * retrying while an editable element holds focus. A quick-search surface hits
+ * both gaps. Opening the session that is already active -- its row is one
+ * keystroke away on both surfaces, and the search path resumes it through the
+ * same async thunk -- changes nothing the effect watches, so it never runs. And
+ * a live row's `switchSlot` moves the key synchronously while the surface is
+ * still mounted with its own input focused (the Command Bar closes only once
+ * the row's promise settles), so the effect sees an editable active element,
+ * declines, and the one chance is spent.
+ *
+ * So the surface says what it means, and says it the way `useMessageSearch`
+ * does when its bar closes -- but only once `switched`, the unwrapped
+ * `switchSlot` dispatch, has FULFILLED, and only while `key` is still the
+ * active slot. The ordering is the one this file's header states for a create,
+ * read in the other direction: `switchSlot.pending` enters the target
+ * synchronously, so the composer already answers to the target's key while the
+ * gateway round trip is in flight. Focusing it then would route every
+ * keystroke typed in that window to the TARGET's draft -- and a switch can
+ * fail. A 404 unwinds the selection to the origin and evicts the gone row, and
+ * the page files the text typed meanwhile under the evicted key, where no row
+ * can ever show it again. So the caret moves only after the switch has landed:
+ * a rejected switch gets no focus from here -- the selection unwinds to the
+ * origin and the pane notice explains the dead gesture, and whatever the
+ * composer's own autofocus does with that key transition is the sidebar's rule,
+ * unchanged. The same bar is applied once
+ * more ON the frame, through `store`: a fulfilment the user has already moved
+ * past (a second gesture during the round trip) focuses nothing, matching the
+ * `switchSlot.fulfilled` reducer, which ignores a payload for a slot that is
+ * not the active one.
+ *
+ * One more case the frame has to read: two switches to the SAME key can
+ * overlap -- a second gesture during the round trip, or the chat page's own
+ * mount-time `switchSlot(activeSlot)` when the surface was used from another
+ * page. The older read may land first. The slot is active, so the check above
+ * passes, but the NEWER request owns the claim (`slotSwitchRequestId` with
+ * `slotSwitchTarget === key`) and may yet unwind the selection with a 404 of
+ * its own, so a caret placed now would route keystrokes to a slot about to be
+ * evicted. The frame therefore defers: one store subscription, released the
+ * first time the claim is no longer a pending same-key one. Cleared with the
+ * slot still active (the newer read fulfilled) -> the focus proceeds, on a
+ * fresh frame. Cleared with another slot active (the newer read 404ed and the
+ * reducer unwound) -> nothing. "Focus only while no switch is pending" would
+ * NOT do here: the mount-time duplicate has no focus helper of its own, so
+ * giving up would leave the caret nowhere on every open from another page.
+ *
+ * `store` is a store HANDLE, not a value captured at the gesture: the surface
+ * has closed and unmounted by the time the switch settles, so only the store
+ * can still answer which slot is active (the sidebar reads live values the
+ * same way, through `useStore().getState()`).
+ *
+ * The sidebar's rules carry over on purpose, all three. Touch devices are
+ * skipped (an on-screen keyboard over the transcript the user just opened), and
+ * a collapsed composer STAYS collapsed -- `queryComposer` reports it missing and
+ * no expand is requested -- because opening a session is navigation, not the
+ * typing intent `focusComposer` expands for, and the autoFocusKey effect
+ * leaves a reading preference alone for the same reason. And the caret is not
+ * taken from an editable element that holds focus ON the frame. The surfaces
+ * themselves never leave one focused: the legacy palette restores nothing
+ * after a pick (only a dismiss gives focus back), and the Command Bar's
+ * focus trap captures its own `autoFocus` input
+ * (React applies `autoFocus` in the commit, before the trap's passive effect
+ * reads `document.activeElement`), so its unmount restore reaches a detached
+ * node and focus ends on `<body>`. An editable element focused by the time the
+ * switch lands is therefore one the user chose during the round trip -- the
+ * sidebar's search box, a title editor, the bar opened again -- and a late
+ * caret must not yank them out of it.
+ *
+ * Not a one-shot for the effect to consume: in the same-key case the effect
+ * does not run at all, so a flag would need its own re-render to be read, and
+ * in the other case the surface is still open when it would run. Not a place
+ * the macOS chord policy applies either: `releaseComposerForKeyboardSwitch`
+ * keeps jump chords CHAINABLE, while a surface's Enter is the terminal pick of
+ * a selection that closes the surface, so an unfocused composer there buys the
+ * user nothing but a click.
+ *
+ * Rejection is swallowed on purpose, as `focusComposerAfter` does: the slice
+ * records the failure and raises the notice, and an unhandled rejection here
+ * would be reported as a page error.
+ */
+export function focusComposerForOpenedSession(switched: Promise<unknown>, key: string, store: ActiveSlotStore): void {
+  void switched
+    .then(() => requestAnimationFrame(() => focusOnceSwitchHasLanded(key, store)))
+    .catch(() => {})
+}
+
+/**
+ * The frame step of `focusComposerForOpenedSession`, re-entered on a fresh
+ * frame after a deferral: read the store NOW -- the last moment before the
+ * focus moves -- and act on what it says.
+ */
+function focusOnceSwitchHasLanded(key: string, store: ActiveSlotStore): void {
+  const chat = store.getState().chat
+  if (chat.activeSlot !== key) return
+  if (chat.slotSwitchRequestId !== null && chat.slotSwitchTarget === key) {
+    // A newer same-key switch owns the claim: wait for it to settle (see the
+    // helper's comment). Released on the first store write that leaves the
+    // claim no longer a pending same-key one; `unsubscribe` is safe to call
+    // from inside the listener, Redux tolerates it.
+    const unsubscribe = store.subscribe(() => {
+      const now = store.getState().chat
+      if (now.activeSlot === key && now.slotSwitchRequestId !== null && now.slotSwitchTarget === key) return
+      unsubscribe()
+      // Unwound to another slot (a 404), or the user moved on: not this gesture's
+      // caret to place.
+      if (now.activeSlot !== key) return
+      // The store changed inside a dispatch; the DOM for it commits later. A
+      // fresh frame re-reads everything, including a claim taken meanwhile.
+      requestAnimationFrame(() => focusOnceSwitchHasLanded(key, store))
+    })
+    return
+  }
+  focusComposerNow(key)
+}
+
+/** The one place both quick-search helpers put the caret: the sidebar's three
+ *  rules (touch, a field the user holds, and -- through `queryComposer` -- a
+ *  collapsed composer stays collapsed, reported missing with no expand
+ *  requested), then the composer the gesture is about.
+ *
+ *  `key` is the slot the gesture OPENED, when it opened one. It decides which
+ *  composer in split view: while a session-grid pane is mounted the page shows
+ *  N composers, each bound to its own pane's slot, and the grid's focus model
+ *  never follows `activeSlot` (see SessionGridView), so `queryComposer` would
+ *  answer with the grid-focused pane's composer -- a session the gesture did
+ *  not open, where the next Enter would send. `queryComposerForSlot` resolves
+ *  the pane bound to the opened key instead (#15937). No pane renders the
+ *  key, or the gesture named no key (the palette's dismiss fallback), and the
+ *  honest answer stays no caret: a sidebar click leaves the split before it
+ *  focuses, a quick-search open does not, and the store having switched does
+ *  not put the session on screen. Outside split view the single composer is
+ *  bound to the active slot, which the callers have already checked IS `key`. */
+export function focusComposerNow(key?: string): void {
+  if (isTouchDevice()) return
+  if (activeElementIsEditable()) return
+  queryComposerForSlot(key)?.focus()
+}
+
+/**
+ * The composer that answers to `key` on this page, or null when none provably
+ * does.
+ *
+ * No pane mounted: the single-chat surface, whose one composer is bound to the
+ * active slot -- `queryComposer`'s document-wide answer, unchanged.
+ *
+ * Panes mounted: ONLY the pane whose `data-pane-slot` names `key`. The pane
+ * names its slot in the DOM for exactly this lookup (ChatPane's root carries
+ * `data-pane-slot` beside `data-chat-pane`), because nothing else there says
+ * which session a composer sends to: `data-chat-pane="focused"` says which pane
+ * the grid considers focused, and that is a different question with a
+ * different answer. Compared as attribute bytes rather than through an
+ * attribute selector, so a slot key never has to be CSS-escaped here.
+ *
+ * A pane bound to `key` is the only acceptable answer while panes are mounted:
+ * the grid-focused pane's composer would route the user's next Enter to a
+ * session the gesture did not open, and the first pane in document order is
+ * no better. Hence null, not a fallback, when no pane renders the key -- and
+ * null for an undefined `key`, since a gesture that opened nothing has no pane
+ * to claim.
+ */
+function queryComposerForSlot(key: string | undefined): HTMLElement | null {
+  const panes = document.querySelectorAll<HTMLElement>('[data-chat-pane]')
+  if (panes.length === 0) return queryComposer()
+  if (key === undefined) return null
+  for (const pane of panes) {
+    if (pane.getAttribute('data-pane-slot') !== key) continue
+    // The same stable hook `queryComposer` probes: the pane's editable element
+    // is the Lexical root on fine-pointer devices and the textarea elsewhere.
+    return pane.querySelector<HTMLElement>(COMPOSER_SELECTOR)
+  }
+  return null
+}
+
+/**
+ * The same, once `resumed` -- an unwrapped `resumeFromHistory` dispatch -- has
+ * actually entered the session.
+ *
+ * Settling is not enough here, which is why this is not `focusComposerAfter`:
+ * the thunk FULFILS for a resume the chat page cannot display (an `ok: false`
+ * answer, or a surface outside `isChatPageSurface`), and the reducer deliberately
+ * leaves the active slot where it was in that case (#3624, #5925). Focusing
+ * then would put the caret into the session the user was LEAVING while the
+ * notice says the one they asked for did not open. The predicate is the
+ * reducer's own. A rejected resume focuses nothing, for the reason
+ * `focusComposerAfter` gives: the slice records it, and there is no new
+ * composer to focus.
+ *
+ * No still-active read here: `resumeFromHistory` moves the active slot only in
+ * its fulfilled reducer, at the moment this promise settles, so there is no
+ * provisional window for a keystroke to land in, and the slot the reducer
+ * entered IS the one the gesture named.
+ *
+ * `key` is the thunk's own payload field -- the slot the gateway resumed, which
+ * is the one the reducer entered -- and names the pane to focus in split view
+ * (#15937).
+ */
+export function focusComposerForResumedSession(resumed: Promise<{ ok: boolean; surface?: string; key: string }>): void {
+  void resumed
+    .then(result => { if (result.ok && isChatPageSurface(result.surface)) requestAnimationFrame(() => focusComposerNow(result.key)) })
+    .catch(() => {})
+}
+
+/**
  * One-shot "keyboard switch: leave the composer alone" signal.
  *
  * On macOS, letter jump chords are input-gated (Ctrl+A/E/K are Cocoa readline
@@ -282,7 +515,10 @@ const COMPOSER_RELEASE_TTL_MS = 1500
 export function releaseComposerForKeyboardSwitch(): void {
   composerReleaseArmedAt = Date.now()
   const ae = document.activeElement
-  if (ae instanceof HTMLTextAreaElement && ae.hasAttribute('data-composer-input')) ae.blur()
+  // Any element carrying the hook — the plain textarea OR the Lexical
+  // contenteditable root — not `HTMLTextAreaElement` alone, which never matched
+  // the default composer and left the chord chain dying on the first jump.
+  if (ae instanceof HTMLElement && ae.hasAttribute('data-composer-input')) ae.blur()
 }
 
 /** Consume the one-shot release. True = the autofocus effect must skip this transition. */

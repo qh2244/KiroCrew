@@ -927,12 +927,56 @@ class TestValidateFilePath:
         import kiro_crew.hooks as hooks_mod
 
         unc_home = "//roaming-server/profiles/alice/.kiro/crew"
-        monkeypatch.setattr(hooks_mod._config_paths, "data_home", lambda: Path(unc_home))
+        monkeypatch.setattr(hooks_mod._config_paths, "peek_data_home", lambda: Path(unc_home))
         self._windows(monkeypatch)
         candidate = unc_home + "/ledger/state.json"
         # The UNC gate admits it (unc_probe_allowed returns True); the value may
         # still be canonicalized downstream, but it is NOT refused by the gate.
         assert hooks_mod.unc_probe_allowed(candidate) is True
+
+    def test_root_resolution_performs_no_maintenance_io(self, monkeypatch, tmp_path):
+        """The trusted-root memo resolves WHERE the data home is without
+        creating it or refreshing the recovery breadcrumb.
+
+        ``_unc_data_home_root()`` is primed at import time, so if it delegated
+        to ``data_home()`` a first resolution would run ``config_dir()``'s
+        maintenance -- ``mkdir(parents=True)`` plus the breadcrumb write --
+        as a side effect of importing this module. It resolves through
+        ``peek_data_home()`` instead: same override predicate, no filesystem
+        writes.
+        """
+        import kiro_crew.config.paths as paths_mod
+        import kiro_crew.hooks as hooks_mod
+
+        home = tmp_path / "unmade" / ".kiro" / "crew"
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        # Fresh resolution state: nothing memoized from other tests.
+        monkeypatch.setattr(paths_mod, "_resolved_home", None)
+        monkeypatch.setattr(hooks_mod, "_unc_data_home_root_cache", None)
+
+        root = hooks_mod._unc_data_home_root()
+
+        assert root == home.resolve() or root == home
+        # The whole point: resolution did NOT create the home...
+        assert not home.exists()
+        # ...and did not run breadcrumb maintenance anywhere under tmp_path.
+        assert not list(tmp_path.rglob("*.breadcrumb"))
+
+    def test_root_memo_invalidates_on_peek_accessor_swap(self, monkeypatch):
+        """The memo key carries the identity of the accessor the root is
+        resolved through (``peek_data_home``), so a monkeypatched accessor --
+        how every test above steers the gate -- invalidates the memo instead
+        of serving a stale root past it.
+        """
+        import kiro_crew.hooks as hooks_mod
+
+        monkeypatch.setattr(hooks_mod, "_unc_data_home_root_cache", None)
+        first = hooks_mod._unc_data_home_root()
+        assert first is not None
+
+        swapped = Path("//other-server/profiles/bob/.kiro/crew")
+        monkeypatch.setattr(hooks_mod._config_paths, "peek_data_home", lambda: swapped)
+        assert hooks_mod._unc_data_home_root() == swapped
 
 
 class TestSafeReadFile:
@@ -1159,6 +1203,127 @@ class TestSafeReadFileBytesNolink:
         f = _write(tmp_path / "a.txt", "body")
         _try_hardlink(f, tmp_path / "b.txt")
         assert safe_read_file_bytes_nolink(str(f)) is None
+
+    def test_a_hardlink_is_admitted_only_by_the_callback_on_its_bytes(self, tmp_path):
+        """``admit_hardlinked`` is opt-in and judges the bytes actually read."""
+        f = _write(tmp_path / "a.txt", "body")
+        _try_hardlink(f, tmp_path / "b.txt")
+        seen: list[tuple[str, bytes]] = []
+
+        def admit(path: str, data: bytes) -> bool:
+            seen.append((path, data))
+            return data == b"body"
+
+        assert safe_read_file_bytes_nolink(str(f), admit_hardlinked=admit) == b"body"
+        assert [data for _path, data in seen] == [b"body"]
+        assert os.path.samefile(seen[0][0], f)
+        assert safe_read_file_bytes_nolink(str(f), admit_hardlinked=lambda p, d: False) is None
+
+    def test_the_callback_is_not_consulted_for_a_single_link(self, tmp_path):
+        f = _write(tmp_path / "a.txt", "body")
+        calls: list[str] = []
+        assert (
+            safe_read_file_bytes_nolink(str(f), admit_hardlinked=lambda p, d: bool(calls.append(p)))
+            == b"body"
+        )
+        assert calls == []
+
+    def test_an_admitted_hardlink_still_passes_containment(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = _write(tmp_path / "outside.txt", "out")
+        _try_hardlink(outside, tmp_path / "alias.txt")
+        assert (
+            safe_read_file_bytes_nolink(
+                str(outside), within_root=str(root), admit_hardlinked=lambda p, d: True
+            )
+            is None
+        )
+
+    def test_an_admitted_hardlink_is_never_truncated(self, tmp_path):
+        f = _write(tmp_path / "a.txt", "0123456789")
+        _try_hardlink(f, tmp_path / "b.txt")
+        with pytest.raises(FileTooLargeError):
+            safe_read_file_bytes_nolink(
+                str(f), max_bytes=4, allow_truncate=True, admit_hardlinked=lambda p, d: True
+            )
+
+    @staticmethod
+    def _kernel_names(monkeypatch, name: Path) -> None:
+        """Make the descriptor's kernel name *name*, as macOS ``F_GETPATH`` does
+        for a hardlinked inode about one read in a hundred."""
+        spelled = os.path.realpath(name)
+        monkeypatch.setattr(hooks_mod, "_fd_real_path", lambda fd: spelled)
+
+    @pytest.mark.skipif(
+        not hooks_mod.pinned_fs.supports_pinned_walk(), reason="needs the pinned witness walk"
+    )
+    def test_a_hardlink_the_kernel_names_by_its_sibling_is_still_read(self, tmp_path, monkeypatch):
+        root = tmp_path / "root"
+        root.mkdir()
+        f = _write(root / "a.txt", "body")
+        _try_hardlink(f, tmp_path / "sibling.txt")  # outside the root, like site-packages
+        self._kernel_names(monkeypatch, tmp_path / "sibling.txt")
+        admit = lambda p, d: True  # noqa: E731
+        assert safe_read_file_bytes_nolink(str(f), admit_hardlinked=admit) == b"body"
+        assert (
+            safe_read_file_bytes_nolink(str(f), within_root=str(root), admit_hardlinked=admit)
+            == b"body"
+        )
+        with pytest.raises(FileTooLargeError):
+            safe_read_file_bytes_nolink(
+                str(f), max_bytes=2, allow_truncate=True, admit_hardlinked=admit
+            )
+
+    def test_a_single_link_file_the_kernel_names_elsewhere_is_refused(self, tmp_path, monkeypatch):
+        f = _write(tmp_path / "a.txt", "body")
+        _write(tmp_path / "other.txt", "body")  # a different inode: a swap, not a link
+        self._kernel_names(monkeypatch, tmp_path / "other.txt")
+        assert safe_read_file_bytes_nolink(str(f)) is None
+
+    def test_a_hardlink_whose_sibling_is_sensitive_is_refused(self, tmp_path, monkeypatch):
+        root = tmp_path / "root"
+        root.mkdir()
+        f = _write(root / "a.txt", "body")
+        sibling = tmp_path / "secret.txt"
+        _try_hardlink(f, sibling)
+        self._kernel_names(monkeypatch, sibling)
+        flagged = os.path.realpath(sibling)
+        real_sensitive = hooks_mod.is_sensitive_path
+        monkeypatch.setattr(
+            hooks_mod, "is_sensitive_path", lambda p: p == flagged or real_sensitive(p)
+        )
+        assert (
+            safe_read_file_bytes_nolink(
+                str(f), within_root=str(root), admit_hardlinked=lambda p, d: True
+            )
+            is None
+        )
+
+    def test_a_sensitive_sibling_named_only_at_the_containment_read_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        # The kernel answers per call: the identity check can see the opened
+        # name and the containment read the sensitive sibling. The containment
+        # branch must refuse on its own.
+        root = tmp_path / "root"
+        root.mkdir()
+        f = _write(root / "a.txt", "body")
+        sibling = tmp_path / "secret.txt"
+        _try_hardlink(f, sibling)
+        answers = iter([os.path.realpath(f)])
+        flagged = os.path.realpath(sibling)
+        monkeypatch.setattr(hooks_mod, "_fd_real_path", lambda fd: next(answers, flagged))
+        real_sensitive = hooks_mod.is_sensitive_path
+        monkeypatch.setattr(
+            hooks_mod, "is_sensitive_path", lambda p: p == flagged or real_sensitive(p)
+        )
+        assert (
+            safe_read_file_bytes_nolink(
+                str(f), within_root=str(root), admit_hardlinked=lambda p, d: True
+            )
+            is None
+        )
 
     def test_non_regular_refused(self, tmp_path):
         d = tmp_path / "adir"

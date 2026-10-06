@@ -34,6 +34,8 @@ import copy
 import logging
 import threading
 
+from kiro_crew.config.fields import _coerce_bool
+
 # Top-level config.json sections a BUILTIN APP owns and reads from the file
 # directly, with no modelled field in this core. Not in _KNOWN_CONFIG_SECTIONS
 # (no dataclass parses them) and not in CONFIG_RESERVED_TOP_KEYS (they must
@@ -200,6 +202,15 @@ def _actual_type_name(value: object) -> str:
 #:   unreadable section so the loader records its degradation and the creation
 #:   guard refuses instead of treating the operator's setting as absent.
 #:
+#: * ``workspaces``: the table names WHERE the Global V1 memory workspaces
+#:   live, some possibly at absolute directories outside the data home, and the
+#:   folder-steering memory-store fence is built from it. Repairing a malformed
+#:   table to ``{}`` reads as "no workspaces configured", and a fence built
+#:   from that covers only the default directory -- so a steering root that
+#:   contains an operator's external workspace would be admitted and read.
+#:   Preserved, the loader records ``DEGRADED_WORKSPACES`` and the fence
+#:   refuses every root until the table is readable again.
+#:
 #: Exact-match only: this is a per-path judgment, not a subtree rule. The
 #: registry is only half of a fix — a preserved value changes nothing unless
 #: the loader RECORDS the degradation and a gate reads
@@ -212,6 +223,7 @@ _FAIL_CLOSED_PATHS = frozenset(
         "dashboard",
         "dashboard.tailscale",
         "memory",
+        "workspaces",
     }
 )
 
@@ -314,8 +326,9 @@ class ConfigCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (fingerprint, deep-copyable validated data dict, opaque sidecar)
-        self._entry: tuple[tuple, dict, dict] | None = None
+        # (fingerprint, deep-copyable validated data dict, opaque sidecar,
+        #  digest of the bytes that read parsed)
+        self._entry: tuple[tuple, dict, dict, str | None] | None = None
         # Monotonic invalidation token. A loader captures this before disk I/O;
         # clear() advances it so that reader cannot publish a pre-write snapshot
         # afterward even when a coarse filesystem reports the same fingerprint.
@@ -339,8 +352,8 @@ class ConfigCache:
                 return copy.deepcopy(self._entry[1])
         return None
 
-    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict] | None:
-        """Return deep copies of ``(data, sidecar)`` from ONE lock hold, else None.
+    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict, str | None] | None:
+        """Return ``(data, sidecar, content_digest)`` from ONE lock hold, else None.
 
         The sidecar carries facts about the SAME read that the merged dict cannot
         express — today, the pre-overlay base values the loader needs to round-trip
@@ -351,10 +364,23 @@ class ConfigCache:
         loader would then capture from as if no overlay existed, deleting shadowed
         base keys on the next save. There is deliberately no separate sidecar
         accessor: the lock makes the pair all-or-nothing.
+
+        ``content_digest`` is the third fact about that one read and leaves under the
+        same hold for the same reason: it says WHICH BYTES this entry was parsed
+        from, which the fingerprint cannot. A fingerprint is stat metadata, so a
+        replacement landing the same byte count can present an identical one, and a
+        caller would then pair this entry's data with a digest of different bytes.
+        ``None`` means the storing caller named none -- it did no disk read, or could
+        not read the files whole -- so a caller needing provenance must treat it as
+        unknown rather than as a match.
         """
         with self._lock:
             if self._entry is not None and self._entry[0] == fingerprint:
-                return copy.deepcopy(self._entry[1]), copy.deepcopy(self._entry[2])
+                return (
+                    copy.deepcopy(self._entry[1]),
+                    copy.deepcopy(self._entry[2]),
+                    self._entry[3],
+                )
         return None
 
     def store(
@@ -364,6 +390,7 @@ class ConfigCache:
         sidecar: dict | None = None,
         *,
         expected_generation: int | None = None,
+        content_digest: str | None = None,
     ) -> bool:
         """Cache *data* when no invalidation occurred since its disk read began.
 
@@ -374,6 +401,11 @@ class ConfigCache:
         closes that gap. ``clear()`` advances the token, and a reader holding an
         older token is refused rather than restoring stale data after the clear.
 
+        *content_digest* is the digest of the bytes this *data* was parsed from, so
+        the entry can answer which content it represents rather than only which stat
+        signature it was filed under. A caller that read no bytes has none to give
+        and passes nothing, which records the provenance as unknown.
+
         Returns whether the value was stored. Callers that do not perform disk
         I/O may omit *expected_generation* and retain the original unconditional
         cache-insertion behavior.
@@ -381,7 +413,12 @@ class ConfigCache:
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
                 return False
-            self._entry = (fingerprint, copy.deepcopy(data), copy.deepcopy(sidecar or {}))
+            self._entry = (
+                fingerprint,
+                copy.deepcopy(data),
+                copy.deepcopy(sidecar or {}),
+                content_digest,
+            )
             return True
 
     def clear(self) -> None:
@@ -468,6 +505,16 @@ def validate_config_data(data: dict) -> dict:
     agent = data.get("agent")
     if isinstance(agent, dict) and isinstance(agent.get("log_level"), str):
         agent["log_level"] = agent["log_level"].upper()
+
+    # 3b. ``auto_update`` decides whether an unattended installer runs, and its
+    # two wrong answers are not symmetric, so a type mismatch must not be
+    # "repaired" to this field's True default: a hand-edited ``"false"`` (or a
+    # ``0``) would then install on a host whose owner wrote the opposite. A
+    # recognized spelling becomes its bool here, before the type check sees it,
+    # and anything else unreadable becomes False. The loader applies the same
+    # rule (``fields._coerce_bool``) for a host without ``jsonschema``.
+    if "auto_update" in data and not isinstance(data["auto_update"], bool):
+        data["auto_update"] = _coerce_bool(data["auto_update"], False)
 
     # 3a. Resolve the STT provider and model through the loader's own degradation
     # rules before the enum check can discard them. Both fields accept values that

@@ -17,6 +17,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ReactNode } from 'react'
 import { render, screen, act, waitFor, fireEvent } from '@testing-library/react'
+import { composerRoot, setComposerValue, pressInComposer, awaitComposer } from './helpers'
 import type { RootState } from '../store'
 import { store as appStore } from '../store'
 import { Provider } from 'react-redux'
@@ -129,14 +130,14 @@ async function renderChat(opts: { subagentsRunning: boolean; turnRunning: boolea
       </QueryClientProvider>,
     )
   })
-  await waitFor(() => expect(screen.getByLabelText('Message input')).toBeTruthy())
-  return { input: screen.getByLabelText('Message input') as HTMLTextAreaElement, store }
+  await awaitComposer()
+  return { input: composerRoot(), store }
 }
 
-async function typeAndSubmit(input: HTMLTextAreaElement, text: string) {
-  fireEvent.change(input, { target: { value: text } })
+async function typeAndSubmit(_input: HTMLElement, text: string) {
+  await setComposerValue(text)
   await act(async () => {
-    fireEvent.keyDown(input, { key: 'Enter' })
+    pressInComposer('Enter')
     await Promise.resolve()
   })
 }
@@ -156,7 +157,8 @@ afterEach(() => vi.restoreAllMocks())
 describe('steer default while sub-agents run', { timeout: 20_000 }, () => {
   it('offers the split Steer button when only sub-agents are running', async () => {
     const { input } = await renderChat({ subagentsRunning: true, turnRunning: false })
-    fireEvent.change(input, { target: { value: 'act on this now' } })
+    await setComposerValue('act on this now')
+    void input
 
     const button = await waitFor(() => screen.getByTestId('busy-send-button'))
     // Label reflects the mode, so it doubles as the assertion that the default
@@ -249,8 +251,9 @@ describe('steer default while sub-agents run', { timeout: 20_000 }, () => {
   })
 })
 
-/* #10634: a native AskUserQuestion card (no ask_id, no card_id) is raised while
- * its own turn is still running and waiting on the answer. Submitting it must
+/* A native AskUserQuestion card (server-owned like every card, with a
+ * `card_id`, and marked `native` on the frame) is raised while its own
+ * turn is still running and waiting on the answer. Submitting it must
  * STEER into the live turn through the receipt-aware path (steerMutation), not
  * the plain send() that would queue behind that turn. When the turn has ended,
  * the same answer starts an ordinary next turn. */
@@ -259,6 +262,8 @@ describe('native question card (#10634) — main chat', { timeout: 20_000 }, () 
     act(() => {
       store.dispatch(setQuestionCard({
         slot: 'slot-a',
+        card_id: 'card-native',
+        native: true,
         questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
       }))
     })
@@ -300,9 +305,10 @@ describe('native question card (#10634) — main chat', { timeout: 20_000 }, () 
     expect(steerArgOf(call)).toBeFalsy()
   })
 
-  it('does NOT steer a busy non-blocking ask_question card (card_id)', async () => {
-    // A card_id card is the non-blocking ask_question card; even with the slot
-    // busy (sub-agents running) it must start a next turn, never steer.
+  it('does NOT steer a busy non-blocking ask_question card (card_id, not native)', async () => {
+    // A card_id card without the `native` mark is the non-blocking ask_question
+    // card; even with the slot busy (sub-agents running) it must start a next
+    // turn, never steer.
     const { store } = await renderChat({ subagentsRunning: true, turnRunning: false })
     act(() => {
       store.dispatch(setQuestionCard({

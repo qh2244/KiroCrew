@@ -3,11 +3,11 @@
   "raw_record_count": 387,
   "counts": {
     "smoke": 42,
-    "nightly": 166,
+    "nightly": 167,
     "native-only": 12,
     "needs-secret": 27,
     "excluded": 22,
-    "total": 269
+    "total": 270
   },
   "priorities": {
     "P0": 10,
@@ -1267,7 +1267,7 @@
       "id": "sidebar-rail-order-and-active-state",
       "feature": "sidebar",
       "title": "Rail shows Main group in registry order with one active row",
-      "user_story": "As a user, I want the rail to list Sessions, Schedule, Artifacts, then Apps/Discover/Library, then Agent Capabilities and Settings, so that navigation is predictable.",
+      "user_story": "As a user, I want the rail to list Sessions, Schedule, Artifacts, then Apps/Discover/Library, then Customize and Settings, so that navigation is predictable.",
       "start_url": "/schedule",
       "entry_path": "Load any page > inspect rail rows and active highlight",
       "preconditions": {
@@ -1579,7 +1579,7 @@
       "title": "Promote a capability tab to the rail",
       "user_story": "As a daily user of one capability tab, I want to pin it as its own rail row (up to NAV_PINNED_LIMIT), so that it is one click away instead of two.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities page header → pin control (PinSurfaceButton) on the current tab",
+      "entry_path": "Customize page header → pin control (PinSurfaceButton) on the current tab",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -1607,7 +1607,7 @@
       "id": "redirect-agents",
       "feature": "navigation",
       "title": "Redirect /agents and /mc-agents",
-      "user_story": "As a user with an old bookmark, I want /agents and /mc-agents to land on Agent Capabilities, so that deep links keep working.",
+      "user_story": "As a user with an old bookmark, I want /agents and /mc-agents to land on Customize, so that deep links keep working.",
       "start_url": "/agents",
       "entry_path": "Type /agents or /mc-agents → /capabilities",
       "preconditions": {
@@ -1980,6 +1980,39 @@
       "component": "website/src/pages/members/MembersPage.tsx"
     },
     {
+      "id": "crewmate-reply-thread",
+      "feature": "members",
+      "title": "Reply in thread on a crewmate's bubble opens the thread panel and the bubble gains a replies footer",
+      "user_story": "As a user talking to a crewmate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the crewmate's findings up the main chat.",
+      "start_url": "/settings",
+      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Settings > Developer > Crewmates > enable Reply threads on crewmate chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
+      "preconditions": {
+        "seed": "rich",
+        "members": [
+          "nova-sky"
+        ],
+        "feature_flags": [
+          "mc-preview-crew"
+        ],
+        "notes": "Threads exist only on a crewmate's chat (a member-mode slot); the fake ACP backend answers the main-chat message so a finished crewmate bubble carries the Reply in thread action, and answers the thread reply too, so the footer reads '1 reply' then '2 replies'. Replies live in the slot's .threads sidecar, never in the transcript."
+      },
+      "runnable": "nightly",
+      "estimated_steps": 8,
+      "rationale": "Hover-revealed action, a side panel opening beside the chat and a footer count under one bubble are pixel-level judgements over two model turns; the DOM tests cover the store, the renderer shape and the panel in isolation.",
+      "source": [
+        "website/src/pages/members/ThreadPanel.tsx",
+        "website/src/pages/chat/ThreadFooter.tsx",
+        "website/src/app-sdk/messageRenderers.tsx",
+        "src/kiro_crew/dashboard/chat_threads.py",
+        "docs/system-specs/modules/history.md"
+      ],
+      "priority": "P1",
+      "merged_from": [
+        "crewmate-reply-thread"
+      ],
+      "component": "website/src/pages/members/ThreadPanel.tsx"
+    },
+    {
       "id": "members-private-memory-keeps-thread",
       "feature": "members",
       "title": "A member's DM thread survives leaving and returning; it keeps its history and still answers",
@@ -2044,7 +2077,7 @@
       "title": "Crews",
       "user_story": "As an operator, I want to define named crews binding an agent, model and workspace with a custom avatar, so that I can pick the right worker per task.",
       "start_url": "/capabilities",
-      "entry_path": "Rail → Agent Capabilities → Crews tab (?tab=crews)",
+      "entry_path": "Rail → Customize → Crewmates tab (?tab=crews)",
       "preconditions": {
         "seed": "rich",
         "members": [],
@@ -2066,10 +2099,10 @@
     {
       "id": "capabilities-crews-templates-skills-tabs",
       "feature": "capabilities",
-      "title": "Navigate Agent Capabilities tabs: Crews, Agent Templates, Skills",
+      "title": "Navigate Customize tabs: Crewmates, Custom agents, Skills",
       "user_story": "As a user, I want to manage crews, agent templates, and skills in one panel, so that agent configuration is centralized.",
       "start_url": "/capabilities",
-      "entry_path": "Rail > Agent Capabilities (bottom group) > tabs Crews | Agent Templates | Skills; /agents and /mc-agents redirect here",
+      "entry_path": "Rail > Customize (bottom group) > tabs Crewmates | Custom agents | Skills; /agents and /mc-agents redirect here",
       "preconditions": {
         "seed": "skills-custom",
         "members": [],
@@ -2098,7 +2131,7 @@
       "title": "Agent templates inside a crew's Template pane",
       "user_story": "As an operator, I want to inspect the harness-level agent definitions crews bind to, so that I understand what a crew actually runs.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Crews tab → open a crew → Template pane (the standalone Agent Templates tab no longer exists)",
+      "entry_path": "Customize → Crewmates tab → open a crewmate → Template pane (the shared definitions live on the Custom agents tab)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -2123,7 +2156,7 @@
       "title": "Crew appearance library",
       "user_story": "As an operator, I want a Library tab of appearance packs a crew can wear, with import and guarded delete, so that crews look distinct.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Crews → a crew → Edit avatar → Library",
+      "entry_path": "Customize → Crewmates → a crewmate → Edit avatar → Library",
       "preconditions": {
         "seed": "rich",
         "members": [],
@@ -2148,7 +2181,7 @@
       "title": "Hooks",
       "user_story": "As an operator, I want event-triggered agent runs, so that routine reactions happen without me.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Hooks tab (?tab=hooks)",
+      "entry_path": "Customize → Hooks tab (?tab=hooks)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -2173,7 +2206,7 @@
       "title": "Prompts",
       "user_story": "As a user, I want reusable prompt entries from the registry, so that common requests are one pick away.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Prompts tab (?tab=prompts)",
+      "entry_path": "Customize → Prompts tab (?tab=prompts)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -2198,7 +2231,7 @@
       "title": "Navigate Prompts, Steering, Hooks, and Workflows tabs",
       "user_story": "As a user, I want to edit prompts, steering files, hooks, and saved workflows, so that I can shape agent behavior and automation.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities > tabs Prompts | Steering files | Hooks | Workflows (/hooks also standalone route)",
+      "entry_path": "Customize > tabs Prompts | Steering files | Hooks | Workflows (/hooks also standalone route)",
       "preconditions": {
         "seed": "skills-custom",
         "members": [],
@@ -2227,7 +2260,7 @@
       "title": "Skills",
       "user_story": "As an operator, I want to see installed skills, browse the public registry and review pending candidates, so that I can curate agent know-how.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Skills tab (?tab=skills)",
+      "entry_path": "Customize → Skills tab (?tab=skills)",
       "preconditions": {
         "seed": "skills-custom",
         "members": [],
@@ -2252,7 +2285,7 @@
       "title": "Steering",
       "user_story": "As an operator, I want to manage always-injected steering documents, so that every agent turn follows house rules.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Steering tab (?tab=steering)",
+      "entry_path": "Customize → Steering tab (?tab=steering)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -2277,7 +2310,7 @@
       "title": "Workflows",
       "user_story": "As a user, I want saved dynamic-workflow definitions and their runs in one library, so that I can rerun orchestrations.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Workflows tab (?tab=workflows)",
+      "entry_path": "Customize → Workflows tab (?tab=workflows)",
       "preconditions": {
         "seed": "rich",
         "members": [],
@@ -2302,7 +2335,7 @@
       "title": "Steering tab lists global and workspace steering docs with their declared inclusion mode and lets me edit it",
       "user_story": "As an author, I want to see each steering document's inclusion mode (and typos resolved as always), so that I understand what loads into every session.",
       "start_url": "/capabilities",
-      "entry_path": "Open Capabilities and pick the Steering tab. Agent Capabilities > Steering tab > document > inclusion",
+      "entry_path": "Open Capabilities and pick the Steering tab. Customize > Steering tab > document > inclusion",
       "preconditions": {
         "seed": "minimal",
         "members": [
@@ -2360,7 +2393,7 @@
       "title": "Skills tab splits live skills from a pending crystallized candidate and lets me approve or dismiss it",
       "user_story": "As a user, I want to review an auto-generated skill before it goes live, so that only skills I trust are injected.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities > Skills tab > Pending section",
+      "entry_path": "Customize > Skills tab > Pending section",
       "preconditions": {
         "seed": "skills-custom",
         "members": [
@@ -2413,7 +2446,7 @@
       "title": "Connections",
       "user_story": "As an operator, I want to install, enable and scope MCP servers, so that agents get exactly the tools they need.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities → Connections tab (?tab=mcp)",
+      "entry_path": "Customize → Connections tab (?tab=mcp)",
       "preconditions": {
         "seed": "connections-two",
         "members": [
@@ -2449,7 +2482,7 @@
       "title": "Connect a third-party service from the Services gallery",
       "user_story": "As a user, I want to sign in to GitHub, Notion, or similar, so that the agent can use those services.",
       "start_url": "/capabilities",
-      "entry_path": "Agent Capabilities > Connections > Services gallery > provider card > Connect (OAuth relay)",
+      "entry_path": "Customize > Connections > Services gallery > provider card > Connect (OAuth relay)",
       "preconditions": {
         "seed": "connections-two",
         "members": [],
@@ -2634,7 +2667,7 @@
       "title": "Add a folder source pointing at the seeded workspace memory and scan it",
       "user_story": "As a user, I want to register a local folder and see per-source counts after a scan, so that its markdown becomes searchable.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Agent Capabilities > Knowledge > Add source > Folder > path > Scan",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Customize > Knowledge > Add source > Folder > path > Scan",
       "preconditions": {
         "seed": "memory-populated",
         "members": [
@@ -2662,7 +2695,7 @@
       "title": "Knowledge",
       "user_story": "As a user, I want a document library with sources and items I can open, so that agents can search what my team knows.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Rail > Agent Capabilities > Knowledge tab (?tab=knowledge; /knowledge redirects here) > SourcesList > ItemCard > DetailView",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Rail > Customize > Knowledge tab (?tab=knowledge; /knowledge redirects here) > SourcesList > ItemCard > DetailView",
       "preconditions": {
         "seed": "memory-populated",
         "members": [],
@@ -2694,7 +2727,7 @@
       "title": "Switch Knowledge to the graph view",
       "user_story": "As a user, I want a graph of knowledge relations, so that I can see how documents connect.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Agent Capabilities > Knowledge > graph view toggle (KnowledgeGraph.tsx)",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Customize > Knowledge > graph view toggle (KnowledgeGraph.tsx)",
       "preconditions": {
         "seed": "memory-populated",
         "members": [],
@@ -2720,7 +2753,7 @@
       "title": "Knowledge tab shows an empty library with add-source affordances",
       "user_story": "As a new user, I want the Knowledge tab to show no sources and how to add one, so that I know where to start.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Sidebar > Agent Capabilities > Knowledge tab",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Sidebar > Customize > Knowledge tab",
       "preconditions": {
         "seed": "empty",
         "members": [
@@ -2749,7 +2782,7 @@
       "title": "Review knowledge settings and embedding status",
       "user_story": "As a user, I want to see embedding progress and knowledge settings, so that I know search is ready.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Agent Capabilities > Knowledge > Settings tab > EmbeddingStatus",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Customize > Knowledge > Settings tab > EmbeddingStatus",
       "preconditions": {
         "seed": "memory-populated",
         "members": [],
@@ -2775,7 +2808,7 @@
       "title": "Upload a document into the knowledge library",
       "user_story": "As a user, I want to upload a PDF or markdown file, so that its content is searchable by the agent.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Agent Capabilities > Knowledge > Upload",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Customize > Knowledge > Upload",
       "preconditions": {
         "seed": "empty",
         "members": [
@@ -2803,7 +2836,7 @@
       "title": "Add a URL source that is fetched and ingested",
       "user_story": "As a user, I want to paste a URL and have its page ingested, so that web docs join my library.",
       "start_url": "/knowledge",
-      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Agent Capabilities > Knowledge > Add source > URL",
+      "entry_path": "Open /knowledge (redirects to the Knowledge tab of Capabilities). Customize > Knowledge > Add source > URL",
       "preconditions": {
         "seed": "empty",
         "members": [
@@ -4419,7 +4452,7 @@
       "title": "Settings › Channels",
       "user_story": "As a team lead, I want to configure Slack, Discord, Telegram, WhatsApp, Teams and more, so that the crew reaches my team where they are.",
       "start_url": "/settings/channels",
-      "entry_path": "Settings → Channels → provider panel",
+      "entry_path": "Settings → Messaging Channels → provider panel",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4502,7 +4535,7 @@
       "title": "Edit allowed user IDs and context thresholds for a bot channel",
       "user_story": "As an operator, I want to set Allowed user IDs and Soft context threshold for Telegram, so that only I can message the bot and compaction is suggested in time.",
       "start_url": "/settings/channels/telegram",
-      "entry_path": "Settings > Channels > Telegram > Allowed user IDs > Soft context threshold % > Save",
+      "entry_path": "Settings > Messaging Channels > Telegram > Allowed user IDs > Soft context threshold % > Save",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4529,7 +4562,7 @@
       "title": "Enable File sessions in a folder for a bot channel (Discord/Telegram)",
       "user_story": "As an operator, I want channel sessions filed into a named sidebar folder, so that Discord or Telegram chats stay grouped.",
       "start_url": "/settings/channels/discord",
-      "entry_path": "Settings > Channels > Discord > File sessions in a folder toggle > Folder name input > Save",
+      "entry_path": "Settings > Messaging Channels > Discord > File sessions in a folder toggle > Folder name input > Save",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4556,7 +4589,7 @@
       "title": "See a channel disabled by governance policy",
       "user_story": "As a governed user, I want to see 'Off by admin' on a channel denied by policy, so that I understand why I cannot edit its config.",
       "start_url": "/settings/channels/slack",
-      "entry_path": "Settings > Channels > select a channel whose governance policy is false > ChannelDisabledPanel shown",
+      "entry_path": "Settings > Messaging Channels > select a channel whose governance policy is false > ChannelDisabledPanel shown",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4582,7 +4615,7 @@
       "title": "Toggle Slack Show thinking without a live connection",
       "user_story": "As an operator, I want to toggle Show thinking for Slack, so that reasoning is or is not posted as a thread reply.",
       "start_url": "/settings/channels/slack",
-      "entry_path": "Settings > Channels > Slack > Show thinking toggle",
+      "entry_path": "Settings > Messaging Channels > Slack > Show thinking toggle",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4633,7 +4666,7 @@
       "title": "Connect Slack in the Slack channel panel",
       "user_story": "As an operator, I want to connect a Slack workspace, so that the bot can DM me.",
       "start_url": "/settings/channels/slack",
-      "entry_path": "Settings > Channels > Slack > enter tokens > Connect",
+      "entry_path": "Settings > Messaging Channels > Slack > enter tokens > Connect",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4662,7 +4695,7 @@
       "title": "Configure Feishu / WeCom channels",
       "user_story": "As an operator, I want to configure Feishu or WeCom credentials and allowlists, so that colleagues on those platforms can use the agent.",
       "start_url": "/settings/channels/feishu",
-      "entry_path": "Settings > Channels > Feishu (or WeCom) > credentials > Save",
+      "entry_path": "Settings > Messaging Channels > Feishu (or WeCom) > credentials > Save",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4689,7 +4722,7 @@
       "title": "Configure iMessage channel (enable, allowed handles, service, DB path)",
       "user_story": "As a Mac user, I want to enable the iMessage channel and allow my handle, so that I can message the agent from my phone.",
       "start_url": "/settings/channels/imessage",
-      "entry_path": "Settings > Channels > iMessage > Enable > Allowed handles > Send replies over > Messages database path",
+      "entry_path": "Settings > Messaging Channels > iMessage > Enable > Allowed handles > Send replies over > Messages database path",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4715,7 +4748,7 @@
       "title": "Configure Microsoft Teams channel (App ID, password, tenant, allowed users)",
       "user_story": "As an operator, I want to enter Azure Bot App ID, client secret and allowed users, so that Teams users can DM the agent.",
       "start_url": "/settings/channels/teams",
-      "entry_path": "Settings > Channels > Microsoft Teams > Enable > App ID > App password > Allowed users > Save",
+      "entry_path": "Settings > Messaging Channels > Microsoft Teams > Enable > App ID > App password > Allowed users > Save",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4741,7 +4774,7 @@
       "title": "Configure Webex channel (token, allowed emails, group spaces, thread reply)",
       "user_story": "As an operator, I want to set the Webex bot token, allowed emails and group-space options, so that the bot answers only approved people.",
       "start_url": "/settings/channels/webex",
-      "entry_path": "Settings > Channels > Webex > Enable > token > Allowed emails > Answer in group spaces > Save",
+      "entry_path": "Settings > Messaging Channels > Webex > Enable > token > Allowed emails > Answer in group spaces > Save",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4767,7 +4800,7 @@
       "title": "Configure WeChat (Weixin) channel",
       "user_story": "As an operator, I want to enable the WeChat channel and set who can message the bot, so that only allowed WeChat users reach the agent.",
       "start_url": "/settings/channels/weixin",
-      "entry_path": "Settings > Channels > WeChat > Enable > Who can message the bot > Allowed user IDs > Folder",
+      "entry_path": "Settings > Messaging Channels > WeChat > Enable > Who can message the bot > Allowed user IDs > Folder",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -4793,7 +4826,7 @@
       "title": "Configure WhatsApp channel (enable, who can message, how the agent joins in)",
       "user_story": "As an operator, I want to enable WhatsApp and choose who can message and when the agent speaks, so that group chats are handled safely.",
       "start_url": "/settings/channels/whatsapp",
-      "entry_path": "Settings > Channels > WhatsApp > Enable > Who can message > How the agent joins in > Seconds between unprompted replies",
+      "entry_path": "Settings > Messaging Channels > WhatsApp > Enable > Who can message > How the agent joins in > Seconds between unprompted replies",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -5184,8 +5217,8 @@
     {
       "id": "shell-instances-tab-bar-switching",
       "feature": "instances",
-      "title": "Switch between Local and remote instance panes",
-      "user_story": "As an operator, I want a header tab strip to switch instances, so that remote dashboards are one click away.",
+      "title": "Switch between Local and remote crew panes",
+      "user_story": "As an operator, I want a header tab strip to switch crews, so that remote dashboards are one click away.",
       "start_url": "/chat",
       "entry_path": "Topbar InstanceTabBar (renders only with >=1 remote) > click tab or Cmd/Ctrl+2 > InstancesViewport shows embedded pane",
       "preconditions": {
@@ -5211,10 +5244,10 @@
     {
       "id": "settings-instances",
       "feature": "remote-instances",
-      "title": "Settings › Instances",
+      "title": "Settings › Remote Crew",
       "user_story": "As an operator, I want to register remote Kiro Crew instances and see provisioning lanes, so that I can switch crews from the header.",
       "start_url": "/settings/instances",
-      "entry_path": "Settings → Instances (/instances redirects)",
+      "entry_path": "Settings → Remote Crew (/instances redirects)",
       "preconditions": {
         "seed": "multi-workspace",
         "members": [],
@@ -5271,10 +5304,10 @@
     {
       "id": "settings-instances-remote-crew",
       "feature": "remote-instances",
-      "title": "Add a remote instance and switch panes via the header tab strip",
-      "user_story": "As an operator with several machines, I want to register remote instances and switch between them, so that I manage all crews from one window.",
+      "title": "Add a remote crew and switch panes via the header tab strip",
+      "user_story": "As an operator with several machines, I want to register remote crews and switch between them, so that I manage all crews from one window.",
       "start_url": "/settings/instances",
-      "entry_path": "Settings > Remote Instances (/instances redirects) > InstanceFormFields > save > InstanceTabBar in topbar (Cmd/Ctrl+1..9)",
+      "entry_path": "Settings > Remote Crew (/instances redirects) > InstanceFormFields > save > InstanceTabBar in topbar (Cmd/Ctrl+1..9)",
       "preconditions": {
         "seed": "multi-workspace",
         "members": [],
@@ -5304,7 +5337,7 @@
       "title": "Cloud launch",
       "user_story": "As an operator, I want to provision a remote Kiro Crew instance (EC2 by default) through a lane selector, so that I can run crews in the cloud.",
       "start_url": "/settings/instances",
-      "entry_path": "Settings → Remote Instances → Set up a new one",
+      "entry_path": "Settings → Remote Crew → Set up a new one",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -6033,7 +6066,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Webhooks tab only with mc-preview-webhooks=1; Instances tab hidden in embedded pane; About gets a dot when an update is available."
+        "notes": "Webhooks tab only with mc-preview-webhooks=1; Remote Crew tab hidden in embedded pane; About gets a dot when an update is available."
       },
       "runnable": "smoke",
       "estimated_steps": 3,
@@ -6133,19 +6166,19 @@
     {
       "id": "settings-about-update-channel-and-notifications",
       "feature": "settings",
-      "title": "Switch update channel and toggle update notifications",
-      "user_story": "As a user, I want to choose stable or insider Update channel and toggle Notify when an update is available, so that I control how I receive updates.",
+      "title": "Switch update channel and set automatic updates",
+      "user_story": "As a user, I want to choose stable or insider Update channel and set Update the gateway automatically, which installs updates and restarts where this install can and only notifies where it cannot, so that I control how I receive updates.",
       "start_url": "/settings/about",
-      "entry_path": "Settings > About > Update channel button group > Notify when an update is available toggle > Auto-update on restart toggle",
+      "entry_path": "Settings > About > Update channel button group > Update the gateway automatically toggle (disabled, with a note under it, where the gateway cannot install) > Install app updates automatically toggle (desktop app)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "configKey auto_update; Auto-update on restart relies on the Electron updater."
+        "notes": "configKey auto_update for the Update the gateway automatically switch; Install app updates automatically is the Electron updater's own switch."
       },
       "runnable": "nightly",
       "estimated_steps": 4,
-      "rationale": "Channel/notify toggles persist in web; auto-update-on-restart effect is Electron-only but the control is degradable.",
+      "rationale": "Channel and gateway auto-update toggles persist in web; the app auto-install switch is Electron-only but the control is degradable.",
       "source": [
         "website/src/pages/settings/AboutPanel.tsx",
         "website/src/components/commandPalette/settingsRegistry.gen.ts"
@@ -6410,8 +6443,8 @@
     {
       "id": "settings-display-terminal-settings",
       "feature": "settings",
-      "title": "Configure built-in terminal (shell, font, size, completion)",
-      "user_story": "As a developer, I want to set the terminal shell, font, font size and command completion in Settings > Display, so that the built-in terminal matches my workflow.",
+      "title": "Configure built-in terminal (shell, font, size, completion, reuse-current)",
+      "user_story": "As a developer, I want to set the terminal shell, font, font size, command completion, and reuse-current-terminal in Settings > Display, so that the built-in terminal matches my workflow.",
       "start_url": "/settings/display",
       "entry_path": "Settings > Display > Terminal section",
       "preconditions": {
@@ -7349,17 +7382,15 @@
     {
       "id": "developer-agent-backend",
       "feature": "developer",
-      "title": "Developer › Agent backend",
+      "title": "Settings › Agent Harness",
       "user_story": "As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness.",
-      "start_url": "/developer",
-      "entry_path": "Developer → agent-backend tab (?tab=agent-backend)",
+      "start_url": "/settings/agent",
+      "entry_path": "Settings → Agent Harness (/settings/agent)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
-        "notes": "Shows the fake ACP backend in the nightly harness. The panel is a LIST of harnesses and a DETAIL for the highlighted one. Clicking a row only changes which detail is shown and is READ-ONLY and safe -- it is the intended way to read a harness. Do NOT click **Use <name>**: that is the switch, and changing the binding restarts sessions and detaches the harness's fake ACP backend. **Check again** is safe to press but it clears this gateway's cached resolution for that one harness, so prefer not to. The capability list is already open (it needs no disclosure now that one card renders at a time); only the operator notes are behind one, and opening that is read-only."
+        "feature_flags": [],
+        "notes": "Shows the fake ACP backend in the nightly harness. The panel lives in ordinary Settings (no Developer Mode needed) and is one RADIO GROUP of harness rows with the DETAIL of the checked row under it, laid out like first-run setup's picker. Checking a row only changes which detail is shown and is READ-ONLY and safe -- it is the intended way to read a harness. Do NOT click **Use <name>**: that is the switch, and changing the binding restarts sessions and detaches the harness's fake ACP backend. **Check again** is safe to press but it clears this gateway's cached resolution for that one harness, so prefer not to. The capability list is already open (it needs no disclosure now that one card renders at a time); only the operator notes are behind one, and opening that is read-only."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
@@ -7368,7 +7399,7 @@
         "docs/feature-map/README.md",
         "website/src/pages/developer/AgentBackendTab.tsx",
         "src/kiro_crew/agent_sdk/backend_cards.py",
-        "website/src/pages/DeveloperPage.tsx",
+        "website/src/pages/SettingsPage.tsx",
         "src/kiro_crew/agent_sdk/backend_install.py"
       ],
       "priority": "P2",

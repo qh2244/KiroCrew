@@ -3,10 +3,19 @@
 > Status: implemented and wired to the KAS relay. The auth subsystem lives under
 > `src/kiro_crew/auth/` with unit tests. Its runtime consumer is
 > `src/kiro_crew/acp/kas_host_auth.py`: when the vault holds an identity, the KAS
-> backend spawns `kiro-cli acp --agent-engine v3` WITHOUT `--auth-method cli`, so the
-> engine's `_kiro/auth/getAccessToken` request reaches Kiro Crew, and `AcpRuntime`
-> answers it from `KasAuthProvider.get_access_token_callback()`. With no identity
-> stored the spawn keeps `--auth-method cli` and kiro-cli owns login exactly as
+> backend spawns the relay in `acp --agent-engine v3` mode WITHOUT `--auth-method
+> cli`, so the engine's `_kiro/auth/getAccessToken` request reaches Kiro Crew, and
+> `AcpRuntime` answers it from `KasAuthProvider.get_access_token_callback()`. That
+> spawn enters through `kiro-cli-chat` when one sits beside the resolved `kiro-cli`
+> (`kiro_cli.chat_sibling`, consulted by `acp/harness/kas.py` on the Crew-owned
+> branch only, never for an explicit `KIROCREW_KIRO_BIN`, never on Windows whose one
+> `kiro-cli.exe` is the chat-cli crate itself): the POSIX `kiro-cli` is the q_cli launcher, and it checks its OWN
+> sign-in before exec'ing `kiro-cli-chat` for `acp` regardless of `--auth-method`, so
+> through it a Crew-owned spawn on a host where kiro-cli is signed out -- the host
+> this mode exists for -- exits `You are not logged in` before the engine ever asks
+> Crew (measured on kiro-cli 2.25.0; `kiro-cli-chat acp --agent-engine v3` starts KAS
+> in `--auth=acp-callback` and the turn completes). With no identity stored the spawn
+> keeps `--auth-method cli` through the launcher and kiro-cli owns login exactly as
 > before. kiro-cli remains the ACP service either way; Crew never spawns the KAS
 > bundle itself.
 
@@ -324,7 +333,7 @@ access token.
   Kiro Crew"`, the engine does not wedge — `initialize` and `session/new` still
   complete, it re-asks on each attempt, and `session/prompt` fails `-32000` with its
   own "not signed in … Please sign in and retry" (`ModelRegistryUnauthenticatedError`
-  / `TokenExpiredError`), which `acp/client.py`'s auth-failure vocabulary now
+  / `TokenExpiredError`), which `acp/transport_errors.py`'s auth-failure vocabulary now
   recognizes so the dashboard renders the sign-in prompt rather than a raw error.
 - A Crew sign-out deletes the vault entry under the identity's refresh lock and
   retires running identity-store processes (`dashboard/handlers/kas_login.py`), so
@@ -346,29 +355,34 @@ access token.
   gap to close but a behaviour deliberately not built (see #9772); the
   pre-existing "expired access token with no refresh token" case, which the probe
   already treats as no usable identity, is left as it is and not extended.
-- The product entry point for the flow is the **Kiro sign-in card** on Developer >
-  Agent Backend (`website/src/pages/developer/KiroSignInCard.tsx`), rendered by
-  `AgentBackendTab` under the backend switch and only while KAS is a backend that
-  switch offers -- the stored identity is consumed by the KAS relay alone, so a
-  build or policy that cannot select KAS has nothing to sign in for. The card
-  embeds the same views `KasLoginGate` renders (`KasLoginEmbedded`, card chrome
-  instead of the scrim + aside door) and adds a signed-in summary (provider,
+- The product entry point for the flow is the **Kiro sign-in** section on Settings >
+  Agent Harness (`website/src/pages/developer/KiroSignInCard.tsx`, `compact`
+  form), rendered by `AgentBackendTab` INSIDE the KAS row's detail and only while
+  KAS is a backend that switch offers -- the stored identity is consumed by the
+  KAS relay alone, so a build or policy that cannot select KAS has nothing to
+  sign in for, and a row that is not KAS has no use for it. The section embeds
+  the same views `KasLoginGate` renders (`KasLoginEmbedded`, card chrome instead
+  of the scrim + aside door; in that chrome the four provider choices are
+  outlined and sit in a two-column grid, none accent-filled, because the detail's
+  own primary button is "Use this agent") and adds a signed-in summary (provider,
   expiry, renewability -- never a token) with sign-out and sign-in-again. It is
   reachable from the chat error row an `AcpAuthRequired` turn produces
   (`chat_utils.AUTH_REQUIRED_KIND` → "Sign in to Kiro", navigating to
-  `KIRO_SIGN_IN_PATH` = `/developer?tab=agent-backend&highlight=key:kiro-sign-in`
+  `KIRO_SIGN_IN_PATH` = `/settings/agent?highlight=key:kiro-sign-in`
   with the colon percent-encoded, from `pages/developer/kiroSignInLink.ts`,
-  whose `highlight` rings the card through `useSettingHighlight`, which the
-  Developer page mounts for exactly this link) and from the KAS remedy
+  whose `highlight` rings the card through the `useSettingHighlight` hook
+  SettingsPage mounts; the card's older home, `/developer?tab=agent-backend`,
+  is forwarded there by DeveloperPage with the `highlight` kept) and from the KAS remedy
   strings in `agent_sdk/host_auth.py`. Its intro sentence names the backend
   ("Used only by the KAS (kiro-agent) backend") and says Kiro CLI keeps its own
   kiro-cli login, because the card sits under a switch that also lists Kiro
   CLI. It is deliberately NOT on Settings > Overview and not indexed into
-  Settings search: KAS is a Developer Mode preview, and a provider chooser on
-  the landing page read as a required step to every user, first-run installs
-  included. Overview carries only a one-line signpost to the card
-  (`KiroSignInMovedPointer`), rendered while `agent.acp_backend` is `kas`, for
-  the users who read token expiry there. The `/developer` route is always mounted;
-  only its sidebar entry is behind Developer Mode, which a user running KAS
-  turned on to select it. `KasLoginGate` itself is still not mounted at the app
+  Settings search: a provider chooser on the landing page read as a required
+  step to every user, first-run installs included. Overview carries only a
+  one-line signpost to the card (`KiroSignInMovedPointer`), rendered while
+  `agent.acp_backend` is `kas`, for the users who read token expiry there. The
+  switch and card moved from the Developer page (whose sidebar entry is behind
+  Developer Mode) to Settings once first-run setup began offering agents other
+  than Kiro CLI, so a user who set up with one of those can switch agents later
+  without turning on Developer Mode. `KasLoginGate` itself is still not mounted at the app
   root; the full-screen form stays available for that.

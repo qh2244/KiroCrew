@@ -15,7 +15,7 @@
  */
 import { memo, useId } from 'react'
 import { Workflow, CheckCircle2, AlertCircle, ChevronDown } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import { useAppDispatch } from '../../store'
 import { openActivityToTab } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
@@ -112,7 +112,7 @@ const WorkflowCompletionCard = memo(function WorkflowCompletionCard({
       <div className="flex items-center gap-2 px-3 py-2">
         <span className="shrink-0">
           {ok ? (
-            <CheckCircle2 size={15} className="text-green-500" />
+            <CheckCircle2 size={15} className="text-ok" />
           ) : (
             <AlertCircle size={15} className="text-danger" />
           )}
@@ -122,7 +122,7 @@ const WorkflowCompletionCard = memo(function WorkflowCompletionCard({
         <span
           className={`shrink-0 text-[10px] leading-4 px-1.5 py-0.5 rounded border ${
             ok
-              ? 'bg-green-500/10 border-green-500/20 text-green-500'
+              ? 'bg-ok/10 border-ok/20 text-ok'
               : 'bg-danger/10 border-danger/20 text-danger'
           }`}
         >
@@ -137,7 +137,7 @@ const WorkflowCompletionCard = memo(function WorkflowCompletionCard({
             aria-label={i18nT('pages.chat.workflowCompletionCard.open_in_the_workflows_panel')}
             className="pi-morph flex items-center gap-1 text-[11px] leading-4 text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-accent/10 transition-colors"
           >
-            <PanelRightSolid size={13} />
+            <SidePanelGlyph size={13} />
             <span className="hidden sm:inline">{i18nT('pages.chat.workflowCompletionCard.panel')}</span>
           </button>
           {body && (

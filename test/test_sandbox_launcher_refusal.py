@@ -21,13 +21,25 @@ import pytest
 
 from kiro_crew import sandbox as sb
 
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    The refusal lines read out of the launcher do not depend on that answer, and a
+    real ssh spawned from the test process is a host dependency this module is not
+    about. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sb, "_ssh_supports_accept_new", lambda: True)
+
+
 #: The exact line a container under its runtime's default AppArmor profile
 #: produces: both unshares succeed, the launcher's first mount is refused.
 _MOUNT_REFUSED = (
     "sandbox: BLOCKED -- making mount propagation private on / failed: errno 13 "
     "(Permission denied). The sandbox could not establish this control, so the "
-    "agent would run with the path visible. Lower sandbox_level to run without it "
-    "deliberately."
+    "agent would run with the path visible. Lower agent.sandbox "
+    "to run without this control deliberately."
 )
 
 
@@ -372,7 +384,7 @@ class TestClassifierMatchesTheLauncher:
         rendered = (
             "sandbox: BLOCKED -- %s failed: errno %d (%s). The sandbox could not "
             "establish this control, so the agent would run with the path "
-            "visible. Lower sandbox_level to run without it deliberately."
+            "visible. Lower agent.sandbox to run without this control deliberately."
         ) % ("making mount propagation private on /", errno.EACCES, "Permission denied")
         assert "_mount_or_die" in sb._build_launcher_script("strict")
         assert sb.launcher_refusal(rendered) == ("no_backend", rendered, sb.REMEDY_MOUNT_DENIED)

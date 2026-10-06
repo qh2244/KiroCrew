@@ -23,6 +23,7 @@ import { render, screen, fireEvent, waitFor, act, within } from '@testing-librar
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { PierreEditorHandle } from '../pierre'
+import { evictDocumentBodies } from '../hooks/usePanelTabs'
 
 // ── CSS Custom Highlight API stub (must precede the dynamic import) ──────────
 const highlightRegistry = new Map<string, Range[]>()
@@ -83,8 +84,16 @@ interface FetchOpts {
   knowledgeEnabled?: boolean
   knowledgeAdded?: boolean
   knowledgePostStatus?: number
+  knowledgeSourceType?: string
+  /** Explicit multi-source list for the GET; overrides knowledgeAdded/Type. */
+  knowledgeSources?: { id: number; source_type: string }[]
+  /** When false, the sources GET resolves non-ok (HTTP 500). */
+  knowledgeSourcesOk?: boolean
+  knowledgeDeleteStatus?: number
   fileReadOk?: boolean
   fileReadText?: string
+  /** Hold the /api/file-read answer until the returned release is called. */
+  fileReadHold?: { release: () => void }
   fileReadTruncated?: boolean
   downloadOk?: boolean
   downloadThrows?: boolean
@@ -102,7 +111,18 @@ function installFetch() {
         const status = fetchOpts.knowledgePostStatus ?? 201
         return { ok: status < 400, status, json: async () => (status >= 400 ? { error: 'library refused' } : { id: 1 }) }
       }
-      return { ok: true, json: async () => (fetchOpts.knowledgeAdded ? [{ id: 1 }] : []) }
+      if (init?.method === 'DELETE') {
+        const status = fetchOpts.knowledgeDeleteStatus ?? 200
+        return { ok: status < 400, status, json: async () => (status >= 400 ? { error: 'library refused the removal' } : {}) }
+      }
+      const type = fetchOpts.knowledgeSourceType ?? 'local_file'
+      if (fetchOpts.knowledgeSourcesOk === false) {
+        return { ok: false, status: 500, json: async () => ({ error: 'sources read failed' }) }
+      }
+      if (fetchOpts.knowledgeSources) {
+        return { ok: true, json: async () => fetchOpts.knowledgeSources }
+      }
+      return { ok: true, json: async () => (fetchOpts.knowledgeAdded ? [{ id: 1, source_type: type }] : []) }
     }
     if (url.startsWith('/api/file-download')) {
       if (fetchOpts.downloadThrows) throw new Error('network down')
@@ -110,6 +130,9 @@ function installFetch() {
       return { ok: true, blob: async () => new Blob(['bytes']) }
     }
     // /api/file-read
+    if (fetchOpts.fileReadHold) {
+      await new Promise<void>(r => { fetchOpts.fileReadHold!.release = r })
+    }
     const ok = fetchOpts.fileReadOk !== false
     return {
       ok,
@@ -374,6 +397,23 @@ describe('MarkdownPanel — refresh', () => {
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('reloaded from disk'))
   })
 
+  it('discards a re-read that straddled a document-body purge (redaction switch flipped)', async () => {
+    // The read starts while the owner's switch is off (raw bytes), the switch
+    // flips before it lands: the result is stale under the pass now in force and
+    // must not be applied to the tab.
+    const onContentChange = vi.fn()
+    fetchOpts.fileReadText = 'AKIA-raw-while-off'
+    fetchOpts.fileReadHold = { release: () => {} }
+    mountPanel({ onContentChange })
+    openPanelMenu()
+    fireEvent.click(screen.getByText('Refresh'))
+    await waitFor(() => expect(fetchOpts.fileReadHold!.release).not.toBeUndefined())
+    act(() => { evictDocumentBodies() })
+    await act(async () => { fetchOpts.fileReadHold!.release() })
+    await new Promise(r => setTimeout(r, 20))
+    expect(onContentChange).not.toHaveBeenCalledWith('AKIA-raw-while-off')
+  })
+
   it('disables Refresh while the buffer is dirty so edits cannot be clobbered', () => {
     mountPanel({ content: 'edited', savedBaseline: 'on disk' })
     openPanelMenu()
@@ -567,6 +607,76 @@ describe('MarkdownPanel — save and cancel', () => {
     const onSave = vi.fn(async () => {})
     mountDirty({ onSave })
     fireEvent.keyDown(document, { key: 's', metaKey: true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  // The chord must be CLAIMED whenever the editor is active, even on a clean
+  // buffer: the editor-local capture handler in PierreEditorImpl only exists
+  // after its lazy chunk resolves, so this document-level handler is the one
+  // deterministic owner. If it lets a clean-buffer Cmd+S fall through,
+  // AppKit's default runs (the reporter saw it select the word under the
+  // cursor). It must preventDefault yet NOT issue a redundant write.
+  it('claims Cmd+S on a clean editing buffer without issuing a save', async () => {
+    const onSave = vi.fn(async () => {})
+    // A code file opens straight into the editor (editing=true) and is clean
+    // (no savedBaseline mismatch), so this is the fall-through case.
+    mountPanel({ filePath: '/tmp/module.ts', content: 'export const a = 1\n', onSave })
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('saves once on Cmd+S when the editing buffer is dirty', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  // Caps Lock / Shift makes the browser report `e.key` as 'S'; the old exact
+  // `=== 's'` never matched, so the chord fell through. Match case-insensitively.
+  it('treats Shift+Cmd+S (key "S") the same as Cmd+S', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 'S', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  // A background (inactive) tab is mounted but hidden; its handler must not
+  // claim the chord the user aimed at the visible tab.
+  it('ignores Cmd+S when the tab is inactive', async () => {
+    const onSave = vi.fn(async () => {})
+    render(
+      <MarkdownPanel embedded active={false} filePath="/tmp/module.ts" content="export const a = 1\n"
+        onContentChange={vi.fn()} onSave={onSave} onClose={vi.fn()} />,
+      { wrapper },
+    )
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(false)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  // PierreEditorImpl's capture handler runs first and preventDefaults the chord
+  // when it owns it. The document handler must then stand down so onSave fires
+  // once, not twice. Simulate the already-claimed event.
+  it('does not double-save when Cmd+S was already handled (defaultPrevented)', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    evt.preventDefault()
+    document.dispatchEvent(evt)
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(onSave).not.toHaveBeenCalled()
   })
@@ -1054,13 +1164,103 @@ describe('MarkdownPanel — knowledge library toggle', () => {
     expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('renders an inert badge for a file already in the library', async () => {
+  it('turns the badge into a Remove button for an added local_file source', async () => {
     fetchOpts.knowledgeEnabled = true
     fetchOpts.knowledgeAdded = true
     mountPanel()
+    const remove = await screen.findByLabelText(/Remove from Knowledge Library/)
+    expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+    fireEvent.click(remove)
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+    // The invalidation refetches the same query key the status check used,
+    // which is what flips the panel back to the Add affordance.
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources?uri=%2Ftmp%2Fnotes.md'))
+  })
+
+  it('treats an already-gone source (404) as a successful removal', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    fetchOpts.knowledgeDeleteStatus = 404
+    mountPanel()
+    fireEvent.click(await screen.findByLabelText(/Remove from Knowledge Library/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+    expect(screen.queryByTestId('markdown-panel-action-error')).toBeNull()
+  })
+
+  it('surfaces a failed removal through the panel error notice', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    fetchOpts.knowledgeDeleteStatus = 500
+    mountPanel()
+    fireEvent.click(await screen.findByLabelText(/Remove from Knowledge Library/))
+    // The backend's raw English body ("library refused the removal") is
+    // intentionally swallowed: the notice shows the localized string instead.
+    expect(await screen.findByTestId('markdown-panel-action-error')).toHaveTextContent('Couldn’t remove the source.')
+  })
+
+  it('keeps the inert badge for a non-local_file (folder) source', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    fetchOpts.knowledgeSourceType = 'folder'
+    mountPanel()
     const badge = await screen.findByLabelText('In Knowledge Library')
     expect(badge.tagName).toBe('SPAN')
+    expect(screen.queryByLabelText(/Remove from Knowledge Library/)).toBeNull()
     expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+  })
+
+  it('finds the removable local_file even when a folder source is listed first', async () => {
+    // A file can match more than one source. The removable affordance must key
+    // off the local_file among all matches, not whichever row came back first,
+    // so a leading folder source must not mask it (and the DELETE must target
+    // the local_file's id, not the folder's).
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeSources = [
+      { id: 9, source_type: 'folder' },
+      { id: 1, source_type: 'local_file' },
+    ]
+    mountPanel()
+    const remove = await screen.findByLabelText(/Remove from Knowledge Library/)
+    expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+    fireEvent.click(remove)
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+  })
+
+  it('URL-encodes the source id so a traversal id cannot redirect the delete', async () => {
+    // Source ids come from imported bundles and are only validated as a
+    // non-empty string, so an id like "../../../sessions" would otherwise
+    // resolve to a different route. The id must be sent as a single, encoded
+    // path segment.
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeSources = [{ id: '../../../sessions' as unknown as number, source_type: 'local_file' }]
+    mountPanel()
+    fireEvent.click(await screen.findByLabelText(/Remove from Knowledge Library/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      '/api/knowledge/sources/' + encodeURIComponent('../../../sessions'),
+      expect.objectContaining({ method: 'DELETE' }),
+    ))
+    expect(fetch).not.toHaveBeenCalledWith('/api/knowledge/sources/../../../sessions', expect.anything())
+  })
+
+  it('surfaces an error (not an empty library) when the sources read fails', async () => {
+    // A failed sources GET must not resolve to [] and read as "not added":
+    // that would offer Add and hide the Remove for a file that may already be
+    // indexed. The panel must render its knowledge query-error notice instead.
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeSourcesOk = false
+    mountPanel()
+    expect(await screen.findByTestId('markdown-panel-knowledge-error')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+    expect(screen.queryByLabelText(/Remove from Knowledge Library/)).toBeNull()
+  })
+
+  it('offers the Remove row in the overflow menu for an added local_file source', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    mountPanel()
+    openPanelMenu()
+    fireEvent.click(await screen.findByText(/Remove from Knowledge Library/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
   })
 })
 

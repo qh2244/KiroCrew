@@ -43,6 +43,11 @@ API. ``src/kiro_crew/docs/*.md`` is packaged and read at runtime, and specific
 filenames are hardcoded in Python and TypeScript. Renaming one of those without
 updating its consumers breaks a shipped feature rather than a link.
 
+The seventh keeps bare invariant IDs honest. A harness comment such as ``# H6:``
+or ``(H13)`` must name a row in ``docs/system-specs/modules/harness-parity.md``.
+Otherwise a comment can claim an enforcement contract its owning spec never
+defines.
+
 The fact checks, and why they need a baseline
 --------------------------------------------
 The checks above hold at zero, so they fail outright. A second family asks a
@@ -198,6 +203,11 @@ SKIP_DIR_PATHS: frozenset[str] = frozenset(
         "src/kiro_crew/static/dist",
     }
 )
+
+#: Build trees whose names carry a per-build id, so they are skipped by prefix:
+#: the scratch, ready and previous trees of website/scripts/publish-dist.mjs,
+#: and the staged copies src/kiro_crew/static/dist links to.
+SKIP_DIR_PREFIXES: tuple[str, ...] = ("website/.dist", "src/kiro_crew/static/.dist")
 
 # Source trees scanned for citations of documentation paths. Broad on purpose: a
 # stale pointer is just as misleading in an agent-facing SKILL.md or an Electron
@@ -360,7 +370,7 @@ _UNRESOLVABLE_REF_OK: frozenset[str] = frozenset(
         # `config/defaults.json`, which resolves.
         "agents/defaults.json",
         #
-        # -- FOREIGN homes. `onboarding_import.py` reads other tools' config dirs
+        # -- FOREIGN homes. The `onboarding_sources/` adapters read other tools' config dirs
         #    to offer an import, so naming their layout is the point.
         #
         # Antigravity / Gemini (`~/.gemini`, `_GEMINI_CONFIG_RELATIVE_PATHS`).
@@ -431,6 +441,13 @@ _CODE_REF_IGNORE_PATH_PARTS: tuple[str, ...] = (
 _CITATION_MARKER_RE = re.compile(
     r"(?:^\s*[#*]|//|/\*|\"\"\"|'''|`|\bSee\b|\bSpec\b|\bDesign\b|\bdocs?:)",
 )
+
+_HARNESS_INVARIANT_DOC = "docs/system-specs/modules/harness-parity.md"
+_HARNESS_INVARIANT_ROW_RE = re.compile(r"^\s*\|\s*(H[1-9][0-9]*)\s*\|", re.MULTILINE)
+_HARNESS_INVARIANT_CITE_RE = re.compile(
+    r"(?:^\s*(?:#|//|/\*)\s*(H[1-9][0-9]*)\s*:" r"|(?:#|//|/\*|\"\"\"|''').*?\((H[1-9][0-9]*)\))"
+)
+_INVARIANT_SOURCE_SUFFIXES = frozenset({".py", ".ts", ".tsx", ".js", ".mjs", ".sh"})
 
 
 # Hand-maintained "when did this change" preambles in a doc's PROSE. Git already
@@ -685,6 +702,7 @@ class Findings:
     missing_index: list[str] = field(default_factory=list)
     changelog_preamble: list[str] = field(default_factory=list)
     conflict_markers: list[str] = field(default_factory=list)
+    unknown_harness_invariants: list[str] = field(default_factory=list)
     # Fact checks, behind the baseline. ``facts`` fails the run; ``advisories``
     # is the report-only half (dead identifiers, unless --strict-identifiers).
     facts: list[FactFinding] = field(default_factory=list)
@@ -701,6 +719,7 @@ class Findings:
             + len(self.missing_index)
             + len(self.changelog_preamble)
             + len(self.conflict_markers)
+            + len(self.unknown_harness_invariants)
             + len(self.facts)
         )
 
@@ -733,7 +752,8 @@ def _prune(root: Path, dirpath: str, dirnames: list[str]) -> None:
         if d in SKIP_DIR_NAMES:
             continue
         full = Path(dirpath) / d
-        if _rel(full, root) in SKIP_DIR_PATHS:
+        rel = _rel(full, root)
+        if rel in SKIP_DIR_PATHS or rel.startswith(SKIP_DIR_PREFIXES):
             continue
         if _is_dir_link(full):
             continue
@@ -1149,6 +1169,54 @@ def check_code_citations(root: Path, findings: Findings) -> None:
                         ):
                             continue
                         findings.phantom_refs.append(f"{rel_path}:{lineno} -> {ref}")
+
+
+def _check_invariant_citations(
+    root: Path,
+    *,
+    invariant_doc_path: str,
+    row_pattern: re.Pattern[str],
+    cite_pattern: re.Pattern[str],
+    target: list[str],
+) -> None:
+    """Append source-comment IDs absent from one owning invariant table."""
+    invariant_doc = root / invariant_doc_path
+    if not _is_regular_file(invariant_doc):
+        return
+    try:
+        declared = set(row_pattern.findall(_read(invariant_doc)))
+    except OSError:
+        return
+    source_root = root / "src"
+    if not source_root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(source_root):
+        _prune(root, dirpath, dirnames)
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if path.suffix not in _INVARIANT_SOURCE_SUFFIXES:
+                continue
+            try:
+                lines = _read(path).splitlines()
+            except OSError:
+                continue
+            rel_path = _rel(path, root)
+            for lineno, line in enumerate(lines, start=1):
+                for match in cite_pattern.finditer(line):
+                    invariant_id = match.group(1) or match.group(2)
+                    if invariant_id not in declared:
+                        target.append(f"{rel_path}:{lineno} -> {invariant_id}")
+
+
+def check_invariant_citations(root: Path, findings: Findings) -> None:
+    """Every bare H source-comment ID must exist in its owning table."""
+    _check_invariant_citations(
+        root,
+        invariant_doc_path=_HARNESS_INVARIANT_DOC,
+        row_pattern=_HARNESS_INVARIANT_ROW_RE,
+        cite_pattern=_HARNESS_INVARIANT_CITE_RE,
+        target=findings.unknown_harness_invariants,
+    )
 
 
 def check_source_citations(root: Path, docs: list[Path], findings: Findings) -> None:
@@ -1709,6 +1777,7 @@ def run(root: Path, *, strict_identifiers: bool = False) -> Findings:
     check_changelog_preambles(root, docs, findings)
     check_conflict_markers(root, docs + entry_points, findings)
     check_code_citations(root, findings)
+    check_invariant_citations(root, findings)
     check_source_citations(root, docs, findings)
     check_code_coupled_docs(root, findings)
     # The fact checks cover the entry points as well: README.md and AGENTS.md cite
@@ -1761,6 +1830,11 @@ def _report(findings: Findings, doc_count: int, stale_baseline: list[tuple[str, 
         "documentation paths cited from code that do not exist",
         findings.phantom_refs,
         "write the missing doc, or correct the citation",
+    )
+    _emit(
+        "Harness invariant IDs cited from source but absent from its table",
+        findings.unknown_harness_invariants,
+        f"add the invariant to {_HARNESS_INVARIANT_DOC}, or correct the bare H-id",
     )
     _emit(
         "source paths cited from a module spec that do not exist",
@@ -1942,6 +2016,15 @@ def _self_test() -> int:
             '"""Spec: ``docs/system-specs/modules/ghost.md``."""\n', encoding="utf-8"
         )
         return "phantom_refs"
+
+    def plant_unknown_harness_invariant(root: Path) -> str:
+        spec = root / _HARNESS_INVARIANT_DOC
+        spec.parent.mkdir(parents=True)
+        spec.write_text("| Id | Rule |\n|---|---|\n| H1 | One |\n", encoding="utf-8")
+        source = root / "src" / "kiro_crew"
+        source.mkdir(parents=True)
+        (source / "harness.py").write_text("# H99: missing invariant\n", encoding="utf-8")
+        return "unknown_harness_invariants"
 
     def plant_phantom_source_path(root: Path) -> str:
         # A module spec naming a file that exists nowhere -- the case the class
@@ -2402,6 +2485,7 @@ def _self_test() -> int:
     probe("line zero", plant_line_zero)
     probe("line RANGE ending past EOF", plant_stale_line_range)
     probe("phantom spec citation", plant_phantom_ref)
+    probe("unknown harness invariant citation", plant_unknown_harness_invariant)
     probe("code-coupled doc missing", plant_coupling)
 
     # Code-markup immunity is an inverse assertion (nothing should fire).
@@ -2515,7 +2599,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--accept-new",
         action="store_true",
-        help="ADD the triples firing now to the baseline, printing each one (needs a reason)",
+        help=(
+            "ADD the triples firing now to the baseline, printing each one "
+            "(each one is an exemption a reviewer must agree with)"
+        ),
     )
     parser.add_argument(
         "--strict-identifiers",

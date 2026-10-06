@@ -1,10 +1,10 @@
 ---
 title: App Session Controls — a composer seam for per-chat app state
-status: accepted
+status: implemented
 author: omerrubi
 created: 2026-08-31
-last-audited: 2026-09-01
-audited-at: 1d705a03f
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: [7573]
 tracking-issues: []
@@ -13,9 +13,9 @@ superseded-by: []
 ---
 # RFC: App Session Controls — a composer seam for per-chat app state
 
-- Status: accepted — this document ships in the same PR as its implementation
-  (#7573), so §4 describes code that lands with it rather than code on a branch.
-  §5 and §9 describe what has not been decided.
+- Status: implemented — #7573 is on main: the manifest schema, resolver,
+  composer host, two-control cap, and `statusPath` polling all ship. §9 keeps
+  follow-up product questions rather than unfinished implementation phases.
 - Author: omerrubi
 - Created: 2026-08-31
 - Related: `rfc-navigation-placement-seam.md` (the sibling problem — a manifest
@@ -118,7 +118,7 @@ commands #7423 established there:
 | `id` | Stable per-app identifier, kebab-case (e.g. `"env-picker"`) |
 | `entryPoint` | ESM bundle path relative to `ui/` |
 | `label` | Accessible name, and the chip tooltip |
-| `icon` | lucide icon name |
+| `icon` | icon name from a fixed rendered set; other names fall back to `Package` (see the `contributes.sessionControls[].icon` row of `docs/app-kit/manifest-reference.md`) |
 | `statusPath` | Optional backend route reporting per-session chip state |
 
 Validation, enforced at install:
@@ -241,7 +241,7 @@ simply carry no state until opened.
 
 The change is additive in both directions.
 
-- **An app that declares nothing is unaffected.** `UIConfig.from_dict` reads
+- **An app that declares nothing is unaffected.** `Contributes.from_dict` reads
   `data.get("sessionControls", [])` (`manifest.py`), so a manifest without
   the key parses to an empty list and behaves exactly as before — no chip, no
   request, no DOM change.
@@ -315,7 +315,7 @@ The change is additive in both directions.
    which cannot be withdrawn once apps write it — bought against a surface that
    does not exist. Adding a field when the second surface arrives is a
    backward-compatible change; removing one is not. The same reasoning removed
-   `agent`, `model` and `workspace` from the props contract in §4.3.
+   `agent`, `model` and `workspace` from the props contract in §4.2.
 
 ## 10. Alternatives considered
 

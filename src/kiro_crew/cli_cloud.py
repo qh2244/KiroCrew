@@ -30,6 +30,7 @@ from kiro_crew.cloud.login_target import (
 )
 from kiro_crew.deploy.engine import resolve_aws_bin
 from kiro_crew.sandbox import SandboxCeilingUnsealable
+from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import ValidationError
 
 
@@ -179,6 +180,14 @@ def _cloud_connect(args: argparse.Namespace) -> int:
     st = ec2.describe(tag, profile, region)
     if not st.get("exists") or not st.get("instance_id"):
         ui.fail(f"No running instance for tag '{tag}'.")
+        # This verb addresses an EC2 crew, by tag, and a Fargate crew has no EC2
+        # instance to find -- so this lookup is also how an operator holding a
+        # Fargate crew arrives here. Name the surface that does reach one, rather
+        # than leaving a correct but terminal answer.
+        ui.detail(
+            "This reaches an EC2 crew. A Fargate crew is reached from Settings > Remote Crew: "
+            "its card opens the forward and shows the task's turn API URL."
+        )
         return 1
     open_browser = not getattr(args, "no_browser", False)
     local_port = getattr(args, "local_port", 0) or connect_mod.DEFAULT_LOCAL_PORT
@@ -589,7 +598,11 @@ def handle_cloud(args: argparse.Namespace) -> int:
         # Caught for the whole dispatch table rather than per verb: every verb resolves the
         # tag or the region through that read, ``launch`` re-attaches through it too, and a
         # verb added later would otherwise print a traceback until someone noticed.
-        ui.fail(str(exc))
+        # Escaped here as well as in the builders, exactly as ``cli_chat`` does: this
+        # handler prints ANY builder of the exception, including ones in modules it does
+        # not own, and ``ui.fail`` writes straight to the terminal. Escaping at each
+        # builder keeps a new SINK safe; escaping at the sink keeps a new BUILDER safe.
+        ui.fail(safe_terminal_line(str(exc)))
         return 1
     except CloudActionDenied as exc:
         # A mutating cloud verb was reached from an agent session (the in-layer

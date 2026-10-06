@@ -1,7 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { i18nT } from '../i18n/t'
 import type { ReactNode } from 'react'
-import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { composerRoot, composerValue, setComposerValue, pressInComposer } from './helpers'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -9,9 +11,13 @@ import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
 import chatReducer, { setQuestionCard, sseChatMessage, selectComposerBusy, selectSlotMessages } from '../store/chatSlice'
-import dashboardReducer from '../store/dashboardSlice'
+import dashboardReducer, { sseSlots } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { store as appStore } from '../store'
+import { TerminalHostContext } from '../hooks/useTerminalCommand'
+import * as bottomTerminal from '../hooks/useBottomTerminal'
+import * as terminalRegistry from '../utils/terminalRegistry'
+import * as terminalPopout from '../utils/terminalPopout'
 
 /* ChatPane sends must follow ChatPage's wire/bubble split for folder tokens
  * (issue #743 review finding): the API payload carries `[attached_dir N] path`
@@ -66,13 +72,13 @@ Object.defineProperty(window, 'matchMedia', {
 import ChatPane from '../components/ChatPane'
 import { api } from '../api/client'
 
-function makeStore(slotKey: string, busy = false) {
+function makeStore(slotKey: string, busy = false, overrides: Partial<RootState['dashboard']['slots'][number]> = {}) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
       dashboard: {
         status: null, connected: true,
-        slots: [{ key: slotKey, messages: 0, running: false, subagents_running: busy, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }],
+        slots: [{ key: slotKey, messages: 0, running: false, subagents_running: busy, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined, ...overrides }],
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
       } as unknown as RootState['dashboard'],
@@ -80,9 +86,9 @@ function makeStore(slotKey: string, busy = false) {
   })
 }
 
-function renderPane(slotKey: string, busy = false) {
+function renderPane(slotKey: string, busy = false, overrides: Partial<RootState['dashboard']['slots'][number]> = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const store = makeStore(slotKey, busy)
+  const store = makeStore(slotKey, busy, overrides)
   return renderWithStore(store, qc, slotKey)
 }
 
@@ -92,7 +98,7 @@ function renderWithStore(store: ReturnType<typeof makeStore>, qc: QueryClient, s
       <QueryClientProvider client={qc}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatPane slotKey={slotKey} />
+            <TerminalHostContext.Provider value="docked"><ChatPane slotKey={slotKey} /></TerminalHostContext.Provider>
           </MemoryRouter>
         </ThemeProvider>
       </QueryClientProvider>
@@ -104,17 +110,31 @@ beforeEach(() => {
   vi.clearAllMocks()
 })
 
+/* The composer is a lazy-loaded Lexical contenteditable root; wait for it to
+ * mount and attach its handle, then return the scoped root for the driver calls.
+ * ChatPane may mount several panes, so scope to the first (only) composer. */
+async function waitComposer(): Promise<HTMLElement> {
+  await waitFor(() => expect(document.querySelector('[data-composer-input]')).not.toBeNull())
+  await act(async () => {})
+  return composerRoot()
+}
+
+/** Type `text` into the composer and press Enter to send. */
+async function sendText(box: HTMLElement, text: string): Promise<void> {
+  await setComposerValue(text, box)
+  await act(async () => {
+    pressInComposer('Enter', { code: 'Enter' }, box)
+  })
+}
+
 describe('ChatPane busy send echo', () => {
   it.each([false, true])('keeps one user row before the reply with an early receipt: %s', async (earlyReceipt) => {
     let deliverReceipt!: (value: unknown) => void
     vi.mocked(api.sendChat).mockImplementationOnce(() => new Promise(resolve => { deliverReceipt = resolve }))
     const { store } = renderPane('pane-busy', true)
-    const box = (await screen.findAllByRole('textbox'))[0]
+    const box = await waitComposer()
     await waitFor(() => expect(selectComposerBusy(store.getState(), 'pane-busy')).toBe(true))
-    await act(async () => {
-      fireEvent.change(box, { target: { value: 'inspect @/tmp/design/ please' } })
-      fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
-    })
+    await sendText(box, 'inspect @/tmp/design/ please')
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     const [content, , , , meta] = vi.mocked(api.sendChat).mock.calls[0]
     const receipt = { ok: true, json: async () => ({ ok: true, mid: 'm-pane-user' }) }
@@ -138,9 +158,8 @@ describe('ChatPane busy send echo', () => {
 describe('ChatPane send — folder token serialization', () => {
   it('sends [attached_dir N] wire text with meta.dirs; bubble keeps the raw token', async () => {
     renderPane('pane-1')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'please review @/home/user/design-assets/ thanks' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'please review @/home/user/design-assets/ thanks')
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     const [wireText, slot, , , meta] = (api.sendChat as ReturnType<typeof vi.fn>).mock.calls[0]
     expect(slot).toBe('pane-1')
@@ -150,9 +169,8 @@ describe('ChatPane send — folder token serialization', () => {
 
   it('sends plain text untouched (sendId only) when there are no folder tokens', async () => {
     renderPane('pane-2')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'just words' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'just words')
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     const [wireText, , , , meta] = (api.sendChat as ReturnType<typeof vi.fn>).mock.calls[0]
     expect(wireText).toBe('just words')
@@ -177,9 +195,8 @@ describe('ChatPane send — the response confirms the optimistic bubble', () => 
       json: () => Promise.resolve({ ok: true, mid: 'm-server-confirmed' }),
     })
     const { store } = renderPane('pane-confirm')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'confirm me' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'confirm me')
 
     await waitFor(() => expect(userRow(store, 'pane-confirm')?.meta?.optimistic).toBeUndefined())
     // The correlation id stays so a late echo updates this row in place.
@@ -190,9 +207,8 @@ describe('ChatPane send — the response confirms the optimistic bubble', () => 
   it('leaves the bubble pending when the server rejects the send', async () => {
     ;(api.sendChat as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, json: () => Promise.resolve({ ok: false, error: 'refused' }) })
     const { store } = renderPane('pane-reject')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'refuse me' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'refuse me')
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     // A refusal is not a receipt, so the pending flag must survive it. What the
@@ -208,7 +224,10 @@ describe('ChatPane send — the response confirms the optimistic bubble', () => 
 describe('ChatPane agent switch — failures reach the shared notice', () => {
   async function openAgentPicker() {
     const { store } = renderPane('pane-agent')
-    const trigger = await screen.findByLabelText(/agent/i)
+    // The picker's own label, not `/agent/i`: the slot key doubles as the
+    // pane title, and the rename trigger's name carries the title too
+    // ("pane-agent (rename session)"), so the loose regex matches both.
+    const trigger = await screen.findByLabelText(/follows the default agent|^Agent: /)
     fireEvent.click(trigger)
     return store
   }
@@ -251,11 +270,12 @@ describe('ChatPane agent switch — failures reach the shared notice', () => {
 describe('ChatPane pane boundary — data-chat-pane contract', () => {
   it('the pane wrapper carries data-chat-pane and contains the pane composer', async () => {
     const { container } = renderPane('pane-focus')
+    await waitComposer()
     const pane = container.querySelector('[data-chat-pane]')
     expect(pane).not.toBeNull()
     const composer = await screen.findAllByRole('textbox')
     expect(pane!.contains(composer[0])).toBe(true)
-    expect(pane!.querySelector('textarea[data-composer-input]')).not.toBeNull()
+    expect(pane!.querySelector('[data-composer-input]')).not.toBeNull()
   })
 
   it('the wrapper marks the grid-focused pane with the "focused" value', () => {
@@ -315,9 +335,8 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
   it('reports a rejected send and hands the text back to the composer', async () => {
     ;(api.sendChat as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('offline'))
     const { store } = renderPane('pane-reject')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'this one never left' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'this one never left')
 
     await waitFor(() => expect(errorsIn(store, 'pane-reject')).toHaveLength(1))
     // Asserted as a non-empty error row rather than by copy: the string comes
@@ -326,7 +345,7 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     expect(errorsIn(store, 'pane-reject')[0].content.trim().length).toBeGreaterThan(0)
     // The payload is recoverable rather than lost, which is the action the
     // removed notice never offered.
-    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('this one never left'))
+    await waitFor(() => expect(composerValue(box)).toBe('this one never left'))
   })
 
   it('reports a body the server accepted as neither ok nor queued', async () => {
@@ -334,9 +353,8 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
       ok: true, json: () => Promise.resolve({ error: 'slot is stopping' }),
     })
     const { store } = renderPane('pane-refused')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'refused at the guard' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'refused at the guard')
 
     await waitFor(() => expect(errorsIn(store, 'pane-refused')).toHaveLength(1))
     // The server's own reason survives — FRAMED with what happened and where
@@ -345,7 +363,7 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     // a bare "slot is stopping" reads as the agent erroring, not as a send
     // that never went out.
     expect(errorsIn(store, 'pane-refused')[0].content).toBe("Couldn't send this message: slot is stopping. Your text is back in the composer.")
-    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('refused at the guard'))
+    await waitFor(() => expect(composerValue(box)).toBe('refused at the guard'))
   })
 
   it('says nothing when a 2xx receipt will not parse, and keeps the composer clear (#4217)', async () => {
@@ -357,21 +375,19 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
       ok: true, json: () => Promise.reject(new Error('unexpected end of JSON input')),
     })
     const { store } = renderPane('pane-unreadable')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'maybe it landed' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'maybe it landed')
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     expect(errorsIn(store, 'pane-unreadable')).toHaveLength(0)
-    expect((box as HTMLTextAreaElement).value).toBe('')
+    expect(composerValue(box)).toBe('')
   })
 
   it('states the cause when the transport rejects: the shared connection copy, not a bare "Send failed"', async () => {
     ;(api.sendChat as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('offline'))
     const { store } = renderPane('pane-generic')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'no body to read' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'no body to read')
 
     // No response means no server reason, so the connectivity copy is correct here.
     await waitFor(() => expect(errorsIn(store, 'pane-generic')).toHaveLength(1))
@@ -400,8 +416,8 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     await waitFor(() => expect(errorsIn(store, 'pane-ask')).toHaveLength(1))
     expect(errorsIn(store, 'pane-ask')[0].content).toBe("Couldn't send this message: slot is stopping. Your text is back in the composer.")
     // ...and the answer comes back so it can be sent again.
-    const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
-    await waitFor(() => expect(box.value).toBe('Public only'))
+    const box = await waitComposer()
+    await waitFor(() => expect(composerValue(box)).toBe('Public only'))
   })
 
   it('restores a cleared question-card answer and warns delivery-unconfirmed when its receipt is late', async () => {
@@ -427,8 +443,8 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     fireEvent.click(screen.getByText('Submit'))
 
     // The answer is restored to the composer for the user to inspect/resend...
-    const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
-    await waitFor(() => expect(box.value).toBe('Public only'))
+    const box = await waitComposer()
+    await waitFor(() => expect(composerValue(box)).toBe('Public only'))
     // ...and a delivery-unconfirmed NOTICE (not an error) warns it is unconfirmed,
     // so the answer survives a reload via the composer and the user is told.
     await waitFor(() => expect(noticesIn(store, 'pane-ask-late')).toHaveLength(1))
@@ -440,9 +456,8 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
       ok: true, json: () => Promise.resolve({ ok: true }),
     })
     renderPane('pane-abort')
-    const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'might hang' } })
-    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    const box = await waitComposer()
+    await sendText(box, 'might hang')
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     // A hung POST settles neither way, so without a bound the message sits on
@@ -462,13 +477,13 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     )
     const { store } = renderPane('pane-aborted')
     const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'slow to answer' } })
+    await setComposerValue('slow to answer')
     fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     expect(errorsIn(store, 'pane-aborted')).toHaveLength(0)
     // The composer stays clear: the message is on its way, not recoverable work.
-    expect((box as HTMLTextAreaElement).value).toBe('')
+    expect(composerValue(box)).toBe('')
   })
 
   it('reports an attachment-only send the backend refuses', async () => {
@@ -507,12 +522,12 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     })
     const { store } = renderPane('pane-queued')
     const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'wait your turn' } })
+    await setComposerValue('wait your turn')
     fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     expect(errorsIn(store, 'pane-queued')).toHaveLength(0)
-    expect((box as HTMLTextAreaElement).value).toBe('')
+    expect(composerValue(box)).toBe('')
   })
 
   it('reports nothing when the server accepts the send', async () => {
@@ -521,12 +536,12 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     })
     const { store } = renderPane('pane-ok')
     const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'this one landed' } })
+    await setComposerValue('this one landed')
     fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     expect(errorsIn(store, 'pane-ok')).toHaveLength(0)
-    expect((box as HTMLTextAreaElement).value).toBe('')
+    expect(composerValue(box)).toBe('')
   })
 
   it('appends the failed payload below a message typed while the send was in flight', async () => {
@@ -536,17 +551,17 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     )
     renderPane('pane-merge')
     const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'the failing one' } })
+    await setComposerValue('the failing one')
     fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
     // The user starts a fresh message before the POST settles. NEITHER payload
     // may win: preferring the newer one silently discards the message the error
     // row is telling the user to try again, and preferring the older one loses
     // work they just did.
-    fireEvent.change(box, { target: { value: 'newer work' } })
+    await setComposerValue('newer work')
     reject(new Error('offline'))
 
     await waitFor(() =>
-      expect((box as HTMLTextAreaElement).value).toBe('newer work\n\nthe failing one'),
+      expect(composerValue(box)).toBe('newer work\n\nthe failing one'),
     )
   })
 
@@ -557,21 +572,22 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     )
     renderPane('pane-dup')
     const box = (await screen.findAllByRole('textbox'))[0]
-    fireEvent.change(box, { target: { value: 'same text' } })
+    await setComposerValue('same text')
     fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
     // Retyping the same message while the first attempt is in flight is the
     // common recovery reflex; it must not come back doubled.
-    fireEvent.change(box, { target: { value: 'same text' } })
+    await setComposerValue('same text')
     reject(new Error('offline'))
 
-    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('same text'))
+    await waitFor(() => expect(composerValue(box)).toBe('same text'))
   })
 })
 
 /* #10634: a NATIVE AskUserQuestion card is raised WHILE its own turn is still
- * running and waiting on the answer, and it carries neither `ask_id` (the
- * blocking backend card) nor `card_id` (the non-blocking `ask_question` MCP
- * card). Answering it must STEER into the live turn, not queue behind it — the
+ * running and waiting on the answer. It is server-owned like every card (a
+ * `card_id`) and the server marks it `native` on the frame — the one
+ * thing that tells it apart from the non-blocking `ask_question` MCP card.
+ * Answering it must STEER into the live turn, not queue behind it — the
  * queue path is what left the question unanswered until timeout. When the turn
  * has ended, the same card answer starts an ordinary next turn, exactly as the
  * non-blocking card always does. */
@@ -613,11 +629,13 @@ describe('ChatPane native question card (#10634) — steer while the turn is liv
   }
 
   function seedNativeCard(store: ReturnType<typeof nativeStore>, slot: string) {
-    // No ask_id AND no card_id — the native card shape (chat_runner.py broadcasts
-    // { slot, questions } only). setQuestionCard with neither id reproduces it.
+    // The native card shape: a server `card_id` plus the `native` mark
+    // (chat_runner.py posts it through post_question_card(native=True)).
     act(() => {
       store.dispatch(setQuestionCard({
         slot,
+        card_id: 'card-native',
+        native: true,
         questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
       }))
     })
@@ -734,8 +752,8 @@ describe('ChatPane native question card (#10634) — steer while the turn is liv
     // No failure, no unconfirmed notice, and the answer is NOT re-restored.
     expect(rows.some(m => m.role === 'error')).toBe(false)
     expect(rows.some(m => m.role === 'notice')).toBe(false)
-    const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
-    expect(box.value).toBe('')
+    const box = await waitComposer()
+    expect(composerValue(box)).toBe('')
   })
 
   it('recovers the answer when a live steer times out (response-late), never silently dropping it', async () => {
@@ -751,8 +769,8 @@ describe('ChatPane native question card (#10634) — steer while the turn is liv
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
     // The answer is handed back to the composer for the user to inspect/resend.
-    const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
-    await waitFor(() => expect(box.value).toBe('us-east-1'))
+    const box = await waitComposer()
+    await waitFor(() => expect(composerValue(box)).toBe('us-east-1'))
   })
 })
 
@@ -781,5 +799,95 @@ describe('ChatPane file drop', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('chat-drop-overlay')).not.toBeInTheDocument()
     })
+  })
+})
+
+describe('ChatPane terminal attachment and session boundaries', () => {
+  beforeEach(() => {
+    terminalRegistry.setTerminalEnabledFlag(true)
+    vi.spyOn(bottomTerminal, 'addTab').mockReturnValue('pane-terminal')
+    vi.spyOn(terminalRegistry, 'sendToTerminalSession').mockReturnValue(true)
+    vi.spyOn(terminalRegistry, 'onTerminalReady').mockImplementation((_id, ready) => {
+      ready()
+      return vi.fn()
+    })
+    vi.spyOn(terminalPopout, 'bringBack').mockImplementation(() => {})
+  })
+  afterEach(() => {
+    terminalRegistry.setTerminalEnabledFlag(false)
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('refuses a dropped folder until its chip removes the token, then reviews the pane workspace', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('kirocrew', { getPathForFile: () => '/work/docs' })
+    renderPane('pane-terminal-folder', false, { project: '/work/pane-project' })
+    const box = await waitComposer()
+    const folder = new File([], 'docs')
+    // The Lexical root's own drop listener reads `getData` before the host
+    // handler runs, so the OS-file transfer carries an empty text reader.
+    const dataTransfer = {
+      types: ['Files'], files: [folder], getData: () => '',
+      items: [{ kind: 'file', getAsFile: () => folder, webkitGetAsEntry: () => ({ isDirectory: true }) }],
+    }
+    await act(async () => { fireEvent.drop(box, { dataTransfer }) })
+    expect(composerValue(box)).toBe('@/work/docs/ ')
+    await setComposerValue('! pwd @/work/docs/ ', box)
+    const run = screen.getByRole('button', { name: 'Review terminal command' })
+    expect(run).toBeDisabled()
+    expect(screen.getByText('Remove folder attachments before running. Removing a folder also removes its @path reference from the command.')).toBeVisible()
+    await user.click(run)
+    await user.click(box)
+    await user.keyboard('{Enter}')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(composerValue(box)).toBe('! pwd @/work/docs/ ')
+    expect(bottomTerminal.addTab).not.toHaveBeenCalled()
+    expect(terminalRegistry.sendToTerminalSession).not.toHaveBeenCalled()
+    expect(terminalPopout.bringBack).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(api.uploadFiles).not.toHaveBeenCalled()
+
+    await user.click(within(screen.getByRole('group', { name: '/work/docs/' })).getByRole('button', { name: 'Remove folder' }))
+    expect(composerValue(box)).toBe('! pwd ')
+    expect(run).toBeEnabled()
+    await user.click(run)
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent('/work/pane-project')
+    expect(bottomTerminal.addTab).not.toHaveBeenCalled()
+    await user.click(within(dialog).getByRole('button', { name: 'Run', exact: true }))
+    expect(bottomTerminal.addTab).toHaveBeenCalledExactlyOnceWith('/work/pane-project')
+    expect(terminalRegistry.sendToTerminalSession).toHaveBeenCalledExactlyOnceWith('pane-terminal', 'pwd ', { preserveTrailingWhitespace: true })
+    expect(composerValue(box)).toBe('! pwd ')
+    expect(api.sendChat).not.toHaveBeenCalled()
+  })
+
+  it('keeps a retained remote pane blocked when its row disappears, without replay on rehydration', async () => {
+    const user = userEvent.setup()
+    const { store } = renderPane('pane-remote-retained', false, { executor: 'remote', project: '/peer/project' })
+    const row = store.getState().dashboard.slots[0]
+    act(() => store.dispatch(sseSlots([row])))
+    const box = await waitComposer()
+    await setComposerValue('! pwd', box)
+    expect(screen.getByText('Terminal commands are unavailable for sessions on another server. Remove the leading ! to return to chat.')).toBeVisible()
+    act(() => store.dispatch(sseSlots([])))
+    expect(store.getState().dashboard.slots).toHaveLength(0)
+    expect(screen.getByText('Wait for session details to load, or select another session.')).toBeVisible()
+    const run = screen.getByRole('button', { name: 'Review terminal command' })
+    expect(run).toBeDisabled()
+    await user.click(run)
+    await user.click(box)
+    await user.keyboard('{Enter}')
+    expect(composerValue(box)).toBe('! pwd')
+    act(() => store.dispatch(sseSlots([row])))
+    expect(screen.getByText('Terminal commands are unavailable for sessions on another server. Remove the leading ! to return to chat.')).toBeVisible()
+    expect(run).toBeDisabled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(composerValue(box)).toBe('! pwd')
+    expect(bottomTerminal.addTab).not.toHaveBeenCalled()
+    expect(terminalRegistry.onTerminalReady).not.toHaveBeenCalled()
+    expect(terminalRegistry.sendToTerminalSession).not.toHaveBeenCalled()
+    expect(terminalPopout.bringBack).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
   })
 })

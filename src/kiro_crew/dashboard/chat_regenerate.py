@@ -8,16 +8,24 @@ import logging
 
 from aiohttp import web
 
+from kiro_crew.dashboard.chat_delivery import queued_text_for_display
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.chat_utils import (
+    adopt_variant_text,
     effective_session_key,
     reject_if_slot_under_construction,
     slot_history_key,
+    variant_from_row,
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.remote_relay import remote_bound_refusal
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.slot_ownership import (
+    checkpoint_slot_replaced,
+    deny_app_slot_session_access,
+    slot_not_found,
+)
+from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -44,6 +52,28 @@ _MAX_EDIT_CONTENT_CHARS = 32_768
 _SAVE_DRAIN_ATTEMPTS = 8
 
 
+def _destructive_history_busy(slot: "_ChatSlot") -> web.Response | None:
+    """Refuse history mutation while a turn, admission reservation, or teardown owns
+    the slot.
+
+    The teardown arm is what keeps a truncating save from being ADMITTED into a
+    close that is already running. A close fences the slot synchronously before
+    its first await and then waits for a guarded history write to leave its commit
+    window; without this arm a regenerate arriving during that wait would dispatch
+    a fresh truncating write which the close has already stopped waiting for, and
+    it could commit onto the transcript after the replacement has adopted the key.
+    ``cancel_close`` releases the fence on every path that leaves the slot live, so
+    an aborted close re-admits the mutation instead of wedging the tab.
+    """
+    if slot.turn_running:
+        return web.json_response({"error": "slot is running", "code": "slot_running"}, status=409)
+    if slot.running:
+        return web.json_response({"error": "slot is busy", "code": "slot_busy"}, status=409)
+    if slot.is_closing:
+        return web.json_response({"error": "slot is closing", "code": "slot_closing"}, status=409)
+    return None
+
+
 async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/regenerate — regenerate the last assistant reply."""
     # Destructive: this truncates and PERSISTS history before the background
@@ -55,8 +85,13 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
-    if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # The app claim, recorded on the audit row below. Ownership itself is decided
+    # before this handler runs, by the per-slot checkpoint (slot_ownership.py),
+    # on the slot that was live then. The readiness await above can outlast a
+    # close and a same-name create, so the slot looked up now must be that one.
+    request_app = request.get("app", "")
+    if not slot or checkpoint_slot_replaced(request, slot):
+        return slot_not_found()
     under_construction = reject_if_slot_under_construction(state, slot)
     if under_construction is not None:
         return under_construction
@@ -68,10 +103,11 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
         return refusal
 
     async with slot._lock:
-        if slot.running:
-            return web.json_response(
-                {"error": "slot is running", "code": "slot_running"}, status=409
-            )
+        if request_app and state._slots.get(name) is not slot:
+            return slot_not_found()
+        busy = _destructive_history_busy(slot)
+        if busy is not None:
+            return busy
 
         msgs = slot.messages
         ai_idx = -1
@@ -117,7 +153,7 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
         ai_msg = msgs[ai_idx]
         _rv = ai_msg.get("variants")
         variants: list[dict] = list(_rv) if isinstance(_rv, list) else []  # type: ignore[arg-type]
-        current_entry = {"content": ai_msg.get("content", ""), "ts": ai_msg.get("ts", "")}
+        current_entry = variant_from_row(ai_msg)
         if not any(v.get("content") == current_entry["content"] for v in variants):
             variants.append(current_entry)
         if len(variants) > _MAX_VARIANTS:
@@ -174,6 +210,8 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("Regenerate: failed to rewrite session history", exc_info=True)
             committed = True
+        if request_app and state._slots.get(name) is not slot:
+            return slot_not_found()
         if not committed:
             # The save's own guards refused the write: the slot was rebound to
             # another transcript, or a same-name recreate replaced it, while the
@@ -196,7 +234,7 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             )
 
         sel().log_api_access(
-            caller="dashboard",
+            caller=request_app or "dashboard",
             operation="chat.regenerate",
             outcome="allowed",
             source="dashboard",
@@ -215,6 +253,10 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
                 user_msg,
                 regenerate_hint=hint,
                 _directive_user_origin=not bool(request.get("app", "")),
+                # See ``api_chat``: an observed app must be NAMED, because the
+                # actor resolver's fallback is ``user``. ``""`` is the parameter's
+                # own default and reads as "not named".
+                _turn_actor="app" if request.get("app", "") else "",
             )
         )
         slot.task = task
@@ -238,8 +280,11 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
+    # The app claim, recorded on the audit row below. Ownership itself is decided
+    # before this handler runs, by the per-slot checkpoint (slot_ownership.py).
+    request_app = request.get("app", "")
     if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     under_construction = reject_if_slot_under_construction(state, slot)
     if under_construction is not None:
         return under_construction
@@ -256,10 +301,11 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid index", "code": "index_invalid"}, status=400)
 
     async with slot._lock:
-        if slot.running:
-            return web.json_response(
-                {"error": "slot is running", "code": "slot_running"}, status=409
-            )
+        if request_app and state._slots.get(name) is not slot:
+            return slot_not_found()
+        busy = _destructive_history_busy(slot)
+        if busy is not None:
+            return busy
 
         target = None
         for m in reversed(slot.messages):
@@ -285,9 +331,8 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
                 {"error": "corrupt variant entry", "code": "variant_corrupt"}, status=400
             )
         target_dict: dict = target
-        target_dict["content"] = chosen.get("content", "")
+        adopt_variant_text(target_dict, chosen)
         slot.invalidate_source_links()
-        target_dict["ts"] = chosen.get("ts", target_dict.get("ts", ""))
         target_dict["variant_idx"] = idx
         slot._dirty = True
         slot._resumed_count = 0
@@ -314,6 +359,8 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("switch-variant: failed to persist", exc_info=True)
             committed = True
+        if request_app and state._slots.get(name) is not slot:
+            return slot_not_found()
         if not committed:
             # The save's guards refused: the slot was rebound or a same-name
             # recreate replaced it while the write awaited its lock. The chosen
@@ -332,7 +379,7 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
                 status=409,
             )
         sel().log_api_access(
-            caller="dashboard",
+            caller=request_app or "dashboard",
             operation="chat.switch_variant",
             outcome="allowed",
             source="dashboard",
@@ -356,7 +403,6 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     # ``import kiro_crew.dashboard.chat_regenerate`` fail on its own. Same reason
     # ``session_control`` and ``handlers/core`` reach it this way.
     from kiro_crew.dashboard.chat_handlers import (
-        _check_slot_app_ownership,
         _reauthorize_after_await,
         _subagents_attached_response,
     )
@@ -372,7 +418,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     request_app = request.get("app", "")
     if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     under_construction = reject_if_slot_under_construction(state, slot)
     if under_construction is not None:
         return under_construction
@@ -380,7 +426,9 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     # App-ownership gate (App Kit §5.2). This endpoint discards the slot's
     # NATIVE ACP conversation below, so an app token reaching a slot it does not
     # own destroys a resume identity it has no claim on -- the same capability
-    # every other app-reachable write authorizes first. Reuse the shared gate
+    # every other app-reachable write authorizes first (slot_ownership_middleware
+    # makes that slot-ownership decision for every per-slot route; this gate adds
+    # the session and transcript halves). Reuse the shared gate
     # rather than a second spelling of it: it authorizes all four keys
     # (``_app`` presence, ``_app`` match, the effective SESSION key, and the
     # TRANSCRIPT key), so a channel-linked slot -- whose effective session is a
@@ -388,7 +436,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     # are both already covered, with no separate link check to keep in sync.
     # Denials are 404, not 403: indistinguishable from a missing slot
     # (anti-enumeration, CWE-204); the true reason is logged via SEL inside.
-    denied = _check_slot_app_ownership(slot, name, request_app, "chat.slot_edit_resend")
+    denied = deny_app_slot_session_access(request_app, slot, name, "chat.slot_edit_resend")
     if denied is not None:
         return denied
 
@@ -437,43 +485,32 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         )
 
     async with slot._lock:
-        # Reading the body above was an await, and ``linked_session_key`` is
-        # rebound on ALREADY-LIVE slots with no ``running`` gate (a cron
-        # completion, a workflow injection), so a slow caller can be authorized
-        # against its own session and land on somebody else's conversation.
-        # Re-authorize before the first read of slot state, since ``running``
-        # belongs to whichever conversation the slot now routes to.
+        # Reading the body above was an await, and ``linked_session_key`` can
+        # be rebound on an already-live slot by a cron or workflow injection, so
+        # a slow caller can be authorized against its own session and land on
+        # somebody else's conversation. Re-authorize before checking admission
+        # on whichever conversation the slot now routes to.
         stale = _reauthorize_after_await(state, slot, name, request_app, "chat.slot_edit_resend")
         if stale is not None:
             return stale
 
-        if slot.running:
-            return web.json_response(
-                {"error": "slot is running", "code": "slot_running"}, status=409
-            )
+        busy = _destructive_history_busy(slot)
+        if busy is not None:
+            return busy
 
         # The session whose native resume identity the discard below clears.
         # Resolved here because the two guards that follow are about THAT
         # session, not about this slot's own task.
         session_key = effective_session_key(slot)
 
-        # ``slot.running`` is not the whole "is this session busy" question, and
-        # ``discard_conversation`` is a full teardown. Both guards below are the
-        # ones the sibling teardown route (``reset-conversation``) already
-        # applies before the SAME call, in the same order and with the same
-        # codes -- reused rather than respelled, so the two cannot drift.
-        if slot._in_stage_execution:
-            # An autopilot plan reads ``running`` False BETWEEN stages while it
-            # is still mid-plan, so ``running`` alone would discard the
-            # conversation the plan is writing into and cold-start its next
-            # stage -- on top of truncating the history that plan is producing.
-            return web.json_response(
-                {"error": "slot is orchestrating", "code": "slot_orchestrating", "slot": name},
-                status=409,
-            )
+        # The slot admission reservation is not the whole "is this session
+        # busy" question, and ``discard_conversation`` is a full teardown. The guard below is the
+        # one the sibling teardown route (``reset-conversation``) already
+        # applies before the SAME call, with the same code -- reused rather
+        # than respelled, so the two cannot drift.
         # The discard also releases the shared sub-agent runtime the parent's
-        # children run on. ``slot.running`` is False while they keep going (the
-        # parent turn ends first), so nothing above catches it and a child's
+        # children run on. ``slot.running`` can be False while they keep going
+        # (the parent turn ends first), so nothing above catches it and a child's
         # work would be destroyed by an edit it has no part in.
         attached = await _subagents_attached_response(
             state, slot, session_key, "chat.slot_edit_resend"
@@ -516,8 +553,19 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         # Prepare the truncated+edited window on a COPY. The dirty-slot flush
         # can run while either durable boundary below is pending, so exposing a
         # truncated live window here could make a rejected edit permanent.
-        _bc, _ = redact_exfiltration_urls(content)
-        _bc, _ = redact_credentials(_bc)
+        # This edited value is BOTH the persisted user row (``append`` below)
+        # and the turn's input (``_run_chat`` runs the same ``_bc``), so the
+        # session's own human's edit is delivered AS TYPED -- the rule an
+        # ordinary send follows -- and redacting it would strip a link the human
+        # kept in the message from the model. An app-driven edit-resend
+        # (``request_app`` set) is not the reader's own words and stays
+        # display-redacted, matching ``queue_entry_is_user_origin``'s boundary
+        # and the ``_directive_user_origin=not bool(request_app)`` stamp below.
+        # ``not request_app`` is the whole owner test here, not a narrowing of
+        # that discriminator: this HTTP endpoint carries only the dashboard
+        # composer or an app, so a channel or producer ``kind`` stamp cannot
+        # reach it -- the sole question left is whether an app drives the edit.
+        _bc = queued_text_for_display(content, user_origin=not bool(request_app))
         prospective_slot = copy.copy(slot)
         prospective_slot.messages = list(slot.messages[:index])
         # ``copy.copy`` is SHALLOW, so every mutable attribute still IS the live
@@ -585,7 +633,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         pre_await_pending = list(slot._pending)
         pre_await_pending_ids = {id(row) for row in pre_await_pending}
 
-        # Reserve the slot BEFORE the awaits below. ``slot.running`` derives
+        # Reserve the slot BEFORE the awaits below. ``slot.turn_running`` derives
         # from ``slot.task``, and the send path is not serialized on
         # ``slot._lock``: without a live task, a send arriving while any of the
         # three durable boundaries below is pending observes an IDLE slot,
@@ -608,6 +656,10 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                     slot,
                     _bc,
                     _directive_user_origin=not bool(request_app),
+                    # See ``api_chat``: an observed app must be NAMED, because the
+                    # actor resolver's fallback is ``user``. ``""`` is the
+                    # parameter's own default and reads as "not named".
+                    _turn_actor="app" if request_app else "",
                 )
                 return
             # Edit rejected. A send diverted to the queue by this reservation
@@ -681,7 +733,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                 # keeps this handler alive long enough to learn the outcome.
                 discard_task = asyncio.ensure_future(
                     # ``skip_if_busy``: an inbound channel turn holds the session
-                    # semaphore while ``slot.running`` reads False, so the idle
+                    # semaphore while ``slot.turn_running`` reads False, so the idle
                     # check above cannot see it -- an unconditional discard would
                     # tear down its provider mid-reply.
                     state.sessions.discard_conversation(session_key, skip_if_busy=True)
@@ -993,6 +1045,21 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
             # not release the flag early. ``best_effort=False`` so a failure
             # propagates to the 503 below instead of being swallowed and
             # re-armed as a dirty retry.
+            #
+            # Both axes are pinned INTO the write, because the commit boundary is
+            # the only place either can be decided. ``expected_history_key``
+            # catches a RENAMED replacement; it cannot see a same-name
+            # close-and-recreate, which resumes the same transcript and so keeps
+            # the key identical. ``expected_slot_name`` carries this slot's map
+            # key in, where ``state._slots[name]`` is re-read inside the
+            # transcript lock with no await before the write: a map holding a
+            # different slot object refuses the save, nothing written. The
+            # loop-side identity check above cannot stand in for it -- the
+            # recreate can land during the executor wait, after that check and
+            # before the write -- and the loop-side check is still needed for the
+            # reservation axis (``slot.task``), which the persistence layer
+            # cannot see. A refusal returns ``False`` and reaches the 503 below
+            # with the live slot untouched.
             save_task = asyncio.ensure_future(
                 save_slot_off_loop(
                     state,
@@ -1000,6 +1067,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                     msgs_snapshot,
                     best_effort=False,
                     expected_history_key=expected_history_key,
+                    expected_slot_name=name,
                 )
             )
             try:

@@ -16,13 +16,14 @@ subprocesses, no real Slack/HTTP, and every filesystem write lands in
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -31,6 +32,13 @@ import kiro_crew.config.loader as loader
 import kiro_crew.dashboard.handlers.messaging as mod
 from conftest import forget_env_at_teardown
 from kiro_crew.subagent import AGENT_NOT_FOUND_CODE
+
+#: The subject every request double presents, and the id ``_state`` reports as its
+#: owner. These suites exercise body validation and response shape, not
+#: authorization, so the caller they model is the owner's own dashboard session --
+#: the one the owner gate admits. A test that means to model somebody else passes
+#: its own ``extra={"user": ...}``.
+_OWNER_SUBJECT = "U0OWNER0000"
 
 
 class _Req:
@@ -52,10 +60,15 @@ class _Req:
         self.query = query or {}
         self.headers: dict[str, str] = {}
         self.remote = remote
-        self._extra = {"app": "", **(extra or {})}
+        self._extra = {"app": "", "user": _OWNER_SUBJECT, **(extra or {})}
 
     def __contains__(self, key: str) -> bool:
         return key in self._extra
+
+    def __getitem__(self, key: str) -> Any:
+        # The owner predicate reads ``request["app"]`` directly after testing
+        # membership, so the double needs the read as well as the ``in``.
+        return self._extra[key]
 
     async def json(self) -> Any:
         if isinstance(self._body, BaseException):
@@ -89,6 +102,7 @@ def _payload(resp: web.Response) -> Any:
 def _state(**kw: Any) -> Any:
     """A DashboardState double with the JSON-serializable fields pinned."""
     state = MagicMock()
+    state.owner_id = _OWNER_SUBJECT
     state.subagents = None
     state.slack_client = None
     state._native_cards = {}
@@ -111,6 +125,8 @@ def _info(**kw: Any) -> Any:
         "result": "",
         "result_path": "",
         "started": 1_700_000_000.0,
+        "elapsed": 0.0,
+        "credits": 0.0,
         "turns": 2,
         "last_tool": "fs_read",
         "parent_session_key": "dashboard:chat-1",
@@ -143,6 +159,8 @@ def _mgr(**kw: Any) -> Any:
     mgr.all_agents = []
     mgr._agents = {}
     mgr._tasks = {}
+    mgr.get.return_value = None
+    mgr.settle_before_delete = AsyncMock(return_value="delivered")
     for key, val in kw.items():
         setattr(mgr, key, val)
     return mgr
@@ -256,6 +274,33 @@ class TestApiSpawn:
         req = _Req(_state(subagents=mgr), {"task": "x", "batch_total": "many"})
         assert _run(mod.api_spawn, req).status == 200
         assert mgr.spawn.call_args.kwargs["batch_total"] == 0
+
+    def test_a_deferred_row_answers_queued_with_the_gate_reason(self) -> None:
+        """The memory guard parked the row: the caller is told it WAITS and why,
+        under the same ``id`` (the wave reconcile and the run card key on it)."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(
+            id="q1",
+            queued=True,
+            queued_reason="low_memory",
+            queued_reason_detail="low memory: 3.2 GB available, need 4 GB",
+        )
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["id"] == "q1"
+        assert body["status"] == "queued"
+        assert body["reason"] == "low_memory"
+        assert body["reason_detail"] == "low memory: 3.2 GB available, need 4 GB"
+
+    def test_a_capacity_queued_row_still_answers_spawned(self) -> None:
+        """Waiting behind the cap for a stagger tick is the ordinary wave shape;
+        its wire answer does not change."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(id="q2", queued=True, queued_reason="concurrency_limit")
+        body = _payload(_run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"})))
+        assert body["status"] == "spawned"
+        assert "reason" not in body
 
     @pytest.mark.parametrize("source", ["crew", "subagent"])
     @pytest.mark.parametrize("unavailable", [False, True])
@@ -536,7 +581,7 @@ class TestApiSpawnMarkCollected:
         assert _payload(_run(mod.api_spawn_mark_collected, req)) == {"status": "no_slot"}
 
     def test_records_ids_bounded_and_skips_non_strings(self) -> None:
-        slot = SimpleNamespace(_subagents_inline_collected=set())
+        slot = SimpleNamespace(_subagents_inline_collected=set(), _queue=[])
         state = _state()
         state.get_slot.return_value = slot
         ids: list[Any] = [f"a{i}" for i in range(250)] + ["", 7]
@@ -645,6 +690,78 @@ class TestApiSpawnStatus:
         assert data["result"].strip() == "all good"
         assert "orphaned by restart" in data["error"]
 
+    def test_disk_fallback_reads_tombstone_off_event_loop(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        agent_dir = tmp_path / "a1"
+        agent_dir.mkdir()
+        caller_thread = threading.get_ident()
+        reader_threads: list[int] = []
+
+        def _read_tombstone(_agent_id: str) -> dict[str, object]:
+            reader_threads.append(threading.get_ident())
+            return {"cause": "delivered", "elapsed": 4.0, "credits": 0.5}
+
+        mgr = _mgr()
+        mgr.get.return_value = None
+        monkeypatch.setattr(mod, "read_state", lambda aid: {"task": "t"})
+        monkeypatch.setattr(mod, "read_tombstone", _read_tombstone)
+        monkeypatch.setattr(mod, "_agent_dir", lambda aid: agent_dir)
+        req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
+
+        data = _payload(_run(mod.api_spawn_status, req))
+
+        assert reader_threads and reader_threads[0] != caller_thread
+        assert data["elapsed"] == 4.0
+        assert data["credits"] == 0.5
+
+    def test_disk_fallback_does_not_trust_agent_state_usage(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        agent_dir = tmp_path / "a1"
+        agent_dir.mkdir()
+        mgr = _mgr()
+        mgr.get.return_value = None
+        monkeypatch.setattr(
+            mod,
+            "read_state",
+            lambda aid: {"task": "t", "elapsed": 999.0, "credits": 999.0},
+        )
+        monkeypatch.setattr(
+            mod,
+            "read_tombstone",
+            lambda aid: {"cause": "delivered", "elapsed": 4.0, "credits": 0.5},
+        )
+        monkeypatch.setattr(mod, "_agent_dir", lambda aid: agent_dir)
+        req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
+
+        data = _payload(_run(mod.api_spawn_status, req))
+
+        assert data["elapsed"] == 4.0
+        assert data["credits"] == 0.5
+
+    @pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "0.5"])
+    def test_disk_fallback_omits_unsafe_tombstone_usage(
+        self, monkeypatch, tmp_path: Path, value: object
+    ) -> None:
+        agent_dir = tmp_path / "a1"
+        agent_dir.mkdir()
+        mgr = _mgr()
+        mgr.get.return_value = None
+        monkeypatch.setattr(mod, "read_state", lambda aid: {"task": "t"})
+        monkeypatch.setattr(
+            mod,
+            "read_tombstone",
+            lambda aid: {"cause": "delivered", "elapsed": value, "credits": value},
+        )
+        monkeypatch.setattr(mod, "_agent_dir", lambda aid: agent_dir)
+        req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
+
+        data = _payload(_run(mod.api_spawn_status, req))
+
+        assert "elapsed" not in data
+        assert "credits" not in data
+
     def test_disk_fallback_reports_unknown_cause_on_corrupt_tombstone(
         self, monkeypatch, tmp_path: Path
     ) -> None:
@@ -679,26 +796,54 @@ class TestApiSpawnStatus:
         assert data["result_meta"]["offset"] == 1
         assert data["error"] == ""
 
-    def test_running_agent_reports_progress_fields(self) -> None:
+    def test_running_agent_reports_redacted_partial_transcript(self) -> None:
+        streaming_text = "working\nsecret AKIAIOSFODNN7EXAMPLE\nstill working"
         mgr = _mgr()
-        mgr.get.return_value = _info(done=False)
+        mgr.get.return_value = _info(done=False, streaming_text=streaming_text)
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
         data = _payload(_run(mod.api_spawn_status, req))
         assert data["done"] is False
+        assert data["result"] == mod._redact(streaming_text)
         assert data["turns"] == 2 and data["last_tool"] == "fs_read"
         assert isinstance(data["elapsed"], int)
+
+    def test_running_agent_pages_partial_transcript(self) -> None:
+        mgr = _mgr()
+        mgr.get.return_value = _info(done=False, streaming_text="l0\nl1\nl2")
+        req = _Req(
+            _state(subagents=mgr),
+            None,
+            match_info={"agent_id": "a1"},
+            query={"offset": "1", "limit": "1"},
+        )
+        data = _payload(_run(mod.api_spawn_status, req))
+        assert data["done"] is False
+        assert data["result"] == "l1"
+        assert data["result_meta"] == {
+            "total_lines": 3,
+            "offset": 1,
+            "returned_lines": 1,
+            "has_more": True,
+        }
 
     def test_done_agent_prefers_full_result_from_disk(self, tmp_path: Path) -> None:
         result_file = tmp_path / "result.txt"
         result_file.write_text("full transcript", encoding="utf-8")
         mgr = _mgr()
         mgr.get.return_value = _info(
-            done=True, result="truncated", result_path=str(result_file), error="oops"
+            done=True,
+            result="truncated",
+            result_path=str(result_file),
+            error="oops",
+            elapsed=28.5,
+            credits=0.75,
         )
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
         data = _payload(_run(mod.api_spawn_status, req))
         assert data["result"] == "full transcript"
         assert data["error"] == "oops"
+        assert data["elapsed"] == 28.5
+        assert data["credits"] == 0.75
 
     def test_done_agent_falls_back_to_in_memory_result_on_read_error(self, tmp_path: Path) -> None:
         mgr = _mgr()
@@ -720,18 +865,30 @@ class TestApiSpawnList:
         mgr = _mgr(
             all_agents=[
                 _info(id="run", done=False),
-                _info(id="fin", done=True, result="r", error="e", outcome="failed"),
+                _info(
+                    id="fin",
+                    done=True,
+                    result="r",
+                    error="e",
+                    outcome="failed",
+                    elapsed=42.5,
+                    credits=1.25,
+                ),
             ]
         )
         agents = _payload(_run(mod.api_spawn_list, _Req(_state(subagents=mgr))))["agents"]
         assert [a["id"] for a in agents] == ["run", "fin"]
         assert "turns" in agents[0] and "result" not in agents[0]
         assert agents[1]["outcome"] == "failed" and agents[1]["stopped"] is False
+        assert "elapsed" not in agents[1]
+        assert "credits" not in agents[1]
 
     def test_finished_agent_without_error_reports_empty_string(self) -> None:
         mgr = _mgr(all_agents=[_info(done=True, error="")])
         agents = _payload(_run(mod.api_spawn_list, _Req(_state(subagents=mgr))))["agents"]
         assert agents[0]["error"] == ""
+        assert "elapsed" not in agents[0]
+        assert "credits" not in agents[0]
 
 
 class TestApiSpawnRetry:
@@ -798,6 +955,65 @@ class TestApiSpawnRetry:
         assert mgr.spawn.call_args.args[0] == "original task"
         assert "batch_id" not in mgr.spawn.call_args.kwargs
 
+    def test_refuses_a_run_whose_successor_claim_is_taken(self) -> None:
+        """The manager's claim decides; the route starts nothing when it is taken."""
+        mgr = _mgr()
+        mgr.get.return_value = _info(done=True, outcome="failed", _raw_task="original task")
+        mgr.claim_retry.return_value = "c1"
+        resp = _run(mod.api_spawn_retry, self._req(mgr))
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "retry_superseded"
+        assert "c1" in _payload(resp)["error"]
+        mgr.claim_retry.assert_called_once_with(mgr.get.return_value)
+        mgr.spawn.assert_not_called()
+
+    def test_a_landed_retry_settles_its_claim_with_the_new_id(self) -> None:
+        mgr = _mgr()
+        old = _info(done=True, outcome="failed", _raw_task="t")
+        mgr.get.return_value = old
+        mgr.claim_retry.return_value = ""
+        mgr.spawn.return_value = _info(id="new")
+        assert _run(mod.api_spawn_retry, self._req(mgr)).status == 200
+        assert mgr.settle_retry.call_args_list[0].args == (old, "new")
+
+    def test_a_start_that_raises_keeps_the_claim(self) -> None:
+        """The start may have accepted its row before raising, so the run is
+        not handed back as retryable."""
+        mgr = _mgr()
+        mgr.get.return_value = _info(done=True, outcome="failed", _raw_task="t")
+        mgr.claim_retry.return_value = ""
+        old = mgr.get.return_value
+        mgr.spawn.side_effect = RuntimeError("store write raised")
+        with pytest.raises(RuntimeError):
+            _run(mod.api_spawn_retry, self._req(mgr))
+        assert mgr.settle_retry.call_args_list[0].args == (old, mod.SUCCESSOR_UNKNOWN)
+
+    def test_a_raise_before_the_spawn_releases_the_claim(self) -> None:
+        """Nothing can have landed before the spawn is reached, so the run stays
+        retryable."""
+        mgr = _mgr()
+        old = _info(done=True, outcome="failed", _raw_task="t", agent="proj-agent")
+        mgr.get.return_value = old
+        mgr.claim_retry.return_value = ""
+        with (
+            patch.object(
+                mod, "warm_project_agents_for_spawn", AsyncMock(side_effect=RuntimeError("x"))
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            _run(mod.api_spawn_retry, self._req(mgr))
+        assert mgr.settle_retry.call_args_list == [((old, None),)]
+        mgr.spawn.assert_not_called()
+
+    def test_a_refused_start_releases_the_claim(self) -> None:
+        mgr = _mgr()
+        old = _info(done=True, outcome="failed", _raw_task="t")
+        mgr.get.return_value = old
+        mgr.claim_retry.return_value = ""
+        mgr.spawn.return_value = None
+        assert _run(mod.api_spawn_retry, self._req(mgr)).status == 429
+        assert mgr.settle_retry.call_args_list == [((old, None),)]
+
     def test_falls_back_to_redacted_task_when_raw_is_empty(self) -> None:
         mgr = _mgr()
         mgr.get.return_value = _info(done=True, outcome="failed", _raw_task="", task="shown")
@@ -852,21 +1068,53 @@ class TestApiSpawnDelete:
         req = _Req(state, None, match_info={"agent_id": "native:c1"})
         assert _payload(_run(mod.api_spawn_delete, req))["ok"] is True
 
+    def test_managed_delete_settlement_uses_one_public_manager_seam(self) -> None:
+        """The HTTP handler does not own manager report or registry internals."""
+        source = inspect.getsource(mod.api_spawn_delete)
+
+        assert ".settle_before_delete(" in source
+        for private in (
+            "._agents",
+            "._tasks",
+            "._run_terminal_report",
+        ):
+            assert private not in source
+
     def test_404_when_managed_agent_is_unknown(self) -> None:
         req = _Req(_state(subagents=_mgr()), None, match_info={"agent_id": "a1"})
         assert _run(mod.api_spawn_delete, req).status == 404
 
     def test_cancels_a_running_agent(self) -> None:
-        mgr = _mgr(_agents={"a1": _info()}, cancel=AsyncMock(return_value=True))
+        info = _info()
+        mgr = _mgr(_agents={"a1": info}, cancel=AsyncMock(return_value=True))
+        mgr.get.return_value = info
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
         assert _payload(_run(mod.api_spawn_delete, req)) == {"ok": True, "cancelled": True}
 
     def test_removes_an_already_finished_agent(self) -> None:
-        mgr = _mgr(_agents={"a1": _info()}, cancel=AsyncMock(return_value=False))
-        mgr._tasks = {"a1": object()}
+        info = _info()
+        mgr = _mgr(_agents={"a1": info}, cancel=AsyncMock(return_value=False))
+        mgr.get.return_value = info
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
+
         assert _payload(_run(mod.api_spawn_delete, req))["cancelled"] is False
-        assert mgr._agents == {} and mgr._tasks == {}
+        mgr.settle_before_delete.assert_awaited_once_with("a1")
+
+    def test_preserves_finished_agent_while_settlement_is_pending(self) -> None:
+        info = _info(parent_session_key="dashboard:chat-1")
+        mgr = _mgr(
+            _agents={"a1": info},
+            cancel=AsyncMock(return_value=False),
+            settle_before_delete=AsyncMock(return_value="pending"),
+        )
+        mgr.get.return_value = info
+        req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
+
+        response = _run(mod.api_spawn_delete, req)
+
+        assert response.status == 409
+        assert _payload(response)["code"] == "completion_delivery_pending"
+        mgr.settle_before_delete.assert_awaited_once_with("a1")
 
 
 class TestApiSpawnStopAll:
@@ -1576,12 +1824,12 @@ class TestTeamsConfigSave:
         monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
         monkeypatch.setenv("MICROSOFT_APP_PASSWORD", "")
 
-        import kiro_crew.agent as _agent
-
         def _boom(*_a, **_k):
             raise OSError("disk full during config write")
 
-        monkeypatch.setattr(_agent, "_atomic_json_write", _boom)
+        # The save writes through ``update_config_locked``, whose file write is
+        # the loader's ``write_config_atomically``; failing THAT is the disk-full.
+        monkeypatch.setattr(loader, "write_config_atomically", _boom)
         try:
             _run(mod.api_teams_config_save, _Req(_state(), {"app_password_clear": True}))
         except Exception:

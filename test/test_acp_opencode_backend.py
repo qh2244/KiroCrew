@@ -157,7 +157,10 @@ def test_the_handshake_is_the_spec_dialect():
     table = acp_client._PROTOCOL_VERSION_BY_BACKEND
     assert table[ACP_BACKEND_OPENCODE] == PROTOCOL_VERSION_OPENCODE
     assert table.get("", acp_client.PROTOCOL_VERSION) == acp_client.PROTOCOL_VERSION
-    body = inspect.getsource(AcpClient._initialize_session)
+    # The params are spelled once, in _initialize_params, which both the session
+    # handshake and the entitlement probe's handshake read.
+    assert "self._initialize_params()" in inspect.getsource(AcpClient._initialize_session)
+    body = inspect.getsource(AcpClient._initialize_params)
     assert "_PROTOCOL_VERSION_BY_BACKEND.get(" in body
     assert "PROTOCOL_VERSION_OPENCODE if" not in body
 
@@ -278,6 +281,62 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         issue, remedy = self._client(tmp_path)._verify_opencode_routing(_ARGV, "{}")
         assert "exit 3" in issue
         assert "debug config" in remedy
+
+    def test_the_mcp_servers_of_the_harnesss_own_config_are_recorded(self, tmp_path, monkeypatch):
+        """The read-back names the servers opencode mounts itself, for hook matching."""
+
+        class _Completed:
+            returncode = 0
+            stdout = (
+                'banner\n{"permission": "ask", "mcp": {"docs.server": {"type": "local"},'
+                ' "kirocrew-core": {"type": "local"}}}'
+            )
+            stderr = ""
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        client = self._client(tmp_path)
+        assert client._opencode_config_mcp_servers == ()
+        issue, _remedy = client._verify_opencode_routing(_ARGV, "{}")
+        assert issue == ""
+        assert client._opencode_config_mcp_servers == ("docs.server",)
+
+    def test_only_the_names_opencode_rewrites_are_kept(self):
+        from kiro_crew.acp.client import _opencode_config_mcp_server_names
+
+        resolved = {"mcp": {"docs.server": {}, "kirocrew-core": {}, "a_b": {}}}
+        assert _opencode_config_mcp_server_names(resolved) == (("docs.server",), "")
+
+    @pytest.mark.parametrize("shape", ["count", "length"])
+    def test_a_config_past_the_bounds_refuses_the_session(self, shape, tmp_path, monkeypatch):
+        """Bounded by refusing, never by truncating: a dropped name would miss its deny."""
+        from kiro_crew.acp.harness_tool_names import (
+            MAX_HARNESS_CONFIG_MCP_SERVERS,
+            MAX_HARNESS_TOOL_NAME_LEN,
+        )
+
+        if shape == "count":
+            servers = {f"s.{i}": {} for i in range(MAX_HARNESS_CONFIG_MCP_SERVERS + 1)}
+        else:
+            servers = {"x" * (MAX_HARNESS_TOOL_NAME_LEN + 1): {}}
+        # Names opencode writes as they are do not count toward the bound.
+        plain = {f"s{i}": {} for i in range(MAX_HARNESS_CONFIG_MCP_SERVERS + 1)}
+
+        def _completed(mcp):
+            class _Completed:
+                returncode = 0
+                stdout = json.dumps({"permission": "ask", "mcp": mcp})
+                stderr = ""
+
+            return _Completed()
+
+        client = self._client(tmp_path)
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _completed(plain))
+        assert client._verify_opencode_routing(_ARGV, "{}") == ("", "")
+        monkeypatch.setattr(
+            acp_client.subprocess_mod, "run", lambda *_a, **_kw: _completed(servers)
+        )
+        issue, remedy = client._verify_opencode_routing(_ARGV, "{}")
+        assert "MCP server" in issue and "opencode's own config" in remedy
 
     def test_the_childs_own_reason_reaches_the_refusal(self, tmp_path, monkeypatch):
         """The child's own reason reaches the refusal, as on the pi read-back."""
@@ -706,3 +765,73 @@ def test_the_spawn_arm_refuses_before_the_first_prompt() -> None:
 def test_the_backend_declares_the_verified_mechanism() -> None:
     """Named here so a change of mechanism cannot pass as a refactor."""
     assert routing_for(ACP_BACKEND_OPENCODE) is Routing.VERIFIED_SEEDED_SETTINGS
+
+
+# ── A per-tool rule from a lower config source ───────────────────────────────
+
+
+class TestATrailingAskRuleOutranksTheRulesBeforeIt:
+    """OpenCode checks rules in order and the LAST match wins; ``"*"`` matches all.
+
+    The seed's ``"*": "ask"`` is merged in AFTER a lower source's per-tool keys,
+    because the harness merges sources key by key. Measured on opencode 1.18.30 and
+    1.18.32: with ``{"bash": "allow"}`` in the operator's global ``opencode.json`` the
+    resolved map is ``{"bash": "allow", "*": "ask"}`` and ``bash`` asks before it
+    runs. Main refused that map, so every session on such a host was refused.
+    """
+
+    def test_a_trailing_ask_after_an_allowed_tool_is_ask(self):
+        assert _opencode_uniform_permission({"bash": "allow", "*": "ask"}) == "ask"
+
+    def test_a_trailing_ask_after_a_pattern_map_is_ask(self):
+        raw = {"bash": {"git *": "allow", "*": "ask"}, "edit": "allow", "*": "ask"}
+        assert _opencode_uniform_permission(raw) == "ask"
+
+    def test_order_matters_a_leading_ask_is_outranked(self):
+        """``{"*": "ask", "bash": "allow"}`` lets ``bash`` win: still refused."""
+        observed = _opencode_uniform_permission({"*": "ask", "bash": "allow"})
+        assert observed != "ask"
+        assert "bash" in str(observed)
+
+    def test_a_trailing_allow_is_not_ask(self):
+        observed = _opencode_uniform_permission({"bash": "ask", "*": "allow"})
+        assert observed != "ask"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"webfetch": "deny", "*": "ask"},
+            {"bash": "allow", "webfetch": "deny", "*": "ask"},
+            {"bash": {"pwd": "deny", "git *": "allow"}, "*": "ask"},
+        ],
+    )
+    def test_a_deny_the_trailing_ask_would_outrank_stays_refused(self, raw):
+        """The trailing ``"*"`` would turn the operator's ``deny`` into a prompt, and
+        an auto-approving session would then run the call they switched off. Measured
+        live: ``bash: {"pwd": "deny"}`` with ``"*": "ask"`` after it asks and runs
+        ``pwd``. So a map carrying any deny is not read as ``ask``."""
+        assert _opencode_uniform_permission(raw) != "ask"
+
+    def test_the_read_back_accepts_the_merged_shape(self, tmp_path, monkeypatch):
+        class _Completed:
+            returncode = 0
+            stdout = '{"permission": {"bash": "allow", "edit": "allow", "*": "ask"}}'
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        assert client._verify_opencode_routing(_ARGV, '{"permission": "ask"}') == ("", "")
+
+    def test_an_agent_map_follows_the_same_rule(self, tmp_path, monkeypatch):
+        """The agent-level check shares the reducer, so the order rule holds there."""
+
+        class _Completed:
+            returncode = 0
+            stdout = (
+                '{"permission": {"*": "ask"}, "agent": {'
+                '"build": {"permission": {"*": "ask", "bash": "allow"}, "options": {}}}}'
+            )
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        issue, _remedy = client._verify_opencode_routing(_ARGV, "{}")
+        assert "'build'" in issue

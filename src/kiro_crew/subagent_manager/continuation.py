@@ -28,7 +28,6 @@ if TYPE_CHECKING:
         sel,
         time,
         update_state,
-        uuid,
     )
 
 
@@ -113,15 +112,16 @@ class ContinuationCoordinator(ManagerComponent):
         would then die with ``resume_failed``), or let a second continue race
         the same conversation.
 
-        A FINISHED run also holds its conversation while its id sits in
-        ``_abandoned_state_writers``: its bounded state-write drain expired, so a
-        worker is still live and its stale whole-file rewrite would roll back the
-        ``keep`` that this gate's two callers write on the loop. Holding
-        defers those writes past the worker instead of letting it undo them. That
-        record lives on the manager rather than on the run, because
-        ``evict_completed_agents`` prunes completed runs out of ``_agents`` and an
-        eviction must not release the hold; the worker's own done-callback
-        discards the id, so the hold lasts exactly as long as the danger.
+        A FINISHED run also holds its conversation while its id is a key of
+        ``_abandoned_state_writers``: a worker of that run (a drain that expired,
+        or the final cap of a run already ``done``) is still live, and its stale
+        whole-file rewrite would roll back the ``keep`` that this gate's two
+        callers write on the loop. Holding defers those writes past the worker
+        instead of letting it undo them. That record lives on the manager rather
+        than on the run, because ``evict_completed_agents`` prunes completed runs
+        out of ``_agents`` and an eviction must not release the hold; each
+        worker's own done-callback removes that worker, and the id goes with the
+        run's LAST live worker, so the hold lasts exactly as long as the danger.
         """
         for a in self._manager._agents.values():
             if not a.done and (a.conversation_key or f"subagent:{a.id}") == conv_key:
@@ -465,7 +465,7 @@ class ContinuationCoordinator(ManagerComponent):
                 )
         except (OSError, ValueError) as exc:
             return SubagentInfo(
-                id=_preassigned_id or uuid.uuid4().hex[:8],
+                id=_preassigned_id or self._manager._mint_agent_id(),
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -532,7 +532,7 @@ class ContinuationCoordinator(ManagerComponent):
         busy = self._manager._conversation_busy(conv_key)
         if busy is not None:
             info = SubagentInfo(
-                id=uuid.uuid4().hex[:8],
+                id=self._manager._mint_agent_id(),
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -570,7 +570,7 @@ class ContinuationCoordinator(ManagerComponent):
             native_refusal = self.native_child_resume_refusal(conv_id)
             if native_refusal is not None:
                 return SubagentInfo(
-                    id=uuid.uuid4().hex[:8],
+                    id=self._manager._mint_agent_id(),
                     task=_redact(task),
                     done=True,
                     parent_session_key=parent_session_key,
@@ -586,7 +586,7 @@ class ContinuationCoordinator(ManagerComponent):
             except Exception:
                 pass
             info = SubagentInfo(
-                id=uuid.uuid4().hex[:8],
+                id=self._manager._mint_agent_id(),
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -607,7 +607,7 @@ class ContinuationCoordinator(ManagerComponent):
                 memory_store = self._manager._inherited_memory_store(conv_id)
         except (OSError, ValueError) as exc:
             return SubagentInfo(
-                id=_preassigned_id or uuid.uuid4().hex[:8],
+                id=_preassigned_id or self._manager._mint_agent_id(),
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -629,7 +629,7 @@ class ContinuationCoordinator(ManagerComponent):
                 raise ValueError("protected app ownership unavailable; start a new conversation")
         except (OSError, ValueError) as exc:
             return SubagentInfo(
-                id=_preassigned_id or uuid.uuid4().hex[:8],
+                id=_preassigned_id or self._manager._mint_agent_id(),
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -658,7 +658,7 @@ class ContinuationCoordinator(ManagerComponent):
             else:
                 self._manager._conversations[conv_key] = previous_last_used
             return SubagentInfo(
-                id=uuid.uuid4().hex[:8],
+                id=self._manager._mint_agent_id(),
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -834,6 +834,14 @@ class ContinuationCoordinator(ManagerComponent):
                     f"not registered within {_STEER_STARTUP_WAIT_SECS}s — "
                     "retry in a few seconds"
                 )
+        if provider.steer_needs_loss_recovery is True:
+            # codex can drop a steer it reported delivered when a later approval
+            # in the turn is denied, and a subagent run keeps no pending-steer
+            # record to requeue it from. Refuse so the caller queues instead.
+            return False, (
+                "steer_unsupported: this run's backend cannot guarantee a mid-turn "
+                "steer — use mode='follow_up'"
+            )
         try:
             ok = await provider.steer(message)
         except Exception as exc:  # pragma: no cover - provider-specific
@@ -916,9 +924,13 @@ class ContinuationCoordinator(ManagerComponent):
         run_info = info  # narrowed local: mypy loses the None-narrow in closure defaults
         task = asyncio.create_task(self._manager._deliver_followups(info))
         self._manager._followup_watchers[run_id] = task
+        self._manager._followup_watcher_parents[run_id] = info.parent_session_key
+        self._manager._followup_watcher_infos[run_id] = info
 
         def _done(t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info) -> None:
             self._manager._followup_watchers.pop(_id, None)
+            self._manager._followup_watcher_parents.pop(_id, None)
+            self._manager._followup_watcher_infos.pop(_id, None)
             _info._followup_watcher = False
             if not t.cancelled() and t.exception() is not None:
                 logger.warning("follow_up watcher for %s failed", _id, exc_info=t.exception())
@@ -1087,7 +1099,7 @@ class ContinuationCoordinator(ManagerComponent):
         # matching the former 120-chars-per-message cap.
         followup_label = _redact("; ".join(label_msgs))[: 120 * len(label_msgs)]
         synthetic = failure_info or SubagentInfo(
-            id=uuid.uuid4().hex[:8],
+            id=self._manager._mint_agent_id(),
             task=f"[follow_up of run {info.id}] " + (followup_label or "queued follow-up"),
             done=True,
             parent_session_key=info.parent_session_key,

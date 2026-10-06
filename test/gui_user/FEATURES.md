@@ -26,7 +26,7 @@ under `scenarios/` says how the lane checks it.
 
 | | Total | smoke | nightly | native-only | needs-secret | excluded |
 |---|---|---|---|---|---|---|
-| **All features** | 269 | 42 | 166 | 12 | 27 | 22 |
+| **All features** | 270 | 42 | 167 | 12 | 27 | 22 |
 | Chat sessions (`chat`) | 26 | 3 | 19 | 0 | 2 | 2 |
 | Side panel tabs (`side-panel`) | 4 | 1 | 3 | 0 | 0 | 0 |
 | Terminal panel (`terminal`) | 3 | 0 | 3 | 0 | 0 | 0 |
@@ -34,7 +34,7 @@ under `scenarios/` says how the lane checks it.
 | Routing & redirects (`navigation`) | 10 | 0 | 10 | 0 | 0 | 0 |
 | Top bar (`topbar`) | 3 | 0 | 3 | 0 | 0 | 0 |
 | Search everywhere & command palette (`search`) | 1 | 1 | 0 | 0 | 0 | 0 |
-| Crew Members (`members`) | 3 | 0 | 3 | 0 | 0 | 0 |
+| Crew Members (`members`) | 4 | 0 | 4 | 0 | 0 | 0 |
 | Agent capabilities (crews, templates, skills, prompts, steering, hooks, workflows) (`capabilities`) | 14 | 2 | 12 | 0 | 0 | 0 |
 | Connections (MCP servers & services) (`connections`) | 2 | 1 | 0 | 0 | 1 | 0 |
 | Memory, lessons & usage (`memory`) | 6 | 1 | 4 | 0 | 1 | 0 |
@@ -54,7 +54,7 @@ under `scenarios/` says how the lane checks it.
 | Notifications (`notifications`) | 5 | 2 | 0 | 1 | 0 | 2 |
 | Computer Use (`computer-use`) | 3 | 0 | 1 | 2 | 0 | 0 |
 | Multi-instance shell (`instances`) | 2 | 1 | 0 | 0 | 1 | 0 |
-| Remote instances & cloud launch (`remote-instances`) | 4 | 0 | 1 | 0 | 1 | 2 |
+| Remote crews & cloud launch (`remote-instances`) | 4 | 0 | 1 | 0 | 1 | 2 |
 | Popouts & embeds (`popout`) | 6 | 0 | 4 | 2 | 0 | 0 |
 | Authentication & sign-in (`auth`) | 3 | 2 | 0 | 0 | 0 | 1 |
 | Onboarding (`onboarding`) | 4 | 0 | 4 | 0 | 0 | 0 |
@@ -63,7 +63,7 @@ under `scenarios/` says how the lane checks it.
 | Security & governance (`security`) | 10 | 1 | 9 | 0 | 0 | 0 |
 | Developer tools (`developer`) | 12 | 0 | 12 | 0 | 0 | 0 |
 
-Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
+Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 
 ## Chat sessions (`chat`)
 
@@ -117,7 +117,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 | P1 | `chat-older-sessions` | As a user, I want a searchable history pane of closed sessions with per-session and bulk delete, so that I can revisit or prune past work. | `/chat` | sessions-long-history | smoke | 4 |
 | P1 | `chat-sessions-page` | As a dashboard user, I want a bookmarkable session chooser with search, filter chips and recency groups, so that I can pick a session without one being auto-selected or auto-created. | `/sessions` | sessions-a-few | smoke | 3 |
 | P1 | `sidebar-rail-collapse-expand` | As a user, I want to collapse the rail to icons, so that I have more room for content. | `/chat` | minimal | smoke | 2 |
-| P1 | `sidebar-rail-order-and-active-state` | As a user, I want the rail to list Sessions, Schedule, Artifacts, then Apps/Discover/Library, then Agent Capabilities and Settings, so that navigation is predictable. | `/schedule` | minimal | smoke | 1 |
+| P1 | `sidebar-rail-order-and-active-state` | As a user, I want the rail to list Sessions, Schedule, Artifacts, then Apps/Discover/Library, then Customize and Settings, so that navigation is predictable. | `/schedule` | minimal | smoke | 1 |
 | P2 | `chat-fork-session` | As a user, I want to branch a new slot from an existing transcript, keeping incognito or temporary mode on the child, so that I can explore an alternative without losing the original. | `/chat` | incognito-mix | nightly | 3 |
 | P2 | `chat-session-folders` | As a user with many sessions, I want to group session rows into folders and start mode-pinned ephemeral chats inside them, so that my sidebar stays organised. | `/chat` | sessions-a-few | nightly | 6 |
 | P2 | `chat-session-tags` | As a user, I want to put coloured labels on sessions and filter by them, so that I can find related conversations quickly. | `/chat` | sessions-a-few | nightly | 5 |
@@ -134,7 +134,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
 | P2 | `capabilities-pin-tab-to-rail` | As a daily user of one capability tab, I want to pin it as its own rail row (up to NAV_PINNED_LIMIT), so that it is one click away instead of two. | `/capabilities` | minimal | nightly | 3 |
-| P2 | `redirect-agents` | As a user with an old bookmark, I want /agents and /mc-agents to land on Agent Capabilities, so that deep links keep working. | `/agents` | minimal | nightly | 1 |
+| P2 | `redirect-agents` | As a user with an old bookmark, I want /agents and /mc-agents to land on Customize, so that deep links keep working. | `/agents` | minimal | nightly | 1 |
 | P2 | `redirect-artifacts-deploy` | As a user with an old bookmark, I want /artifacts/deploy to land on /deploy, so that deep links keep working. | `/artifacts/deploy` | minimal | nightly | 1 |
 | P2 | `redirect-connections` | As a user with an old bookmark, I want /connections to land on the Connections tab, so that deep links keep working. | `/connections` | minimal | nightly | 1 |
 | P2 | `redirect-instances` | As a user with an old bookmark, I want /instances to land on Settings Instances, so that deep links keep working. | `/instances` | minimal | nightly | 1 |
@@ -163,6 +163,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
 | P0 | `members-crew-members` | As a crew operator, I want a durable DM thread per member with a docked side panel (Crew summary, activity by day, worker sessions, auto-patrol status) and a filterable roster, so that I can supervise each crew in one place. | `/members` | rich | nightly | 6 |
+| P1 | `crewmate-reply-thread` | As a user talking to a crewmate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the crewmate's findings up the main chat. | `/settings` | rich | nightly | 8 |
 | P1 | `members-private-memory-keeps-thread` | As a crew operator, I want a member's direct-message thread to survive leaving and returning to the member, so that our earlier conversation and the member's ability to answer are not lost. | `/settings` | rich | nightly | 8 |
 | P2 | `sidebar-crew-members-create-menu-entry` | As a user, I want the Crew Members menu entry to open the page or the setting that enables it, so that I can find the feature either way. | `/chat` | minimal | nightly | 3 |
 
@@ -328,7 +329,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 |---|---|---|---|---|---|---|
 | P1 | `sidebar-blank-instance` | As a first-time user, I want to see what the dashboard offers with no content, so that I know how to begin. | `/chat` | empty | smoke | 1 |
 
-## Remote instances & cloud launch (`remote-instances`)
+## Remote crews & cloud launch (`remote-instances`)
 
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
@@ -378,7 +379,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 | P2 | `chat-default-memory-mode` | As a privacy-conscious user, I want to choose Persistent, Incognito or Temporary as the default for new dashboard chats, so that new sessions follow my retention preference without a per-chat click. | `/settings/chat` | incognito-mix | nightly | 4 |
 | P2 | `notifications-channel-mute-and-priority-override` | As a user, I want per-channel mute and priority controls, so that noisy channels stay in history without badging while approvals stay critical. | `/settings/notifications` | minimal | nightly | 5 |
 | P2 | `settings-about-report-a-problem` | As a user, I want to click Report a Problem in Settings > About, so that I can file an issue with diagnostics attached. | `/settings/about` | minimal | nightly | 3 |
-| P2 | `settings-about-update-channel-and-notifications` | As a user, I want to choose stable or insider Update channel and toggle Notify when an update is available, so that I control how I receive updates. | `/settings/about` | minimal | nightly | 4 |
+| P2 | `settings-about-update-channel-and-notifications` | As a user, I want to choose stable or insider Update channel and set Update the gateway automatically, which installs updates and restarts where this install can and only notifies where it cannot, so that I control how I receive updates. | `/settings/about` | minimal | nightly | 4 |
 | P2 | `settings-browser-attach-token` | As a dashboard user, I want to paste an extension token in Settings > Browser, so that attaching to my own Chrome skips the per-attach prompt. | `/settings/browser` | minimal | nightly | 3 |
 | P2 | `settings-browser-panel` | As a dashboard user, I want to open Settings > Browser and see whether playwright-cli is installed and toggle the built-in browser, so that the agent can browse. | `/settings/browser` | minimal | nightly | 3 |
 | P2 | `settings-chat-content-width-buttongroup` | As a dashboard user, I want to switch Content Width in Settings > Chat, so that the chat column uses more or less of the screen. | `/settings/chat` | sessions-a-few | nightly | 3 |
@@ -388,7 +389,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 | P2 | `settings-developer-feature-previews` | As an early adopter, I want to turn on a feature preview in Settings > Developer, so that unfinished surfaces appear in the dashboard. | `/settings/developer` | minimal | nightly | 4 |
 | P2 | `settings-display-language-select` | As a non-English user, I want to change the dashboard Language in Settings > Display, so that the UI is shown in my language. | `/settings/display` | minimal | nightly | 3 |
 | P2 | `settings-display-session-color-palette` | As a dashboard user, I want to set the session colour palette and defaults in Settings > Display, so that sidebar rows are colour-coded. | `/settings/display` | sessions-a-few | nightly | 5 |
-| P2 | `settings-display-terminal-settings` | As a developer, I want to set the terminal shell, font, font size and command completion in Settings > Display, so that the built-in terminal matches my workflow. | `/settings/display` | minimal | nightly | 5 |
+| P2 | `settings-display-terminal-settings` | As a developer, I want to set the terminal shell, font, font size, command completion, and reuse-current-terminal in Settings > Display, so that the built-in terminal matches my workflow. | `/settings/display` | minimal | nightly | 5 |
 | P2 | `settings-display-zoom-level-stepper` | As a dashboard user, I want to step the Zoom Level in Settings > Display, so that the UI is larger or smaller. | `/settings/display` | minimal | nightly | 3 |
 | P2 | `settings-imports-panel` | As a new user, I want to import existing agent setups, so that I do not start from scratch. | `/settings/imports` | minimal | nightly | 3 |
 | P2 | `settings-notifications-category-sound-override` | As a dashboard user, I want to choose a different sound for Approval or Cron notifications, so that I can tell them apart by ear. | `/settings/notifications` | minimal | nightly | 4 |
@@ -430,7 +431,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
-| P2 | `developer-agent-backend` | As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness. | `/developer` | minimal | nightly | 3 |
+| P2 | `developer-agent-backend` | As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness. | `/settings/agent` | minimal | nightly | 3 |
 | P2 | `developer-archive` | As a developer, I want a consolidated session archive browser, so that I can inspect compacted history. | `/developer` | sessions-long-history | nightly | 3 |
 | P2 | `developer-config` | As a developer, I want raw Kiro Crew and agent config editors, so that I can fix a setting no panel exposes. | `/developer` | minimal | nightly | 3 |
 | P2 | `developer-debug-tools` | As a developer, I want diagnostic overlays such as the chat scroll inspector, so that I can debug layout issues. | `/developer` | sessions-a-few | nightly | 3 |
@@ -485,8 +486,8 @@ Features the lane cannot drive on its target. Listed so the gap is a decision, n
 | needs-secret | `settings-channels-whatsapp-configure` | channels | Configure WhatsApp channel (enable, who can message, how the agent joins in) | Real account pairing required for connection; conditional form rendering could be nightly. |
 | needs-secret | `stt-dictation-aws-transcribe` | voice | Dictate through AWS Transcribe after granting consent | Billed AWS service with real credentials and network; also needs a microphone, which the target lacks. |
 | needs-secret | `voice-polly-synthesis-with-aws-consent` | voice | Select Amazon Polly and pass the AWS consent gate before hearing a reply | A paid AWS service reached with real credentials over the network; the target has neither. |
-| needs-secret | `shell-instances-tab-bar-switching` | instances | Switch between Local and remote instance panes | Needs a reachable remote instance over a tunnel. |
-| needs-secret | `settings-instances-remote-crew` | remote-instances | Add a remote instance and switch panes via the header tab strip | Connecting needs a real peer and tunnel credentials; the form and empty tab strip are nightly-testable. |
+| needs-secret | `shell-instances-tab-bar-switching` | instances | Switch between Local and remote crew panes | Needs a reachable remote instance over a tunnel. |
+| needs-secret | `settings-instances-remote-crew` | remote-instances | Add a remote crew and switch panes via the header tab strip | Connecting needs a real peer and tunnel credentials; the form and empty tab strip are nightly-testable. |
 | needs-secret | `themes-install-pack-from-github` | themes | Install a theme pack from a github.com URL | Needs outbound network to github.com (and a sandbox backend), unavailable on the target. |
 | excluded | `chat-mcp-app-inline-render` | chat | An MCP App renders inline in chat as a sandboxed iframe with a live bridge | Not reachable on the fake backend/no-network target. |
 | excluded | `chat-workflow-launch-and-completion-cards` | chat | workflow_run shows a launch card and later a completion card in chat | Depends on real MCP tool execution by a model, absent on the fake ACP target. |

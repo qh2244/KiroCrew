@@ -2,7 +2,8 @@
 
 ``GET  /api/decisions/consent``   the keystone plus the endpoint config names now
 ``PUT  /api/decisions/consent``   ``{"enabled": bool}`` -> writes it, bound to that endpoint
-                                 plus the ``tool_args`` / ``compaction`` egress scopes,
+                                 plus the ``tool_args`` / ``compaction`` /
+                                 ``memory_text`` egress scopes,
                                  each preserved when its field is omitted
 ``POST /api/decisions/feedback``  a person's verdict on one turn -> one appended log row
 
@@ -61,6 +62,7 @@ from aiohttp import web
 
 from kiro_crew.dashboard.handlers._shared import _owner_denial_response
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,7 @@ _CODE_INVALID_JSON = "invalid_json"
 _CODE_INVALID_BODY = "decisions_consent_invalid_body"
 _CODE_CORRUPT = "decisions_consent_corrupt"
 _CODE_ENDPOINT_CHANGED = "decisions_consent_endpoint_changed"
+_CODE_NO_MODEL = "decisions_consent_no_model"
 _CODE_FEEDBACK_INVALID_BODY = "decisions_feedback_invalid_body"
 #: The append did not land -- a full day-file, a read-only home, a directory
 #: someone chmod-ed. 503 rather than 500: the request was valid and the caller may
@@ -143,6 +146,224 @@ async def _deny_non_owner(request: web.Request, operation: str) -> web.Response 
     return _owner_denial_response(request, "dashboard owner required", _CODE_OWNER_REQUIRED)
 
 
+#: Status a point row carries, as the EFFECTIVE answer rather than a switch
+#: position. ``off`` covers every reason nothing is sent -- no consent, a moved
+#: endpoint, a governance pin -- because a reader acting on the row cares that it is
+#: not running, and the card states the reason once above the list rather than
+#: per row.
+_POINT_ACTIVE = "active"
+#: Consent is given and the endpoint holds, but this point sends a category the
+#: owner has not agreed to (``tool.risk`` and the keystone's ``tool_args``). Its own
+#: value rather than ``off``, because the fix is a switch on the point's own panel
+#: and ``off`` would send the reader to the main switch that is already on.
+_POINT_NEEDS_SCOPE = "needs_scope"
+_POINT_OFF = "off"
+
+
+def _sampling_admits_anybody() -> bool:
+    """Whether ``decisions.bucket`` admits ANY session. Never raises.
+
+    A share of 0 admits nobody, so no point is ever asked and the seam does nothing
+    however the keystone reads. Anything unreadable is treated as admitting nobody,
+    the same fail-closed direction the gate's own bucket parse takes: reporting a
+    point as running on a config this handler could not parse is the one answer a
+    reader has no way to check.
+
+    Reads ``config.json`` synchronously, so it belongs on a worker thread: its only
+    caller is ``_points``, which both routes reach through ``asyncio.to_thread``.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        decisions = getattr(KiroCrewConfig.load(), "decisions", None)
+        return int(getattr(decisions, "bucket", 0)) > 0
+    except Exception:
+        logger.debug("decisions: sampled share unreadable; reporting no point as running")
+        return False
+
+
+def _judge_lane(jev_armed: bool) -> str:
+    """Which lane :data:`gate.JUDGE_POINT` would use, per the gate. Never raises.
+
+    Its own helper beside :func:`_sampling_admits_anybody` and for the same reason:
+    one synchronous ``config.json`` read, on the worker thread both routes already
+    reach ``_points`` through.
+
+    The RULE is not restated here. ``gate.judge_lane`` owns it -- including that
+    ``auto`` resolves against Jev being ARMED rather than merely consented, and that an
+    unknown provider name reads as ``auto`` -- so the lane this row names is the lane
+    the oracle is built from. *jev_armed* is that arming, already resolved by the
+    caller against the keystone and this point's own scope.
+
+    Anything unreadable resolves to the Jev lane, which the normal keystone rule then
+    judges: a config this handler could not parse must not be what reports a
+    key-free judge nobody configured.
+    """
+    from kiro_crew.decisions import gate as _gate
+
+    try:
+        return str(_gate.judge_lane(jev_consented=jev_armed) or _gate.LANE_JEV)
+    except Exception:
+        logger.debug("decisions: judge lane unreadable; judging the row on the keystone")
+        return _gate.LANE_JEV
+
+
+def _llm_lane_available() -> bool:
+    """Whether the judge's small-model lane could answer at all. Never raises.
+
+    ``auto`` resolves to that lane whenever Jev is not armed, so the row's answer for
+    ``auto`` depends on whether the lane has a model call to make. A build whose
+    runner was never registered has no judge on that lane -- every ask raises and the
+    tick fires -- and a row calling that ``active`` would be the same error this
+    function exists to prevent, in the other direction.
+    """
+    try:
+        from kiro_crew.decisions import impl_llm
+
+        return bool(impl_llm.has_runner())
+    except Exception:
+        logger.debug("decisions: LLM lane availability unreadable; reporting unavailable")
+        return False
+
+
+def _points(state: dict, *, permits: bool, denied: bool = False) -> list[dict]:
+    """One row per decision point this build ships, for the card's overview list.
+
+    Projected from the seam's own registry (``gate.DECISION_POINT_NAMES``,
+    ``gate.POINT_SCOPE_KEYS``) rather than
+    authored here or in the frontend: a build that ships another point lists it with
+    no edit on either side, and the set the card draws cannot disagree with the set
+    the gate will answer for. The card holds a LABEL per id, the same arrangement
+    ``agent_sdk/backend_cards.py`` and the Agent Backend panel use.
+
+    ``status`` is the SERVER's verdict for the same reason ``permits`` is: it is
+    derived from the keystone and the governance probe the caller already resolved,
+    so the row and the gate cannot report different answers for one point. It is
+    never a switch position -- ``off`` is every reason nothing would be sent.
+
+    *permits* is the effective "anything is sent at all" answer, governance denial
+    already folded in, so this function performs no probe of its own.
+
+    The SAMPLED SHARE is folded in on the same terms. ``decisions.bucket`` at 0 means
+    no session's key falls inside the sample, so every point is asked for nobody and
+    does nothing -- and a row reporting ``active`` there would tell a reader the seam
+    is working while no turn can reach it. That is the one status word a reader cannot
+    check for themselves, so it has to be the effective answer rather than the
+    consent-shaped one. ``off`` is already every reason nothing is sent, and a share of
+    zero is one of them; the share itself is on screen in the shared block, so a reader
+    who sees every row off has the reason one glance away.
+
+    ONE point is not read off the keystone: the judge has two providers, and its row
+    has to name the lane that would actually run. ``llm`` reaches the model provider
+    the owner's sessions already use, so that row needs neither the endpoint consent
+    nor this point's scope -- only a lane that can answer, which means a registered
+    runner. ``auto`` resolves to that same lane whenever Jev is not armed, so it is
+    ``active`` on either lane being able to answer. An explicitly pinned ``jev`` is
+    judged on the keystone AND this point's own scope, fail-closed the way the gate
+    reads it: a point with no registered scope has no grant to run that lane on. The
+    sampled share binds all three.
+    """
+    from kiro_crew.decisions import consent
+    from kiro_crew.decisions import gate as _gate
+
+    # Read per SCOPE rather than per point, and only for the scopes this build
+    # actually has: a point's row says whether ITS OWN consent is recorded, so a
+    # hardcoded reader would report the tool-argument answer for a point that needs
+    # the transcript scope. One read per distinct scope, reused across its points.
+    granted = {
+        key: bool(getattr(consent, f"consented_{key}")(state))
+        for key in set(_gate.POINT_SCOPE_KEYS.values())
+    }
+    # Read once for the whole projection rather than per row: it is one config read
+    # and every row resolves against the same answer, which is also what keeps the five
+    # rows from disagreeing about whether sampling admits anybody.
+    sampled = _sampling_admits_anybody()
+    rows: list[dict] = []
+    for name in _gate.DECISION_POINT_NAMES:
+        # From the gate's own scope map, so a point that gains a scope is listed with
+        # it and needs no edit here or in the card.
+        scope = _gate.POINT_SCOPE_KEYS.get(name)
+        # The judge is the one point with TWO providers, so its row cannot be read off
+        # the keystone alone: it has to name the lane that would actually run. Its LLM
+        # lane sends to the model provider the owner's sessions already use, which is
+        # why it needs neither the endpoint consent nor this point's scope -- only a
+        # runner to call -- so a row reporting ``off`` while that lane is answering is
+        # a row describing a state that is not happening. ``auto`` is the case that
+        # makes this more than one branch: ``_judge_authority`` sends it to the small
+        # model whenever Jev is not armed, so it is active on EITHER lane being able to
+        # answer. The sampled share still binds all three, exactly as it binds every
+        # other row: at a share of zero no session is asked, whatever the provider says.
+        if name == _gate.JUDGE_POINT:
+            # NOT the generic rule one branch down, and the difference is the whole
+            # point: there, no registered scope means none is NEEDED, which is right
+            # for a point that sends nothing beyond what the keystone records. The
+            # judge's Jev lane sends this point's own evidence, so the absence of a
+            # registered scope means the opposite -- nothing authorized that egress,
+            # so there is no grant to run on. ``gate._point_scope_granted`` fail-closes
+            # exactly here and ``decide`` refuses, so a row reading the absence as
+            # armed would report a judge the gate will not run.
+            jev_armed = permits and scope is not None and granted.get(scope, False)
+            # Which lane the GATE would pick, from the gate's own resolver rather than a
+            # second reading of the same config here: ``auto`` is the default and it
+            # resolves against Jev being ARMED, so a row deriving the lane on its own
+            # could name one the gate does not use. The lane travels to the card on this
+            # row, so the word on screen and the oracle that answers come from one read.
+            lane = _judge_lane(jev_armed)
+            # The FLEET ceiling binds both lanes, which is why it is read here and not
+            # folded into ``permits``: a managed install that pinned
+            # ``capabilities.decisions`` off withdrew the seam rather than one
+            # provider's endpoint, so the gate refuses every lane of it -- and a row
+            # calling the judge active under that pin would describe a judge that
+            # cannot answer. ``permits`` already carries the denial, but only together
+            # with consent, and this lane needs the denial WITHOUT the consent.
+            if not sampled or denied:
+                status = _POINT_OFF
+            elif lane == _gate.LANE_LLM:
+                # Judged on its own terms like the Jev lane below: whether this lane can
+                # answer is whether it has a model call to make. A build with no
+                # registered runner raises on every ask, so ``active`` there would name
+                # a judge that cannot run.
+                status = _POINT_ACTIVE if _llm_lane_available() else _POINT_OFF
+            else:
+                # The Jev lane, either pinned or resolved to because it is armed. An
+                # unarmed pinned lane is the owner naming one that cannot run: the gate
+                # refuses rather than answering from the other, so the row says which
+                # grant is missing instead of calling it active.
+                if jev_armed:
+                    status = _POINT_ACTIVE
+                elif permits:
+                    status = _POINT_NEEDS_SCOPE
+                else:
+                    status = _POINT_OFF
+        elif not permits or not sampled:
+            status = _POINT_OFF
+        elif scope is not None and not granted.get(scope, False):
+            status = _POINT_NEEDS_SCOPE
+        else:
+            status = _POINT_ACTIVE
+        rows.append(
+            {
+                "id": name,
+                # Named as the keystone spells it, so the panel's switch and the
+                # scope it writes are one string. ``None`` where a point needs no
+                # scope beyond consent itself.
+                "needs_scope": scope,
+                "status": status,
+                # Paths the card prints as a pointer rather than offering a control
+            }
+        )
+        # On the ONE row that has two of them, so the card's status word can name the
+        # lane that would answer instead of re-deriving it from the switch: the card
+        # holds no scope reader for a point whose scope this build does not register,
+        # so a frontend deriving this would report the Jev lane for an ``auto`` judge
+        # the gate sends to the small model. A field on the single row that has one,
+        # like the pointer sentence below it, rather than a registry a second case
+        # would earn.
+        if name == _gate.JUDGE_POINT:
+            rows[-1]["lane"] = lane
+    return rows
+
+
 def _payload(state: dict, *, denied: bool) -> dict:
     """What both verbs return: the keystone and the endpoint config names now.
 
@@ -150,11 +371,19 @@ def _payload(state: dict, *, denied: bool) -> dict:
     the effective answer is what a caller acts on, and a separate reason field had no
     reader. It is passed in rather than probed here because the probe is filesystem
     IO and both callers already have a worker thread to spend it on.
+
+    SYNCHRONOUS ON PURPOSE, and both callers reach it through ``asyncio.to_thread``.
+    It reads the configured endpoint and the sampled share from ``config.json``, so
+    on slow storage a direct call would hold the event loop for the length of a stat
+    and a parse, and the gateway's other requests and its heartbeat wait behind it
+    (``no-blocking-call-on-event-loop``). One hop covers every read in here rather
+    than one hop per read.
     """
     from kiro_crew.decisions import consent
     from kiro_crew.decisions import gate as _gate
 
     configured = _gate.configured_endpoint()
+    permits = consent.permits(configured, state) and not denied
     return {
         "enabled": consent.is_enabled(state),
         "endpoint": consent.consented_endpoint(state),
@@ -166,7 +395,7 @@ def _payload(state: dict, *, denied: bool) -> dict:
         # it is what keeps the card from claiming a decision would be sent under a
         # pin. The denial is not reported as a field of its own -- nothing reads one,
         # and the surface a caller acts on is the 403 on an enabling write.
-        "permits": consent.permits(configured, state) and not denied,
+        "permits": permits,
         # The prior-conversation CEILING the owner reviewed. Reported so the card can
         # say what was consented to rather than what config.json currently asks for
         # -- those differ exactly when an agent has raised the config value, which is
@@ -183,7 +412,40 @@ def _payload(state: dict, *, denied: bool) -> dict:
         # before this scope existed reads false here rather than inheriting either of
         # the narrower yeses.
         "compaction": consent.consented_compaction(state),
+        # Whether the owner consented to sending the TEXT OF RECALLED MEMORIES, on
+        # the same terms and reported for the same reason: a record written before
+        # this scope existed reads false here, which is what the card must draw for
+        # it rather than inferring the scope from ``enabled``.
+        "memory_text": consent.consented_memory_text(state),
+        "nudge_evidence": consent.consented_nudge_evidence(state),
+        # The points this build ships, with the effective status of each. Here
+        # rather than on a route of its own because the card reads this payload
+        # already and a point's status is a function of the same keystone: a second
+        # endpoint would be a second read that could answer differently.
+        "points": _points(state, permits=permits, denied=denied),
     }
+
+
+def _seam_withdrawn() -> bool:
+    """Whether governance withdraws the seam for the provider configured now. Filesystem IO.
+
+    A local preset adds ``capabilities.decisions_local`` on top of
+    ``capabilities.decisions``; any other provider reads the hosted row. Derived from the config,
+    never from the request, so a caller cannot pick the more permissive row.
+    """
+    from kiro_crew.decisions import gate as _gate
+    from kiro_crew.decisions.capability import (
+        is_decisions_denied,
+        is_local_preset,
+        names_local_preset,
+    )
+
+    endpoint, model = _gate.configured_endpoint(), _gate.configured_provider_model(None)
+    # Preparing counts: the switch is offered while the chosen preset downloads. An
+    # unattested preset shape answers under both rows too, as on the send path, and
+    # the local evaluation already holds the hosted row's deny.
+    local = is_local_preset(endpoint, model, serving=False) or names_local_preset(endpoint, model)
+    return is_decisions_denied(local=local)
 
 
 async def api_decisions_consent_get(request: web.Request) -> web.Response:
@@ -192,14 +454,13 @@ async def api_decisions_consent_get(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     from kiro_crew.decisions import consent
-    from kiro_crew.decisions.capability import is_decisions_denied
 
     state = await asyncio.to_thread(consent.load_state)
     # Off the loop for the same reason as the keystone read: profile resolution may
     # read from disk. Audited by the probe itself. Named ``withdrawn`` because
     # ``denied`` above is the owner gate's refusal, a different decision.
-    withdrawn = await asyncio.to_thread(is_decisions_denied)
-    payload = _payload(state, denied=withdrawn)
+    withdrawn = await asyncio.to_thread(_seam_withdrawn)
+    payload = await asyncio.to_thread(_payload, state, denied=withdrawn)
     # Read audited too: WHO learned whether the owner's messages leave the machine
     # is itself a fact an auditor needs, and it pairs with the denied-read row so
     # the log shows every read of the switch, not only the refused ones.
@@ -212,6 +473,30 @@ async def api_decisions_consent_get(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+def _consent_write_verb(*asserted: object) -> str:
+    """The audit verb for a consent write, from the values it actually carried.
+
+    ``granted`` when any carried value is ``True``, ``revoked`` when every carried value
+    is ``False``, and ``allowed`` when the body carried none of them -- a PUT that
+    asserts nothing changes nothing, so calling it either would be a claim about egress
+    that nobody made.
+
+    A non-boolean is a KEEP sentinel, meaning the field is absent from the body, so it
+    is not counted: that is the whole point of taking the verb from the request rather
+    than from the recorded state, where a scope revocation beside a still-enabled switch
+    reads as a grant.
+
+    Callers pass BOOLEANS, so a field that is not one -- the history ceiling is a number
+    -- arrives already reduced to the question this answers: does this value widen egress.
+    Keeping that reduction at the call site is what lets one rule cover a switch, a scope
+    and a ceiling without this function learning what any of them mean.
+    """
+    values = [value for value in asserted if isinstance(value, bool)]
+    if not values:
+        return "allowed"
+    return "granted" if any(values) else "revoked"
+
+
 async def api_decisions_consent_put(request: web.Request) -> web.Response:
     """PUT /api/decisions/consent -- record ``{"enabled": bool}`` on the keystone.
 
@@ -222,7 +507,8 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     would then consent to an address the owner never saw. A mismatch is ``409``
     and nothing is written; the card re-reads and shows the new address.
 
-    ``enabled`` may be OMITTED, and then the body must name at least one scope. Such a
+    ``enabled`` may be OMITTED, and then the body must name at least one of the fields
+    that may move on their own -- either scope, or the history ceiling. Such a
     write moves only that scope: the switch and the endpoint are read from the keystone
     inside the writer's lock and written back unchanged, so it can neither grant nor
     revoke consent. That is the only safe shape for a scope write, because a body
@@ -233,6 +519,15 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     A scope-only write against a REVOKED keystone leaves it revoked and stores no scope:
     a scope is only meaningful while the seam is on, which is the same rule that clears
     the scopes on a disabling write.
+
+    A scope-only write against a keystone that IS enabled is additionally REFUSED
+    unless consent already stands for the endpoint config names -- ``403`` under a
+    governance pin, otherwise ``409`` with the address in force. The revoked case
+    above is not one of these: it answers ``200`` and records nothing, because there
+    is no address to disagree about. ``permits`` is the predicate, the same one the
+    GET reports and the gate enforces, so omitting ``enabled`` can only move a
+    scope under a consent that already stands and can never record one for an
+    address nobody reviewed.
 
     ``tool_args`` records whether the owner consented to sending TOOL-CALL
     ARGUMENTS, the category ``tool.risk`` needs. Absent PRESERVES the recorded scope
@@ -249,6 +544,12 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     rather than a wider reading of ``tool_args`` because the owner reviewed that one
     as the arguments of the one call about to run.
 
+    ``memory_text`` records the same answer for the TEXT OF RECALLED MEMORIES, the
+    category ``memory.recall`` needs, on identical terms. Independent fields because
+    they are independent decisions: an owner may want risky tool calls flagged without
+    the contents of their memory store leaving the machine, and any order of those
+    answers has to be recordable.
+
     ``history_budget_chars`` records the prior-conversation CEILING the owner
     reviewed, and it is here for the same reason ``endpoint`` is: the value in force
     lives in agent-writable ``config.json``, so a budget recorded only there could be
@@ -264,12 +565,16 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     because a later enable must not inherit a budget nobody re-reviewed.
 
     Outcomes: ``200`` with the new state; ``400`` for a body that is not a JSON
-    object carrying a boolean ``enabled`` (plus a string ``endpoint`` when
-    enabling, and a non-negative whole ``history_budget_chars`` when present);
-    ``403`` for a non-owner, and for an ENABLING write the ceiling withdrew
-    (``decisions_capability_denied``); ``409`` when the echoed endpoint is not the one
-    config names now; ``500`` for a corrupt keystone, which is left byte-identical
-    rather than clobbered (the ``StateCorruptError`` precedent in
+    object, or whose ``enabled`` is present and not a boolean (plus a string
+    ``endpoint`` when enabling, and a non-negative whole ``history_budget_chars``
+    when present); ``403`` for a non-owner, and for an ENABLING or SCOPE-ONLY write
+    the ceiling withdrew (``decisions_capability_denied``); ``409`` when the echoed
+    endpoint is not the one config names now, and for a scope-only write against a
+    keystone ENABLED for a different address than config names. A scope-only write
+    against a REVOKED keystone is not a ``409``: it answers ``200`` and records no
+    scope, because a scope is only meaningful while the seam is on and there is no
+    address to disagree about; ``500`` for a corrupt keystone, which is left
+    byte-identical rather than clobbered (the ``StateCorruptError`` precedent in
     ``handlers/computer_use.py``).
     """
     denied = await _deny_non_owner(request, OP_CONSENT_PUT)
@@ -293,10 +598,25 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     # Omitting it hands ``KEEP_ENABLED`` to the writer, which resolves the switch and the
     # endpoint from the keystone inside its own lock.
     #
-    # It is only a scope-only write when a scope is actually present: a body naming
-    # neither the switch nor a scope asks for nothing and stays a 400, so an empty or
-    # misspelled body is refused rather than silently rewriting the record as itself.
-    scope_named = isinstance(body, dict) and ("tool_args" in body or "compaction" in body)
+    # It is only a standalone write when the body actually names one of the fields it
+    # may move on its own: a body naming neither the switch nor any of them asks for
+    # nothing and stays a 400, so an empty or misspelled body is refused rather than
+    # silently rewriting the record as itself.
+    #
+    # The history CEILING counts among them. It is not a scope, but it moves on exactly
+    # the same terms -- it is a number on the keystone that the card offers on its own,
+    # and raising it is not a review of an address -- so a body carrying only
+    # ``history_budget_chars`` is a write this route has to accept. Leaving it out made
+    # every ceiling save a 400, which is the whole control dead on the one path an owner
+    # uses for it.
+    _STANDALONE_FIELDS = (
+        "tool_args",
+        "compaction",
+        "memory_text",
+        "nudge_evidence",
+        "history_budget_chars",
+    )
+    scope_named = isinstance(body, dict) and any(f in body for f in _STANDALONE_FIELDS)
     enabled = body.get("enabled", consent.KEEP_ENABLED) if isinstance(body, dict) else None
     if enabled is consent.KEEP_ENABLED and not scope_named:
         await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
@@ -307,7 +627,8 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    if enabled is not consent.KEEP_ENABLED and not isinstance(enabled, bool):
+    scope_only = enabled is consent.KEEP_ENABLED
+    if not scope_only and not isinstance(enabled, bool):
         await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
         return web.json_response(
             {"error": 'body must be {"enabled": true|false}', "code": _CODE_INVALID_BODY},
@@ -375,6 +696,36 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The recalled-memory scope, read and validated on exactly the terms above: the
+    # sentinel is handed on rather than resolved here so the writer resolves it from
+    # the same read its write is based on, and a truthy stand-in is a 400 rather than
+    # a silent yes about a new egress category.
+    memory_text = (
+        body.get("memory_text", consent.KEEP_MEMORY_TEXT) if isinstance(body, dict) else False
+    )
+    if memory_text is not consent.KEEP_MEMORY_TEXT and not isinstance(memory_text, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"memory_text" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
+    # The judge's evidence scope, on the same terms again: the sentinel is handed on so
+    # the writer resolves it from the same read its write is based on, and a truthy
+    # stand-in is a 400 rather than a silent yes. This scope is also the wake judge's ON
+    # SWITCH -- the point has no feature toggle of its own -- so the same write both
+    # authorizes the egress category and enables the behaviour, which is why it is
+    # validated as strictly as the three above rather than treated as a preference.
+    nudge_evidence = (
+        body.get("nudge_evidence", consent.KEEP_NUDGE_EVIDENCE) if isinstance(body, dict) else False
+    )
+    if nudge_evidence is not consent.KEEP_NUDGE_EVIDENCE and not isinstance(nudge_evidence, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"nudge_evidence" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
     # Bound to the endpoint the owner REVIEWED, checked against the one the
     # config names now. Equal: consent is for the address on screen, and the one
     # the gate will hold the config to afterwards. Different: the config moved
@@ -383,30 +734,70 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     # ONE probe for this request, resolved before the branch so the refusal below
     # and the ``permits`` value in the response cannot disagree. Off the loop:
     # profile resolution may read from disk.
-    from kiro_crew.decisions.capability import is_decisions_denied
-
-    withdrawn = await asyncio.to_thread(is_decisions_denied)
-    # ``is True`` and not truthiness: ``KEEP_ENABLED`` is an object and would pass a bare
-    # ``if``, which would put a scope-only write through the endpoint echo it has no
-    # ``endpoint`` for. Only an ENABLING write is gated here, and a scope-only write is
-    # not one -- it cannot turn the seam on, so it acquires no authority a withdrawn
-    # ceiling would have to refuse.
+    withdrawn = await asyncio.to_thread(_seam_withdrawn)
+    # What the fleet ceiling is held against is whether this write GRANTS something:
+    # consent itself, or an egress scope. Only a grant is gated -- a disabling or
+    # revoking PUT stays available so an owner can clear a record written before the pin
+    # (the gate already reads it as off, so the write changes no authority, it only
+    # tidies the record), and trapping them with a stale `"enabled": true` they cannot
+    # clear would be worse than the record.
+    #
+    # A scope-only write is in scope for this: it carries ``KEEP_ENABLED`` and therefore
+    # asserts nothing about consent, but turning a scope ON under a pin would still
+    # record an egress permission the fleet has withdrawn.
+    #
+    # A NON-ZERO history ceiling grants too, on exactly that reading: the number bounds
+    # how much prior conversation the seam may carry, so recording one under a pin books
+    # an egress allowance for the moment the pin lifts -- and the pin is when it is
+    # cheapest to record, because nothing sends while it holds. Tested by VALUE and not
+    # against the recorded ceiling: reading the old number here would be the stale read
+    # this route refuses to take (the writer resolves the sentinel under its own lock),
+    # and no read is needed, because ``0`` is the only budget write that cannot widen
+    # anything. So ``0`` stays available under a pin for the reason a revoke does -- it
+    # is how prior turns are taken back -- and any other number waits for the pin to
+    # lift. ``enabled is False`` is excluded because the writer forces the ceiling to 0
+    # on a disabling write, so such a PUT records no allowance and must not be trapped.
+    budget_grants = (
+        budget is not consent.KEEP_HISTORY_BUDGET and budget > 0 and enabled is not False
+    )
+    grants = (
+        enabled is True
+        or tool_args is True
+        or compaction is True
+        or memory_text is True
+        or nudge_evidence is True
+        or budget_grants
+    )
+    # The same answer, carried to the audit verb below with the ABSENT case kept apart
+    # from the false one: `budget_grants` is False both for a ceiling that widens nothing
+    # and for a body that mentioned no ceiling at all, and those two must not audit alike
+    # -- a PUT asserting nothing is `allowed`, not `revoked`.
+    budget_asserts: object = (
+        budget_grants if budget is not consent.KEEP_HISTORY_BUDGET else consent.KEEP_HISTORY_BUDGET
+    )
+    if grants and withdrawn:
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="capability_denied")
+        return web.json_response(
+            {
+                "error": "the decision seam is withdrawn by governance policy",
+                "code": _CODE_CAPABILITY_DENIED,
+            },
+            status=403,
+        )
+    # ``is True``, not truthiness: ``enabled`` may be the ``KEEP_ENABLED`` sentinel,
+    # which is an object and therefore truthy. Only a write that actually turns consent
+    # on has to echo the reviewed address -- a scope-only write is not consenting to an
+    # address, it is leaving the recorded one exactly as it is.
     if enabled is True:
-        # The fleet's ceiling, ahead of every other check on an enabling write: a
-        # withdrawn seam must not acquire a keystone that says otherwise. Only the
-        # ENABLING direction is gated -- a disabling PUT stays available so an owner
-        # can clear a consent recorded before the pin (the gate already reads it as
-        # off, so the write changes no authority, it only tidies the record).
-        if withdrawn:
-            await _audit(
-                request, operation=OP_CONSENT_PUT, outcome="denied", error="capability_denied"
-            )
+        from kiro_crew.decisions.local_models import ENDPOINT_NONE
+
+        # Nothing would be sent with no model chosen, so turning consent on would
+        # record a yes for an address that is not one.
+        if endpoint == ENDPOINT_NONE:
+            await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="no_model")
             return web.json_response(
-                {
-                    "error": "the decision seam is withdrawn by governance policy",
-                    "code": _CODE_CAPABILITY_DENIED,
-                },
-                status=403,
+                {"error": "choose a decision model first", "code": _CODE_NO_MODEL},
+                status=409,
             )
         reviewed = consent.normalize_endpoint(body.get("endpoint"))
         if not reviewed:
@@ -438,12 +829,29 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             history_budget_chars=budget,
             tool_args=tool_args,
             compaction=compaction,
+            memory_text=memory_text,
+            nudge_evidence=nudge_evidence,
         )
     except consent.ConsentCorruptError as exc:
         await _audit(request, operation=OP_CONSENT_PUT, outcome="error", error="corrupt")
         return web.json_response(
             {"error": f"decisions_consent.json is unreadable: {exc}", "code": _CODE_CORRUPT},
             status=500,
+        )
+    except consent.ConsentEndpointMovedError:
+        # The scope branch above checked that consent stands for the address config
+        # names, then the writer found the keystone bound to a different one: a
+        # re-bind landed between the two. Same 409 and the same code the pre-lock
+        # checks answer with, because it is the same refusal -- the card re-reads and
+        # shows the address in force -- and nothing was written.
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="endpoint_changed")
+        return web.json_response(
+            {
+                "error": "a scope needs consent in force for the endpoint config names",
+                "code": _CODE_ENDPOINT_CHANGED,
+                "configured_endpoint": endpoint,
+            },
+            status=409,
         )
     # Written and audited as the security decision it is: which way the switch
     # went is the one fact an auditor reconstructing "when did egress start" needs.
@@ -452,18 +860,40 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     await _audit(
         request,
         operation=OP_CONSENT_PUT,
-        # The state that was WRITTEN, not what the body asked for: a scope-only write
-        # names no switch, and an auditor needs the row to say which way the record
-        # stands afterwards.
-        outcome="granted" if consent.is_enabled(state) else "revoked",
+        # The verb names what THIS write ASSERTS, not the state it leaves behind. A
+        # scope-only PUT that turns a scope off is a revocation even while consent stays
+        # on, so a verb read off the recorded flag names it "granted" -- the opposite of
+        # what the request asked for, in the one record an auditor reconstructs egress
+        # from. Only fields the body actually carries count: a sentinel means the field is
+        # absent, so it asserts nothing. A body that asserts nothing at all changes
+        # nothing and is neither, so it audits as a plain allowed read-modify-write. A
+        # mixed write that grants one thing and revokes another reads as "granted",
+        # naming the widest thing it does; `resources` below carries every recorded value,
+        # so the row says exactly what the file holds afterwards either way.
+        #
+        # The CEILING is judged on the same terms the governance check above judges it
+        # on, and by reusing that same value rather than a second test of it: a bigger
+        # number widens egress, so it is a grant, and `0` takes prior turns back, so it
+        # is a revocation. One expression decides both what a pin refuses and what the
+        # row says happened, which is the only way the two cannot drift into a refused
+        # write the log calls something else.
+        # A scope-only write is judged by the same rule rather than given a word of
+        # its own: one word for every scope write collapses a GRANT and a REVOCATION
+        # into the same row, and which way a scope moved is the fact an auditor
+        # reconstructing when egress started actually needs.
+        outcome=_consent_write_verb(
+            enabled, tool_args, compaction, memory_text, nudge_evidence, budget_asserts
+        ),
         resources=(
             f"decisions_consent.json endpoint={endpoint} "
             f"history_budget_chars={consent.consented_history_budget(state)} "
             f"tool_args={consent.consented_tool_args(state)} "
-            f"compaction={consent.consented_compaction(state)}"
+            f"compaction={consent.consented_compaction(state)} "
+            f"memory_text={consent.consented_memory_text(state)} "
+            f"nudge_evidence={consent.consented_nudge_evidence(state)}"
         ),
     )
-    return web.json_response(_payload(state, denied=withdrawn))
+    return web.json_response(await asyncio.to_thread(_payload, state, denied=withdrawn))
 
 
 async def api_decisions_feedback(request: web.Request) -> web.Response:
@@ -582,3 +1012,391 @@ async def api_decisions_feedback(request: web.Request) -> web.Response:
         resources=f"decisions log verdict={row['verdict']} side={row['side']}",
     )
     return web.json_response({"ok": True})
+
+
+# ── Local models ─────────────────────────────────────────────────────────────
+#
+# ``GET /api/decisions/provider`` lists the local presets and which one the config
+# names; ``PUT`` switches the provider to a preset. The PUT is the ONE dashboard
+# writer of ``decisions.provider.*``: the generic config PATCH excludes that section
+# so a dashboard caller cannot choose where decision state is sent, and this route
+# keeps that true by taking a preset id and a port, never a URL. The endpoint it
+# writes is either the shipped Jev default or ``http://127.0.0.1:<port>/v1/systemone``,
+# built here. Owner-only on both verbs, for the reasons the module docstring gives.
+#
+# Consent is bound to the endpoint, so a switch leaves an existing consent pointing
+# at the old address. Switching TO a local preset carries a standing consent across
+# to the new address, because the owner is choosing it in this request and nothing
+# it sends leaves the machine. Switching back to hosted Jev never does: that is the
+# direction that starts egress, and it waits for the consent switch like any other
+# change of address.
+
+_CODE_PROVIDER_INVALID_BODY = "decisions_provider_invalid_body"
+_CODE_PROVIDER_WRITE_FAILED = "decisions_provider_write_failed"
+
+OP_PROVIDER_GET = "decisions_provider_get"
+OP_PROVIDER_PUT = "decisions_provider_put"
+
+
+def _provider_payload() -> dict:
+    """The presets and the preset the config names now. Filesystem IO."""
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.decisions import gate as _gate
+    from kiro_crew.decisions import local_models
+    from kiro_crew.decisions.capability import denied_sides
+    from kiro_crew.decisions.local_runtime import get_runtime
+
+    cfg = live.snapshot() or KiroCrewConfig.load()
+    provider = getattr(getattr(cfg, "decisions", None), "provider", None)
+    endpoint = _gate.configured_endpoint(cfg)
+    model = getattr(provider, "model", "")
+    runtime = get_runtime()
+    installed = set(runtime.installed_ids())
+    status = runtime.status()
+    active = local_models.active_id(endpoint, model)
+    hosted_denied, local_denied = denied_sides()
+    return {
+        "presets": [
+            {**local_models.as_payload(m), "installed": m.id in installed}
+            for m in local_models.LOCAL_MODELS
+        ],
+        # The server the gateway runs for the chosen preset: downloading, installing,
+        # starting, running or error. ``idle`` when no local preset is wanted.
+        "runtime": status,
+        "active": active,
+        "configured_endpoint": endpoint,
+        # The card needs to say when a hand-written address gets no key; the one
+        # predicate the oracle uses decides it, so the two surfaces cannot disagree.
+        "loopback": local_models.is_loopback_endpoint(endpoint),
+        # Which side of the picker the fleet allows: hosted Jev by
+        # ``capabilities.decisions``, a local preset by both rows, each audited once.
+        "hosted_permitted": not hosted_denied,
+        "local_permitted": not local_denied,
+    }
+
+
+async def api_decisions_provider_get(request: web.Request) -> web.Response:
+    """GET /api/decisions/provider -- the local presets and which one is configured."""
+    denied = await _deny_non_owner(request, OP_PROVIDER_GET)
+    if denied is not None:
+        return denied
+    payload = await asyncio.to_thread(_provider_payload)
+    await _audit(
+        request,
+        operation=OP_PROVIDER_GET,
+        outcome="allowed",
+        resources=f"decisions.provider active={payload['active']}",
+    )
+    return web.json_response(payload)
+
+
+def _provider_target(body: object) -> tuple[str, str, int] | None:
+    """``(endpoint, model, timeout_ms)`` for a valid body, else ``None``.
+
+    A local preset's port is the gateway's to choose: the one already in use when
+    the preset is running, else the preset's default, else any free port. It is
+    never taken from the body. Filesystem and socket IO.
+    """
+    from kiro_crew.config.sections import (
+        DECISION_PROVIDER_ENDPOINT_DEFAULT,
+        DECISION_PROVIDER_MODEL_DEFAULT,
+    )
+    from kiro_crew.decisions import local_models
+    from kiro_crew.decisions.local_runtime import free_port, get_runtime
+
+    if not isinstance(body, dict) or set(body) != {"preset"}:
+        return None
+    preset = body.get("preset")
+    if preset == local_models.PRESET_JEV:
+        return DECISION_PROVIDER_ENDPOINT_DEFAULT, DECISION_PROVIDER_MODEL_DEFAULT, 1000
+    if preset == local_models.PRESET_NONE:
+        return local_models.ENDPOINT_NONE, DECISION_PROVIDER_MODEL_DEFAULT, 1000
+    model = local_models.get(preset)
+    if model is None:
+        return None
+    from kiro_crew.decisions.local_runtime import STATE_RUNNING
+
+    status = get_runtime().status()
+    # Only a RUNNING server holds its port for itself. After an error -- a port
+    # another program took, among others -- a retry probes again.
+    if status["preset"] == model.id and status["state"] == STATE_RUNNING and status["port"]:
+        port = int(status["port"])
+    else:
+        port = free_port(model.default_port)
+    return local_models.endpoint_for(port), model.model, model.timeout_ms
+
+
+def _write_provider(endpoint: str, model: str, timeout_ms: int) -> None:
+    """Set ``decisions.provider`` endpoint, model and timeout; keep every other key."""
+    from kiro_crew.config.loader import config_path, update_config_locked
+
+    def _mutate(data: dict) -> dict:
+        section = data.setdefault("decisions", {})
+        if not isinstance(section, dict):
+            raise ValueError("config section 'decisions' is not an object")
+        provider = section.setdefault("provider", {})
+        if not isinstance(provider, dict):
+            raise ValueError("config section 'decisions.provider' is not an object")
+        provider.update({"endpoint": endpoint, "model": model, "timeout_ms": timeout_ms})
+        return data
+
+    update_config_locked(config_path(), mutate=_mutate)
+
+
+#: Serialises provider switches: the config write and the consent carry land as
+#: one change. The startup resume takes it too, so a switch made just after boot
+#: cannot be overtaken by a resume that read the config before it.
+_PROVIDER_SWITCH_LOCK = LoopBoundLock()
+
+
+async def resume_local_decision_model() -> str:
+    """Start the preset the provider names, under the provider-switch lock; its id or ""."""
+    from kiro_crew.decisions.local_runtime import resume_configured
+
+    async with _PROVIDER_SWITCH_LOCK:
+        return await asyncio.to_thread(resume_configured)
+
+
+def _carry_consent(endpoint: str) -> bool:
+    """Re-bind a standing consent to local *endpoint*; whether it did. Filesystem IO."""
+    from kiro_crew.decisions import consent
+    from kiro_crew.decisions.capability import is_decisions_denied
+    from kiro_crew.decisions.local_models import is_loopback_endpoint
+
+    # Only route-built preset addresses reach here, so both rows govern.
+    if not is_loopback_endpoint(endpoint) or is_decisions_denied(local=True):
+        return False
+    # One locked check-and-write: a consent revoked while this PUT ran stays revoked.
+    return consent.rebind_if_enabled(endpoint)
+
+
+async def api_decisions_provider_put(request: web.Request) -> web.Response:
+    """PUT /api/decisions/provider -- ``{"preset": id}`` switches the provider.
+
+    ``preset`` is ``"jev"``, ``"none"`` or a local preset id. Anything else is a 400: no field
+    of the body is written verbatim, which is what keeps a URL out of this route.
+    Choosing a local preset also starts it -- download, install and serve, in the
+    background -- and choosing hosted Jev or ``"none"`` stops it; the GET reports progress.
+    """
+    denied = await _deny_non_owner(request, OP_PROVIDER_PUT)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        await _audit(
+            request,
+            operation=OP_PROVIDER_PUT,
+            outcome="denied",
+            error="invalid_json",
+            resources="decisions.provider",
+        )
+        return web.json_response({"error": "invalid JSON", "code": _CODE_INVALID_JSON}, status=400)
+    target = await asyncio.to_thread(_provider_target, body)
+    if target is None:
+        await _audit(
+            request,
+            operation=OP_PROVIDER_PUT,
+            outcome="denied",
+            error="invalid_body",
+            resources="decisions.provider",
+        )
+        return web.json_response(
+            {
+                "error": 'body must be {"preset": "jev"}, {"preset": "none"} or {"preset": <local id>}',
+                "code": _CODE_PROVIDER_INVALID_BODY,
+            },
+            status=400,
+        )
+    endpoint, model, timeout_ms = target
+    from kiro_crew.decisions.capability import is_decisions_denied, names_local_preset
+
+    # A switch to a side the fleet withdrew would leave a provider nothing may use;
+    # refuse it where the owner is looking rather than letting decisions stop quietly.
+    # The endpoint was built here from a preset id, so its shape is the answer.
+    from kiro_crew.decisions.local_models import ENDPOINT_NONE
+
+    target_local = names_local_preset(endpoint, model)
+    # "No model" sends nothing and runs nothing, so no row has anything to withhold:
+    # it is the way out on a fleet that denies both, and it is never refused.
+    if endpoint != ENDPOINT_NONE and await asyncio.to_thread(
+        is_decisions_denied, local=target_local
+    ):
+        await _audit(
+            request,
+            operation=OP_PROVIDER_PUT,
+            outcome="denied",
+            error=_CODE_CAPABILITY_DENIED,
+            resources=f"decisions.provider endpoint={endpoint}",
+        )
+        return web.json_response(
+            {
+                "error": "this decision model is turned off by policy",
+                "code": _CODE_CAPABILITY_DENIED,
+            },
+            status=403,
+        )
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock
+    from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
+
+    # One switch at a time, end to end: the config write and the consent carry that
+    # follows it are one change, and two PUTs interleaving them would leave the
+    # config naming one address and the keystone the other.
+    async with _PROVIDER_SWITCH_LOCK:
+        try:
+            async with _get_config_lock():
+                await asyncio.to_thread(_write_provider, endpoint, model, timeout_ms)
+            await _hot_apply_after_write()
+        except Exception as exc:
+            # Class only: a config error can carry a path, and the row names what was
+            # being written rather than why the disk refused it.
+            await _audit(
+                request,
+                operation=OP_PROVIDER_PUT,
+                outcome="error",
+                error=type(exc).__name__,
+                resources=f"decisions.provider endpoint={endpoint}",
+            )
+            return web.json_response(
+                {"error": "the provider could not be saved", "code": _CODE_PROVIDER_WRITE_FAILED},
+                status=500,
+            )
+        # The provider is written and applied from here on, so a failure to carry
+        # consent must not read as "nothing changed": it is reported as not carried,
+        # which is also the state the keystone is in -- nothing is sent until the
+        # owner turns the switch off and on again.
+        try:
+            carried = await asyncio.to_thread(_carry_consent, endpoint)
+        except Exception as exc:
+            carried = False
+            await _audit(
+                request,
+                operation=OP_PROVIDER_PUT,
+                outcome="error",
+                error=f"consent_carry:{type(exc).__name__}",
+                resources=f"decisions_consent.json endpoint={endpoint}",
+            )
+        await asyncio.to_thread(_drive_runtime, endpoint, model)
+    await _audit(
+        request,
+        operation=OP_PROVIDER_PUT,
+        outcome="allowed",
+        resources=f"decisions.provider endpoint={endpoint} model={model} consent_carried={carried}",
+    )
+    return web.json_response(await asyncio.to_thread(_provider_payload))
+
+
+def _drive_runtime(endpoint: str, model: str) -> None:
+    """Run the preset the provider now names, or stop the one that ran."""
+    from urllib.parse import urlsplit
+
+    from kiro_crew.decisions import local_models
+    from kiro_crew.decisions.local_runtime import get_runtime
+
+    preset = local_models.get(local_models.active_id(endpoint, model))
+    port = urlsplit(endpoint).port
+    if preset is None or port is None:
+        get_runtime().deactivate()
+    else:
+        get_runtime().activate(preset, port)
+
+
+OP_LOCAL_MODEL_STATUS = "decisions_local_model_status"
+
+
+async def api_decisions_local_model_status(request: web.Request) -> web.Response:
+    """GET /api/decisions/local-models/status -- what the runtime is doing, for polling.
+
+    The card polls this every two seconds while a model downloads. It reads one
+    in-memory status and the installed flags, and writes no audit row: the provider
+    GET audits every read and evaluates governance twice, which at that rate would
+    bury the trail an auditor reads in thousands of identical rows.
+    """
+    denied = await _deny_non_owner(request, OP_LOCAL_MODEL_STATUS)
+    if denied is not None:
+        return denied
+    from kiro_crew.decisions.local_runtime import get_runtime
+
+    runtime = get_runtime()
+    # One hop for both: status() takes the runtime's lock, which a worker holds
+    # briefly, and the event loop never waits on a thread's lock.
+    payload = await asyncio.to_thread(
+        lambda: {"runtime": runtime.status(), "installed": runtime.installed_ids()}
+    )
+    return web.json_response(payload)
+
+
+_CODE_LOCAL_MODEL_UNKNOWN = "decisions_local_model_unknown"
+_CODE_LOCAL_MODEL_IN_USE = "decisions_local_model_in_use"
+_CODE_LOCAL_MODEL_DELETE_FAILED = "decisions_local_model_delete_failed"
+OP_LOCAL_MODEL_DELETE = "decisions_local_model_delete"
+
+
+async def api_decisions_local_model_delete(request: web.Request) -> web.Response:
+    """DELETE /api/decisions/local-models/{id} -- remove a downloaded preset.
+
+    Refused for the preset the provider names: deleting the files under a running
+    server would break it, and the owner switches away first.
+    """
+    denied = await _deny_non_owner(request, OP_LOCAL_MODEL_DELETE)
+    if denied is not None:
+        return denied
+    from kiro_crew.decisions import local_models
+    from kiro_crew.decisions.local_runtime import get_runtime
+
+    preset = local_models.get(request.match_info.get("id"))
+    if preset is None:
+        return web.json_response(
+            {"error": "unknown local model", "code": _CODE_LOCAL_MODEL_UNKNOWN}, status=404
+        )
+    # Under the switch lock: a provider PUT activating this preset and this delete
+    # are one or the other, never interleaved, so a fresh download is not removed
+    # from under the runtime that just started on it.
+    async with _PROVIDER_SWITCH_LOCK:
+        payload = await asyncio.to_thread(_provider_payload)
+        in_use = payload["active"] == preset.id or payload["runtime"]["preset"] == preset.id
+        if not in_use:
+            # The runtime refuses while a stopped worker is still finishing a step on
+            # these files; the status above does not report that worker.
+            try:
+                in_use = not await asyncio.to_thread(get_runtime().remove, preset)
+            except OSError as exc:
+                # Class only, for the reason the provider write gives: an OS error
+                # carries a path.
+                await _audit(
+                    request,
+                    operation=OP_LOCAL_MODEL_DELETE,
+                    outcome="error",
+                    error=type(exc).__name__,
+                    resources=f"decisions.local_model {preset.id}",
+                )
+                return web.json_response(
+                    {
+                        "error": "some of this model's files could not be removed",
+                        "code": _CODE_LOCAL_MODEL_DELETE_FAILED,
+                    },
+                    status=500,
+                )
+    if in_use:
+        await _audit(
+            request,
+            operation=OP_LOCAL_MODEL_DELETE,
+            outcome="denied",
+            error=_CODE_LOCAL_MODEL_IN_USE,
+            resources=f"decisions.local_model {preset.id}",
+        )
+        return web.json_response(
+            {
+                "error": "this model is in use; choose another first",
+                "code": _CODE_LOCAL_MODEL_IN_USE,
+            },
+            status=409,
+        )
+    await _audit(
+        request,
+        operation=OP_LOCAL_MODEL_DELETE,
+        outcome="allowed",
+        resources=f"decisions.local_model {preset.id}",
+    )
+    return web.json_response(await asyncio.to_thread(_provider_payload))

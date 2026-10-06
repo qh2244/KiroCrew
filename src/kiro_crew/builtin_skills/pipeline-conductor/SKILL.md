@@ -12,6 +12,14 @@ clean up. Every rule below closes a named failure mode.
 
 ## What you track: two columns
 
+For long runs, load the `artifacts` skill's Dynamic Dashboard contract. An
+authorized descendant may publish a `task-dashboard` HTML artifact tailored
+to this pipeline and update the same slug at milestones. Design is free; the
+two facts below remain the source of truth. The page is not a second status
+store, does not authorize reading more worker context, and cannot approve tools.
+The host's native approval inbox names each waiting session, including Normal
+permission mode. Never broaden your role or change permission mode to publish.
+
 Per work item, exactly two:
 
 1. **Is this session still working?**
@@ -139,9 +147,10 @@ rather than permission.
 - `scripts/claim_preflight.py` — one verdict per candidate item before you
   dispatch it: `CLAIM` / `SKIP` / `CLOSE` / `REVIEW` / `UNKNOWN`.
 - `scripts/coverage_filter.py` — the batch open-PR exclusion for the queue
-  build: which of many candidates an open PR already carries, in ONE forge call.
+  build: which of many candidates an open PR CLAIMS TO CLOSE, in ONE forge call.
   It only ever SUBTRACTS, so `UNCOVERED` is not permission and
-  `claim_preflight.py` still gates every dispatch.
+  `claim_preflight.py` still gates every dispatch. A PR that references an item
+  without a closing keyword reports `MENTIONED` and the item stays in the queue.
 - `scripts/fleet_probe.py` — batch worker-tail classification + idle age +
   error tails + banned-process scan + host load + delivery counters, in ONE
   call per cycle.
@@ -237,12 +246,13 @@ never relabel it success in the friction report.
    dispatched a worker cannot un-dispatch it. Only after exit 0 may you read the
    spec and use its values. Then `chat_folder_create` the pipeline folder.
 2. Build the queue from the work source (or adopt the operator's seeded
-   backlog), then **subtract the items an open PR already carries** with
+   backlog), then **subtract the items an open PR claims to close** with
    `scripts/coverage_filter.py` before recording it — see "Queue build
    exclusion" under "Pickup and dispatch". A work source selects and excludes by
    LABEL, and a PR carrying `Fixes #N` applies no label, so an unfiltered queue
    is mostly work already in flight (measured on this repo: 25 of 29 label-clean
-   candidates). **Record the backlog at whatever size it is** — as the queue's
+   candidates). An item a PR only REFERENCES reports `MENTIONED` and stays in the
+   queue. **Record the backlog at whatever size it is** — as the queue's
    PROVENANCE, one entry: the work source, its selector, the count, and the item
    ids as one list. What costs one `artifacts` entry EACH is an item you are
    PROCESSING, never an item merely waiting, so backlog size and ledger capacity
@@ -261,7 +271,12 @@ never relabel it success in the friction report.
    with `monitor_start`, never `wait`.** If live work needs a larger or renewed
    bound, raise it with `monitor_update` before it expires; `monitor_start` is
    create-only. Call `autonudge_stop` yourself when the exit condition fires —
-   coasting into the cycle cap is a failure, not a finish.
+   coasting into the cycle cap is a failure, not a finish. That ~90s interval is
+   also what sizes your panel's stale window: `BOARD_STALE_AFTER_SECONDS` in
+   `kiro_crew.dashboard.handlers.agent_panel` is about ten of these intervals, so a
+   board reads stale only after the log has been quiet across many cycles rather
+   than after one quiet cycle. Change the cadence here and that constant needs the
+   same look.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -295,6 +310,25 @@ via `monitor_update`, see "Live steering"):
 > slot is a supply reading, not a gap to fill. Quiet cycle = one line, end
 > turn. EXIT when queue empty and fleet drained: final tally, then
 > `autonudge_stop`.
+
+## Your panel: publish JUDGMENTS, never numbers
+
+`panel_publish` with template `kirocrew-pipeline-conductor` takes exactly four keys,
+and nothing else — an unknown key is refused and the refusal names it:
+
+| key | shape | what it is |
+|---|---|---|
+| `lede` | string | the one sentence a reader should start from |
+| `you` | object, item id -> string | what a person must DO about that ONE item |
+| `notes` | object, metric key -> string | the gloss on a metric tile |
+| `checks` | object, item id -> string | a CI check tally, `N/M` only |
+
+Every number on that board is derived from your work log by the host, so you cannot
+type one: counts, column names, the revision, the board's age and the dropped-entry
+count all come from the `work` projection. `you` and `checks` are keyed by ITEM ID,
+not by column, so a sentence lands on the card it is about. A `checks` value that is
+not a bare `N/M` is dropped and the cell reads as not said — that cell means a tally
+you read off a forge, and the work log has none.
 
 ## How the ledger behaves
 
@@ -494,17 +528,21 @@ truncated, so page the queue build instead of trimming it.
 | Exit | Line | What you do |
 | --- | --- | --- |
 | 0 | `COVERED <n> open-pr=#<pr> …` | Drop the item from the queue and record the PR as the reason. `unvouched=true` marks a cross-repository PR whose author has no standing: the item still leaves the queue, and that marker is your cue to review the subtraction rather than let it pass as routine. |
+| 0 | `MENTIONED <n> open-pr=#<pr> …` | **Not a subtraction.** A PR references the item with no closing keyword, so it has not claimed to fix it — `Refs #N` is this repository's idiom for exactly that. **Keep the item as a candidate.** Carry the PR number into the dispatch brief as *somebody looked at this and did not fix it; establish what remains*. Occasionally it is work in flight whose author never wrote a keyword, which is what `claim_preflight.py` re-checks before the claim. |
 | 0 | `UNCOVERED <n>` | **Not permission.** Keep the item as a candidate; `claim_preflight.py` still decides. A reference made in a PR COMMENT is in the item's timeline and not in this answer, so silence here is a smaller view, never a clean bill. |
 | 2 | malformed | YOUR arguments are wrong, including a batch over 500 items. Fix the call — a bad call is not a finding about any item, and a batch this refuses was never scanned. |
 | 3 | `UNKNOWN reason=<slug>` | The forge could not be read, so NO exclusion was computed. Keep every candidate and carry on; the per-item preflight still runs. Never read it as "none are covered" — the output prints no `uncovered` list for exactly that reason. |
 
 This filter only ever SUBTRACTS, and that is what makes two evidence sources
-safe. `COVERED` is a positive finding — a reference in a PR's own title or body —
-so acting on it can only remove an item. Nothing it prints can ADD an item or
-certify one as free, so the cheaper evidence can never widen what gets
-dispatched. If the script is absent from your install, treat it as `UNKNOWN`:
-keep the whole queue and let the preflight carry the coverage question, which is
-slower but never permission you did not have.
+safe. `COVERED` is a positive finding — a closing keyword aimed at the item in a
+PR's own title or body — so acting on it can only remove an item. Nothing it
+prints can ADD an item or certify one as free, so the cheaper evidence can never
+widen what gets dispatched. `MENTIONED` and `UNCOVERED` both leave the item a
+candidate and are still separate lines, because a reference the filter declined
+to subtract on is worth a look and printing it as `UNCOVERED` would be exactly as
+silent as the subtraction it replaced. If the script is absent from your install,
+treat it as `UNKNOWN`: keep the whole queue and let the preflight carry the
+coverage question, which is slower but never permission you did not have.
 
 ### Preflight: `claim_preflight.py`
 
@@ -528,7 +566,7 @@ python3 scripts/claim_preflight.py --repo <owner/repo> --item <N> \
 Exit 3 is why the verdicts are exit codes at all: an unanswerable question is
 not a green light, and partial data yields `UNKNOWN` rather than `CLAIM`.
 
-Five checks run on every call, and the verdict is the FIRST match down this
+Six checks run on every call, and the verdict is the FIRST match down this
 precedence list:
 
 1. `merged_prs` — a MERGED PR that CLAIMS TO CLOSE the item (a closing keyword
@@ -540,11 +578,26 @@ precedence list:
    neither CLOSE nor SKIP, so it falls through to the remaining checks, because
    treating it as coverage closes live work and treating it as a claim starves an
    item whose fix was only partial.
-2. `open_prs` — any open PR referencing it, **fork PRs included** → **SKIP**
-   `open-pr`. A fork PR from someone with no standing still SKIPs, but the line
-   carries `risk=high` and an `untrusted-fork` marker — treat that as a triage
-   signal to review rather than an item that simply left the queue, because
-   opening a fork PR needs no permission and is therefore a suppression channel.
+2. `open_prs` — an open PR that CLAIMS TO CLOSE the item (a closing keyword for
+   this item in its title or body, not a bare cross-reference), **fork PRs
+   included** → **SKIP** `open-pr`. A fork PR from someone with no standing still
+   SKIPs, but the line carries `risk=high` and an `untrusted-fork` marker — treat
+   that as a triage signal to review rather than an item that simply left the
+   queue, because opening a fork PR needs no permission and is therefore a
+   suppression channel.
+
+   **An open PR that only MENTIONS the item does not suppress it.** The timeline
+   event this check reads fires on a bare reference, so `Refs #N` — this
+   repository's own idiom for referenced-but-deliberately-not-closed, and the
+   reason the PR template keeps `Related Issues` apart from a closing trailer —
+   used to take the item out of the queue. Measured over one real candidate list:
+   of 21 (item, covering PR) pairs, 18 carried a closing keyword and 3 did not,
+   and all 3 of those PRs disclaimed the fix in their own words. Such an item now
+   reaches **CLAIM** at `risk=high`, with the PR numbers under
+   `evidence.open_pr_mention_only` in `--json`. Read that as *somebody has looked
+   at this and did not fix it* — usually a real dispatch, occasionally work in
+   flight whose author never wrote a keyword, which is why it takes the live
+   recheck rather than the batch.
 3. `prose_claim` — a closure request in the body or the last comment ("this is
    resolved", "please close") **from the item's own reporter or a repository
    insider** → **REVIEW** `reporter-asked-close` at `risk=high`. **Prose never
@@ -556,10 +609,25 @@ precedence list:
    you read the comment the line names and you decide. The authorization
    condition stays too, for a different reason than it had — `REVIEW` writes
    nothing, but it does withhold a dispatch, and a suppression any passer-by can
-   cast is the same denial-of-work channel rule 4 refuses to open. A closure
+   cast is the same denial-of-work channel rule 5 refuses to open. A closure
    phrase from anybody else is not a closure request — it falls through to the
    remaining checks.
-4. `prose_claim` — a self-claim ("I'm claiming this", "working on this") **from
+4. `forge_claim` — the item's own ownership fields, read off the payload the
+   script already fetched: a `claimed` or `in-progress` label (the vocabulary of
+   the default `skip_signals`, matched by word so `crew: in progress` counts and
+   `unclaimed` does not), or any assignee → **SKIP** `forge-claim`, with the
+   label term and the assignees on the line. **Either field alone is a claim.**
+   It is honoured for anybody but you: a label with yourself as the only
+   assignee is the shape of your own atomic claim, so re-checking an item you
+   hold still reads CLAIM; a label with nobody assigned is unattributed and
+   reads as foreign; so does every claim when your own login cannot be read.
+   This is the live half of the queue build's label exclusion — a claim that
+   lands after the queue is built is exactly what the recheck immediately before
+   the atomic claim exists to catch, and until this check existed it could not:
+   four live items in three days carried another pipeline's `claimed` label and
+   read CLAIM. It sits below rule 1 on purpose, so an item that is open, claimed
+   and already fixed still reads CLOSE.
+5. `prose_claim` — a self-claim ("I'm claiming this", "working on this") **from
    the item's reporter or a repository insider** → **SKIP** `prose-claim`. A claim
    written in prose is invisible to every label and field query that exists, which
    is why it is scanned for rather than inferred. From anybody else it is NOT a
@@ -575,27 +643,30 @@ precedence list:
    honouring suppresses the item forever. Bot comments never claim and never
    close. Ownership is read from the newest STANDING claim, not from the last
    comment, so a passer-by's "any update?" does not clear a claim.
-5. `symbol_on_base` — a symbol the item names is absent from
+6. `symbol_on_base` — a symbol the item names is absent from
    `{default_branch}`. **Absence alone is not a SKIP.** Corroborated as
    bug-class, it is **SKIP** `symbol-absent`: the target code lives only on an
    unmerged branch, so that is a park, not a dispatch. Uncorroborated it
    downgrades to **CLAIM** `risk=high`, because a feature request names the
    symbol it PROPOSES to add — vetoing on absence alone would permanently park
    every item of that class.
-6. any check errored → **UNKNOWN**.
-7. otherwise → **CLAIM**, annotated with `risk` from the `recency` check (a
+7. any check errored → **UNKNOWN**.
+8. otherwise → **CLAIM**, annotated with `risk` from the `recency` check (a
    recently opened item from an active contributor is a high self-claim risk).
 
-**A merged PR that only MENTIONS the item is a POINTER you hand over, not a
-verdict you drop.** The script finds it — the timeline it reads is state-agnostic,
-so a merged `Refs #N` with no closing keyword and no `closingIssuesReferences` is
-collected and then correctly falls through to CLAIM, because a mention is neither
-coverage nor a claim. But a pipeline that prefers `Refs` whenever a residue
-remains — which is the right house style, since `Closes` would shut items whose
-remainder nobody has addressed — manufactures precisely this shape, so the gate's
-blind spot is the shape of its own output. Carry the merged PR number into the
-dispatch brief as *a merged PR may cover part of this; establish what remains*,
-and the worker's preflight starts where yours stopped instead of rediscovering it.
+**A PR that only MENTIONS the item is a POINTER you hand over, not a verdict you
+drop.** This holds on both sides of the merge boundary, and for the same reason.
+The script finds the reference — the timeline it reads is state-agnostic, so a
+`Refs #N` with no closing keyword and no `closingIssuesReferences` is collected
+and then correctly falls through to CLAIM, because a mention is neither coverage
+nor a claim. But a pipeline that prefers `Refs` whenever a residue remains — which
+is the right house style, since `Closes` would shut items whose remainder nobody
+has addressed — manufactures precisely this shape, so the gate's blind spot is the
+shape of its own output. That is how the OPEN side came to suppress: it read the
+bare reference as coverage for a while, which quietly withheld every item a PR
+had deliberately left for somebody else. Carry the PR number into the dispatch
+brief as *a PR may cover part of this; establish what remains*, and the worker's
+preflight starts where yours stopped instead of rediscovering it.
 
 **A triage comment routing the item away from automated fixing is a POINTER TO A
 QUESTION — and the LABEL is noise.** A `needs-human`-class label sits on the
@@ -669,6 +740,17 @@ reading, and it comes back as `REVIEW` for you to confirm.
   your seeds send workers to `cd` there for forge calls. Do NOT clean it: a
   reset there is destructive and belongs to whoever left it. Take the
   non-destructive half — the brief's commit ban — and report what you found.
+  Staged state there is usually a whole-tree overlay that never moved HEAD
+  (`git checkout <ref> -- .`): `<ref>`'s tree plus the files `<ref>` deleted.
+  In the shared checkout, test `<remote>/<base>` first, then its reflog entries
+  newest first, stopping at the first match or the first one HEAD is not an
+  ancestor of. A `<commit>` matches when it is not HEAD, `git merge-base
+  --is-ancestor HEAD <commit>` exits 0 and `git diff-index --cached --quiet
+  --diff-filter=a <commit>` exits 0; an exit above 1 is unreadable, not a no.
+  On a match, report the owner's repair: `git merge --ff-only --no-autostash
+  --no-overwrite-ignore <commit>`, or `git reset --keep <commit>`, the same move
+  except that it also unstages anything else staged. Both refuse rather than
+  overwrite a local edit, and neither is yours to run.
   Re-read the base head rather than caching it, too: the default branch moves
   under a long run, and a worker preflighting against a remembered sha is
   preflighting against the past.
@@ -759,9 +841,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > no `tox`, no `nox`, no `run-tests`/`local-gate`/"run the gates" wrapper of any
 > kind: a wrapper that escalates to the full suite satisfies the letter of a
 > targeted-only brief. The ban is on suite wrappers, NOT on the push gate
-> below — `preflight.py` and `push_guard.py` shell out only to `git` and `gh`
-> and run no test at all, so a targeted-test brief never licenses an unguarded
-> push. Pass `-n0` **explicitly** on every run: omitting `-n`
+> below — `preflight.py` and `push_guard.py` spawn only `git`, `gh` and the
+> OS tree-kill tool, and run no test at all (`--commit` / `--squash` run the
+> repository's own git hooks, as any commit does), so a targeted-test brief
+> never licenses an unguarded push. Pass `-n0` **explicitly** on every run: omitting `-n`
 > does not mean single process, it inherits whatever the project's pytest
 > `addopts` sets, and `-n auto` is a common default. Canonical line —
 > `timeout 900 python3 -m pytest -n0 <test file> -x -q </dev/null`. Do not
@@ -785,15 +868,20 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > look partly correct for entirely the wrong reason.
 > NEVER COMMIT FROM THE SHARED CHECKOUT. You may `cd` there for `gh` calls, but
 > its index is not yours and may hold hundreds of staged files left by another
-> operation, so one `git commit -a` there sweeps unrelated work into your PR.
-> Each worktree has its own index; commit only from yours.
+> operation, so one `git commit -a` there — or any commit after staging even a
+> single file — sweeps that staged work into your PR.
+> Each worktree has its own index; commit only from yours. Run nothing there
+> that moves its HEAD or writes its index or files (merge, pull, reset, clean,
+> checkout, restore, `gh pr checkout`, `gh repo sync`); report its state and
+> leave the repair to its owner. Never `git stash` in any worktree: every
+> worktree shares one stash list.
 > REMOTES: `export GIT_TERMINAL_PROMPT=0` and confirm `gh auth setup-git` has
 > run before any push — a bare https push does not use the CLI's token and hangs
 > on an interactive prompt indefinitely. If a push exceeds ~2 minutes, time the
 > actual pre-push hook over the real payload before naming a cause: process
 > liveness cannot distinguish a credential prompt from a slow hook.
 > PUSH GATE (mandatory, every push): the scripts live in `<gate>` =
-> `<crew-home>/skills/kirocrew-dev/prepare-pr/scripts`, where `<crew-home>` is
+> `<crew-home>/skills/kirocrew-dev/kirocrew-prepare-pr/scripts`, where `<crew-home>` is
 > `KIROCREW_HOME` when set and `$HOME/.kiro/crew` otherwise. Invoke them through
 > Kiro Crew's runtime interpreter the way Startup invokes `spec_check.py`, and
 > quote the resolved path: on POSIX `"$KIROCREW_RUNTIME_PYTHON" -B
@@ -805,16 +893,37 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > every push.
 > Run `preflight.py` before the first commit. Then before EVERY push confirm
 > `git status --porcelain` is empty and run `<gate>/push_guard.py
-> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base
-> or a replayed upstream commit. Pass `--max-ahead` explicitly and fill it from
+> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base,
+> a replayed upstream commit, anything staged that HEAD lacks, or a changed path
+> the gate did not commit on this branch and no other author's pushed commit
+> carries (a commit made by hand). When it lists such paths, read each diff: name
+> the ones that are yours after `--` on the same command (that vouch rewrites
+> nothing), and report any that are not.
+> Pass `--max-ahead` explicitly and fill it from
 > the spec, never from memory: the script defaults to 5, which is looser than
 > most repositories' own PR commit-count gate, so omitting it lets a branch read
 > `SAFE TO PUSH` and then fail that gate. Add `--require-single-on-base` only
-> when you actually squashed to one commit; it asserts `HEAD~1 ==
-> origin/<base>` and refuses a legitimate multi-commit branch.
-> Read the exit code, do not just test for zero: `0` proceed; `30`/`40` the gate
-> REFUSED, so do not push and report the code with the branch state; `2` the gate
-> could not RUN — an environment error, not a verdict — so do not push and report
+> when you actually squashed to one commit with the gate's `--squash`; it
+> asserts HEAD's only parent is `origin/<base>` and that the gate committed
+> every path HEAD changes, and refuses a legitimate multi-commit branch or a
+> squash made by hand.
+> Commit and amend through the gate, by name: `<gate>/push_guard.py --commit -m
+> "<subject>" -- <path>...` (or `-F <message file>`) and `--amend -- <path>...`,
+> never `git commit -a` or a bare `git commit`: the index can hold paths you
+> did not stage. Squash, if you squash, with `<gate>/push_guard.py --base {default_branch} --squash`
+> after writing the message to `<git-dir>/prepare-pr-commit-msg-<branch>.txt`
+> (`/` as `-`): it runs the checks above on the commits BEFORE squashing them
+> (so never `--max-ahead {max_commits}` there), then commits your branch's tree,
+> never an index, and `--require-single-on-base` then enforces the one commit.
+> A `40` whose text is the commits-ahead refusal, on commits you authored, is
+> answered once with the `--max-ahead N` it prints. Before any `git rebase
+> --continue`, `<gate>/push_guard.py --check-index` must exit `0`.
+> Read the exit code, do not just test for zero: `0` proceed; `30`/`40`/`41` the gate
+> REFUSED, so do not push and report the code with the branch state and stderr (a
+> git or network failure inside the gate is a `40` whose stderr names the failed
+> command; a `41` prints the staged paths and their remedy — follow it); `64` is
+> your own command-line mistake — fix it and retry; `2` the gate could not RUN —
+> not a git repository, no git, or a missing script — so do not push and report
 > `BLOCKED: push gate inoperative` with the code and stderr, because a worker
 > whose sandbox cannot reach the scripts has to surface that once instead of
 > stalling every item silently. A non-empty `git status --porcelain` is also a
@@ -937,7 +1046,7 @@ carry **metadata only** — the probe never emits transcript text:
 
 ```
 🔔 <key>  <age>s <TAG> i=<index> d=<digest12>
-BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s
+BANNED pid=<pid> rule=<regex|argv:<shape>> cwd=fleet|unknown age=<secs|?>s scope=suite|paths|unknown cmd=<program,flags,+withheld>
 OK <n> watched, <m> fired | load/cpu <x> (ok|hot) | mem <n>G | banned <n> | foreign <n> | deliver init-timeout <a>, watchdog <b>
 ```
 
@@ -945,6 +1054,39 @@ A tail with no protocol tag reads as `-` and never fires on its own, and a
 protocol word inside a tool card is quoted text rather than a report — so a worker
 whose only "status" is in a tool call is silent as far as the probe is concerned,
 and ages into `IDLE`.
+
+`cmd=` on a `BANNED` line is the matched command reduced to what cannot hold a
+secret: a recognised runner or launcher name, recognised option names with their
+values dropped, `+<n>` for the arguments withheld, and a trailing `~` on any single
+token long enough to be clipped. NO option value is printed, the cap flag's
+included — `-n0` prints as `-n`, because a custom rule can point this scan at a
+program whose `-n` value is a numeric secret and nothing tells that apart from a
+worker count. Recognised means drawn from a fixed list, so a program or long option
+the list does not name is counted rather than printed — a word that looks like a
+program name is also exactly what an opaque credential looks like. One program
+spelling is recognised by SHAPE instead: a versioned pytest alias, which prints as
+the fixed label `pytest-<version>` or `py.test-<version>` rather than as itself, so
+the version it carried never reaches the line. An inline
+`KEY=value` in front of the command is withheld whole. Read it before stopping
+anyone — it is what separates a real uncapped run from a command that merely names
+one, and no argv is echoed. When the program itself is withheld, `rule=` is what
+identifies the command: it is the rule that selected this pid.
+
+`rule=` carries one of two vocabularies. A value that reads as a regex is the
+banned-process rule whose match selected the pid. A value prefixed `argv:` names a
+shape the probe recognises from the argv tokens instead, because the joined command
+line cannot express it: `argv:pytest-runner-uncapped` is a runner spelling that is
+also a well-formed filename or path component — a versioned alias (`pytest-3`),
+`py.test`, or `pytest.exe` — standing in the program position with an explicit numeric
+worker count of two or more among its own arguments (the budget-bypassing form). There
+is no regex to look up for such a row, so `cmd=` is the corroborating field: the runner
+name prints there, because an `argv:` row has no rule text to identify it by. An
+`argv:` shape is offered whatever the rule list
+holds, because rule ORIGIN is what carries built-in authority here — the same basis
+the wrapper exemption is written against — so a `banned_process_res` edit cannot
+switch it off. What can is the named opt-out `argv_runner_detection: false`, which
+disables this shape and nothing else. The two settings are independent: replacing the
+rule list leaves the shape on, and disabling the shape leaves the rules in force.
 
 The handled set keeps the last dispositioned PAYLOAD report as `settled`, so a
 later `IDLE` or `NOPROGRESS` mark on the same session cannot resurrect a ruling
@@ -1004,7 +1146,7 @@ digest keying, not a defect, and it does not recur.
 | `IDLE` | Intervention ladder (below). |
 | `NOPROGRESS` | The session has produced nothing — no message, no tool row — since you last acted on it, and that mark is at least one `idle_alert_secs` old. Check the **EFFECT, never liveness**: did the artifact appear, did the remote head move, is there a new commit. Effect present → healthy-slow; extend and name the expected completion signal. Effect absent → **route on the line's own age**, because two paths reach this tag and they do not mean the same thing. Within `idle_alert_secs` the transcript is WARM — held alive by inbound traffic the session never answers — and the first move is **not a nudge**, since a nudge is more of the input that produced the reading: enter the intervention ladder at its **Inspect** step. Past `idle_alert_secs` the session is cold as well as unproductive, so `IDLE`'s ladder applies from the top: the classifier ranks this tag below the clock, but the suppression fallback substitutes it for an already-dispositioned report with no age test, so a cold line can carry it. |
 | `GONE` | Transcript missing — treat as reclaim: re-queue the item with evidence. |
-| `BANNED pid=…` | Banned-ops response (below), keyed by the line's OWNERSHIP CLASS: every class is recorded, and a stop is reserved for `cwd=fleet`. Never read this as a single actionable-or-not decision. Read `age=` to tell the SAME line apart across cycles: an age that GROWS between cycles is one process you have not managed to stop, while a small age under a re-appearing pid is a fresh violation on a recycled number — a bare pid cannot separate those. `age=?s` means the age is unavailable: the process already exited (the expected reading for a short-lived runner), the pid was recycled between the probe's reads (in which case the whole record is stale and `cwd` also drops to `unknown`), or the platform has no `/proc`/`sysconf` to read it from. It never means the process is new. |
+| `BANNED pid=…` | Banned-ops response (below), keyed by the line's OWNERSHIP CLASS: every class is recorded, and a stop is reserved for `cwd=fleet`. Never read this as a single actionable-or-not decision. Read `age=` to tell the SAME line apart across cycles: an age that GROWS between cycles is one process you have not managed to stop, while a small age under a re-appearing pid is a fresh violation on a recycled number — a bare pid cannot separate those. `age=?s` means the age is unavailable: the process already exited (the expected reading for a short-lived runner), the pid was recycled between the probe's reads (in which case the whole record is stale and `cwd` also drops to `unknown`), or the platform has no `/proc`/`sysconf` to read it from. It never means the process is new. Read `scope=` to rank two banned lines against each other: `suite` is a whole-suite or whole-directory run and is the one worth interrupting first, `paths` is a run already narrowed to files or selectors, and `unknown` is a match naming no runner the probe can read a target from — never treat `unknown` as `paths`. `scope` orders the queue; it does not gate the response. The stop stays keyed to `cwd=fleet` alone, so a `paths`-scoped fleet line still draws it — `scope` only says which fleet line to reach first. `age` says whether it is the same line as last cycle. |
 
 The `OK` line's `deliver init-timeout <a>, watchdog <b>` counters are the
 admission instrument, not fleet trivia — see governance.
@@ -1252,13 +1394,18 @@ line, recorded while the evidence still exists. That is also why the legacy-line
 fallback above is a bounded best effort and not the mechanism: it attempts the
 same read, expects it to fail, and declines to guess an owner when it does.
 
-What the pytest rule flags is **a run whose worker count is not explicitly
-chosen**, not "an unbounded `-n`". A bare `pytest` is therefore flagged: it
-inherits the project's `addopts`, so it is not a single-process run and its
-worker count was decided by the config rather than by the person who typed it.
-`-n0` satisfies the rule; so does any explicit number, which is why the brief
-also forbids a small `-n <N>` on grounds the probe cannot check. The other
-banned shape is a full-suite runner invoked with no file argument.
+What the pytest rule flags is **a run whose worker pool bypasses the budget**:
+an explicit numeric `-n` of two or more (`-n 4`, `-n=4`, `-n4`, `-n 32`,
+`--numprocesses 2`), because `xdist_budget.py`'s hook only ever sizes `auto`, so
+a number is a count the host's memory and the other runs on it are never
+consulted about. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
+bare form inherits the project's `addopts`, which supply `-n auto`, so its pool
+is budgeted by the same hook. `-n0` and `-n 1` are quiet too, as single-process
+runs with xdist inactive. Where `-n` is given twice the last one wins, as pytest
+resolves it. The brief still mandates `-n0` on a worker's own test runs -- a
+budgeted pool is still a pool -- but the probe only reports the shape that
+escapes the budget. The other banned shape is a full-suite runner invoked with
+no file argument.
 
 Standing constants: `session_ceiling` machine-wide, `-n0` on every worker test
 run, targeted tests only, ≤2 subagents per worker. `-n0` rather than a small

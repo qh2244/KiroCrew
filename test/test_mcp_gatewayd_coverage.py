@@ -95,10 +95,6 @@ def _pool_key(server: str = "demo-mcp", agent: str = "cov-agent", env_hash: str 
         work_dir="/tmp/cov",
         binary_version="1.0",
         os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="b" * 8,
-        approval_mode="reads",
-        trust_all_tools=False,
         config_snapshot_hash="c" * 8,
     )
 
@@ -770,6 +766,21 @@ class TestReadFirstFrame:
     @pytest.mark.parametrize("line", [b"[1,2]\n", b'"hello"\n', b"7\n"])
     async def test_non_object_json_is_refused(self, line):
         assert await gw._read_first_frame(cast(Any, _FakeReader(line=line))) is None
+
+    @pytest.mark.asyncio
+    async def test_a_frame_nested_past_the_decoder_is_refused_not_raised(self):
+        """``RecursionError`` is not a ``JSONDecodeError``: the frame closes one
+        connection cleanly instead of raising out of the connection handler."""
+        from stray_line_helpers import too_deep_line
+
+        assert await gw._read_first_frame(cast(Any, _FakeReader(line=too_deep_line()))) is None
+
+    def test_the_ping_probe_reads_every_stray_frame_as_not_a_ping(self):
+        from stray_line_helpers import STRAY_LINES
+
+        for make in STRAY_LINES.values():
+            assert gw._is_ping_frame(make()) is False
+        assert gw._is_ping_frame(b'{"type":"ping"}\n') is True
 
 
 class TestWriteJsonLine:

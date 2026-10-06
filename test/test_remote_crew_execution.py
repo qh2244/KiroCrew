@@ -936,6 +936,7 @@ class TestBindingAuthorization:
             state,
             "nobita",
             agent="",
+            agent_kind="",
             model="",
             memory_mode="temporary",
         )
@@ -981,7 +982,7 @@ class TestBindingAuthorization:
             # peer write (F3): the mode guard fires ahead of every later name
             # check, so a crew-bound session can never host mode-specific work that
             # would run on THIS machine.
-            ({"name": "...", "mode": "orchestrator"}, "remote_mode_unsupported"),
+            ({"name": "...", "mode": "design-critique"}, "remote_mode_unsupported"),
         ],
         ids=["mode", "memory_mode", "remote_mode_unsupported"],
     )
@@ -1112,9 +1113,13 @@ class TestBindingAuthorization:
 
         state = _make_state(tmp_path)
         state._folders.append({"id": "f1", "name": "Folder"})
+
+        async def invalid_project(folders, folder_id):
+            return "", "no such directory"
+
         monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_handlers._resolve_folder_project_dir",
-            lambda folders, folder_id: ("", "no such directory"),
+            "kiro_crew.dashboard.chat_handlers.resolve_folder_project_dir_off_loop",
+            invalid_project,
         )
         async with TestClient(TestServer(_create_app(state))) as client:
             resp = await client.post(
@@ -1172,6 +1177,7 @@ class TestBoundCreateDefaults:
         # peer is told to apply its own default.
         assert peer.await_args.kwargs == {
             "agent": "",
+            "agent_kind": "",
             "model": "",
             "memory_mode": "persistent",
         }
@@ -1196,12 +1202,19 @@ class TestBoundCreateDefaults:
             body = await (
                 await client.post(
                     "/api/chat/slots",
-                    json={"name": "chat-1", "instance_id": "nobita", "agent": "peer-crew"},
+                    json={
+                        "name": "chat-1",
+                        "instance_id": "nobita",
+                        "agent": "peer-crew",
+                        "agent_kind": "template",
+                    },
                 )
             ).json()
 
         assert body["agent"] == "peer-crew"
         assert peer.await_args.kwargs["agent"] == "peer-crew"
+        assert body["agent_kind"] == "template"
+        assert peer.await_args.kwargs["agent_kind"] == "template"
 
 
 class TestRemotePickApplication:
@@ -1279,32 +1292,50 @@ class TestRemotePickApplication:
         assert slot.workspace == "kept"
 
     @pytest.mark.asyncio
-    async def test_a_failed_persist_rearms_the_flush_and_still_reports_success(
-        self, tmp_path, forward
+    async def test_a_failed_persist_reports_pending_and_restart_restores_the_old_pick(
+        self, tmp_path, monkeypatch
     ):
-        """A swallowed write must not be silently final.
-
-        The peer committed the pick, so the local write is the side that failed:
-        marking the slot dirty makes the periodic flush retry it. The response
-        stays 2xx on purpose — the pick DID apply on the machine that runs the
-        turns, so reporting failure would roll the header back to a value the peer
-        does not hold.
-        """
+        """A peer commit with a stale local row is applied but not durable."""
         from kiro_crew.dashboard.chat_handlers import _apply_remote_pick
+        from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
 
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.forward_peer_selection",
+            AsyncMock(return_value={"agent": "reviewer", "agent_kind": "template"}),
+        )
         state = _make_state(tmp_path)
-        state.conversation_log = MagicMock()
-        state.conversation_log.update_metadata.side_effect = OSError("history lock timeout")
         slot = _remote_slot()
+        history_key = "dashboard:chat-1"
+        await asyncio.to_thread(state.conversation_log.append, history_key, "user", "hello")
+        await asyncio.to_thread(
+            state.conversation_log.update_metadata,
+            history_key,
+            {"agent": "writer", "agent_kind": "member"},
+        )
+        monkeypatch.setattr(
+            state.conversation_log,
+            "update_metadata",
+            MagicMock(side_effect=OSError("history lock timeout")),
+        )
         slot._dirty = False
 
         resp = await _apply_remote_pick(
-            _owner_request(state), state, slot, "model", {"model": "opus"}
+            _owner_request(state),
+            state,
+            slot,
+            "agent",
+            {"agent": "reviewer", "agent_kind": "template"},
         )
 
         assert resp.status == 200
-        assert slot.model == "opus"
+        assert json.loads(resp.body.decode())["local_persistence"] == "pending"
+        assert (slot.agent, slot.agent_kind) == ("reviewer", "template")
         assert slot._dirty is True
+
+        restarted = _make_state(tmp_path)
+        restored = _rehydrate_slot_from_history(restarted, "chat-1")
+        assert restored is not None
+        assert (restored.agent, restored.agent_kind) == ("writer", "member")
 
     @pytest.mark.asyncio
     async def test_the_mirrored_workspace_is_persisted_with_the_agent(self, tmp_path, monkeypatch):
@@ -1323,7 +1354,11 @@ class TestRemotePickApplication:
         await _apply_remote_pick(_owner_request(state), state, slot, "agent", {"agent": "reviewer"})
 
         written = state.conversation_log.update_metadata.call_args.args[1]
-        assert written == {"agent": "reviewer", "workspace": "peer-ws"}
+        assert written == {
+            "agent": "reviewer",
+            "agent_kind": "",
+            "workspace": "peer-ws",
+        }
 
     @pytest.mark.asyncio
     async def test_an_accepted_pick_is_mirrored_on_the_slot(self, tmp_path, forward):
@@ -1340,6 +1375,7 @@ class TestRemotePickApplication:
         assert json.loads(resp.body.decode()) == {
             "ok": True,
             "agent": "reviewer",
+            "agent_kind": "",
             "remote": True,
         }
         assert slot.agent == "reviewer"
@@ -1414,6 +1450,90 @@ class TestRemotePickApplication:
         await _apply_remote_pick(_owner_request(state), state, slot, control, {control: value})
 
         assert state.conversation_log.get_metadata("dashboard:chat-1").get(control) == value
+
+    @pytest.mark.asyncio
+    async def test_remote_dynamic_effort_pick_survives_cold_restore(
+        self, tmp_path, monkeypatch, forward
+    ):
+        from kiro_crew.dashboard import chat_persistence
+        from kiro_crew.dashboard.chat_handlers import _apply_remote_pick
+
+        monkeypatch.setattr(chat_persistence, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            chat_persistence,
+            "_reasoning_effort_values",
+            set(chat_persistence._REASONING_EFFORT_FALLBACK),
+        )
+        monkeypatch.setattr(chat_persistence, "_reasoning_effort_marked", set())
+        chat_persistence.register_reasoning_effort_values(["minimal"])
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("chat-1")
+        slot.executor = "remote"
+        slot.instance_id = "nobita"
+        slot.remote_slot = "peer-chat-9"
+
+        response = await _apply_remote_pick(
+            _owner_request(state), state, slot, "reasoning_effort", {"reasoning_effort": "minimal"}
+        )
+
+        assert response.status == 200
+        assert (
+            state.conversation_log.get_metadata("dashboard:chat-1")["reasoning_effort"] == "minimal"
+        )
+        assert chat_persistence._has_validated_effort_marker("minimal")
+        chat_persistence._reasoning_effort_values = set(chat_persistence._REASONING_EFFORT_FALLBACK)
+        assert (
+            chat_persistence._validate_reasoning_effort("minimal", persisted_marker=True)
+            == "minimal"
+        )
+
+    @pytest.mark.asyncio
+    async def test_marker_failure_refuses_remote_pick_before_forward(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import chat_handlers
+
+        forward = AsyncMock(return_value={"ok": True, "reasoning_effort": "minimal"})
+        monkeypatch.setattr(chat_handlers, "forward_peer_selection", forward)
+        monkeypatch.setattr(
+            chat_handlers,
+            "_remember_reasoning_effort_for_restore",
+            MagicMock(side_effect=ValueError("validated effort marker limit reached")),
+        )
+        state = _make_state(tmp_path)
+        slot = _remote_slot()
+
+        response = await chat_handlers._apply_remote_pick(
+            _owner_request(state), state, slot, "reasoning_effort", {"reasoning_effort": "minimal"}
+        )
+
+        assert response.status == 503
+        assert json.loads(response.body.decode())["code"] == "effort_marker_unavailable"
+        forward.assert_not_awaited()
+        assert slot.reasoning_effort == ""
+
+    @pytest.mark.asyncio
+    async def test_remote_effort_pick_mirrors_normalized_codex_model(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.chat_handlers import _apply_remote_pick
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.forward_peer_selection",
+            AsyncMock(return_value={"ok": True, "reasoning_effort": "", "model": "gpt-6-sol"}),
+        )
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("chat-1")
+        slot.executor = "remote"
+        slot.instance_id = "nobita"
+        slot.remote_slot = "peer-chat-9"
+        slot.model = "gpt-6-sol[max]"
+
+        response = await _apply_remote_pick(
+            _owner_request(state), state, slot, "reasoning_effort", {"reasoning_effort": ""}
+        )
+
+        assert response.status == 200
+        assert slot.model == "gpt-6-sol"
+        metadata = state.conversation_log.get_metadata("dashboard:chat-1")
+        assert metadata["reasoning_effort"] == ""
+        assert metadata["model"] == "gpt-6-sol"
 
     @pytest.mark.asyncio
     async def test_a_refused_pick_persists_nothing(self, tmp_path, monkeypatch):
@@ -1521,6 +1641,7 @@ class TestCreatePeerSlot:
             state,
             "nobita",
             agent="reviewer",
+            agent_kind="template",
             model="opus",
             memory_mode="temporary",
         )
@@ -1528,6 +1649,7 @@ class TestCreatePeerSlot:
         _, kwargs = mgr.proxy_request.call_args
         assert json.loads(kwargs["data"]) == {
             "agent": "reviewer",
+            "agent_kind": "template",
             "model": "opus",
             "memory_mode": "temporary",
         }
@@ -1536,6 +1658,14 @@ class TestCreatePeerSlot:
         "kwargs,expected",
         [
             ({"agent": "reviewer"}, {"agent": "reviewer", "memory_mode": "persistent"}),
+            (
+                {"agent": "reviewer", "agent_kind": "template"},
+                {
+                    "agent": "reviewer",
+                    "agent_kind": "template",
+                    "memory_mode": "persistent",
+                },
+            ),
             ({"model": "opus"}, {"model": "opus", "memory_mode": "persistent"}),
             ({"agent": "", "model": ""}, {"memory_mode": "persistent"}),
         ],
@@ -2766,7 +2896,7 @@ def _called_names(node) -> set[str]:
 class TestEveryPeerDirectedOperationIsOwnerGated:
     """The gap this closes, and the reason it is closed structurally.
 
-    ``_deny_cross_app_slot_access`` returns ``None`` for every caller with an
+    ``slot_ownership.deny_app_slot_access`` returns ``None`` for every caller with an
     empty ``request["app"]`` — that is its contract, "dashboard users pass". But
     ``send_dashboard_link`` mints a dashboard token with ``app=""`` for an
     allow-listed messaging identity, so a NON-owner holds exactly that shape.
@@ -3497,9 +3627,11 @@ class TestRemoteSessionIsPlainChatOnly:
         slot = _remote_slot("chat-1")
         state._slots[slot.key] = slot
         async with TestClient(TestServer(_mode_app(state))) as client:
-            resp = await client.patch("/api/chat/slots/chat-1/mode", json={"mode": "orchestrator"})
-            assert resp.status == 409
-            assert (await resp.json())["code"] == "remote_mode_unsupported"
+            resp = await client.patch(
+                "/api/chat/slots/chat-1/mode", json={"mode": "design-critique"}
+            )
+            # The switch allowlist holds only plain chat, so it refuses first.
+            assert resp.status == 400
         # The mode is left plain — the switch changed nothing.
         assert slot.mode == ""
 

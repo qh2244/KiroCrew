@@ -21,7 +21,12 @@ from typing import Any
 # compared by identity, never substituted.
 from kiro_crew import agent as agent_mod
 from kiro_crew import sandbox as sandbox_mod
-from kiro_crew.acp.harness._common import KIRO_FAMILY_ALIASES, MembershipHarness
+from kiro_crew.acp.harness._common import (
+    KIRO_FAMILY_ALIASES,
+    MembershipHarness,
+    apply_client_application_env,
+    pin_mandatory_mcps_env,
+)
 from kiro_crew.acp.harness.base import (
     NotificationAliases,
     SessionExtras,
@@ -131,8 +136,16 @@ class KiroHarness(MembershipHarness):
             )
         return SpawnPlan(argv=argv, native_context_documents=native_documents)
 
-    def apply_spawn_env(self, env: dict[str, str]) -> None:
-        """Hand kiro-cli the API key from Crew's own configuration.
+    def apply_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        spawned_binary: str | None = None,
+        cli_owned_auth: bool = False,
+    ) -> None:
+        """Hand kiro-cli the API key from Crew's own configuration, and pin Tool
+        Search exemptions by operator override or engine version
+        (:func:`pin_mandatory_mcps_env`).
 
         Deferred import: the config loader pulls in the credential path, which the
         boot path must not touch at module scope.
@@ -140,6 +153,8 @@ class KiroHarness(MembershipHarness):
         from kiro_crew.config.loader import inject_kiro_cli_api_key
 
         inject_kiro_cli_api_key(env)
+        pin_mandatory_mcps_env(env, spawned_binary=spawned_binary)
+        apply_client_application_env(env)
 
     @property
     def verifies_agent_activation(self) -> bool:
@@ -169,6 +184,7 @@ class KiroHarness(MembershipHarness):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
         """Nothing. kiro-cli already has the agent from its spawn flag.

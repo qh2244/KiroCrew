@@ -113,6 +113,8 @@ Heartbeat runs in its own session (`HEARTBEAT_KEY = "_hb"` in `session.py`), dis
 
 The session is shared across all tasks in one cycle (so concurrent gather'd tasks reuse the warm provider) and conditionally recycled by `recycle_heartbeat` between cycles when context grows past the threshold.
 
+Each task's prompt is built without a session key, but the record of skill bodies the session already holds is kept under `HEARTBEAT_KEY` (`build_message(..., skill_bodies_session=HEARTBEAT_KEY)`). A skill that several tasks on one session match is sent in full to the first and as its pointer line to the rest; a fresh session starts the record again. Each task settles the record with `rollback_skill_bodies` before it releases the session, because the next task builds on the same session: a task whose prompt never landed rolls it back, so the next task gets the full body. When the backend reports a completed compaction during a task's turn (`stream_and_collect(on_compaction=...)`), the task arms the session's one-shot reinjection flag before the release. The next task consumes it with `consume_reinjection` and passes `needs_reinjection=True`, so its prompt sends the skill bodies and session-start context the compaction dropped, and `rearm_reinjection` puts the flag back if that prompt never lands.
+
 ### HEARTBEAT_KEEP Injection
 
 Every heartbeat task text is prepended with a fixed instruction at the gateway (`_HEARTBEAT_KEEP_INJECTION` in `slack/gateway.py`) before `ctx_builder.build_message`. The instruction tells the agent it must include `HEARTBEAT_KEEP` in its response when the task is incomplete. Inline injection survives context compaction and webhook-restored sessions where skill / system-prompt copies of the same instruction can drift out of effective context.
@@ -127,7 +129,7 @@ A hook `TOOL_AUTO_APPROVE` that DOES fire in `_resolve_permission` (the read-onl
 
 The allowlist is name-based and exact-match only — no verb / heuristic fallback. Heartbeat polls untrusted external content (CR comments, ticket bodies) where prompt-injection could try to widen approval via a clever read-shaped tool name (`get_all_credentials`, `list_env_secrets`, etc.). Strict enforcement is auditable and cannot be widened that way; this is deny-by-default per the security-controls guideline.
 
-The allowlist is curated for read-only / observation tools — local file reads (`Read`, `Grep`, `Glob`), `WorkspaceSearch`, and side-effect-free KiroCrew-core reads (`learn_list`, `cron_list`, `spawn_list`, `spawn_status`, `artifact_list`, `artifact_get`, `artifact_versions`, `local_knowledge_search`). (The enterprise-internal read APIs — internal code/knowledge search, code-review/ticketing/pipeline/deploy/on-call reads, `recall` — were removed from the public fork's allowlist; an internal companion re-adds them out of band.) Write tools (`send_message`, `file_send`, `cron_add`, `Edit`, `Write`, shell `execute`/`run`) are not in the list and are rejected.
+The allowlist is curated for read-only / observation tools — local file reads (`Read`, `Grep`, `Glob`), `WorkspaceSearch`, and side-effect-free `kirocrew-core` reads (`learn_list`, `cron_list`, `spawn_list`, `spawn_status`, `artifact_list`, `artifact_get`, `artifact_versions`, `local_knowledge_search`). (The enterprise-internal read APIs — internal code/knowledge search, code-review/ticketing/pipeline/deploy/on-call reads, `recall` — were removed from the public fork's allowlist; an internal companion re-adds them out of band.) Write tools (`send_message`, `file_send`, `cron_add`, `Edit`, `Write`, shell `execute`/`run`) are not in the list and are rejected.
 
 When a legitimate new read tool needs to run in heartbeat, operators observe SEL `denied` events (or the gateway-log warning `Heartbeat blocked tool call: <name>`) and explicitly add the name to `HEARTBEAT_SAFE_TOOLS`.
 
@@ -142,7 +144,7 @@ When a legitimate new read tool needs to run in heartbeat, operators observe SEL
 | `HEARTBEAT_TASK_TIMEOUT_SECS` | 1800 | `heartbeat.py` |
 | `HEARTBEAT_FILE` | `HEARTBEAT.md` | `heartbeat.py` |
 | `HEARTBEAT_KEY` | `_hb` | `session.py` |
-| `HEARTBEAT_SAFE_TOOLS` | curated frozenset | `slack/gateway.py` |
+| `HEARTBEAT_SAFE_TOOLS` | curated frozenset | `slack/gateway_runtime/tool_policy.py` |
 | `_HEARTBEAT_KEEP_INJECTION` | reminder string | `slack/gateway.py` |
 | `kirocrew-heartbeat` agent | minimal-MCP agent JSON | installed by `agent.py:_install_heartbeat_agent` |
 | `_BG_RECYCLE_PCT` | 70.0 (shared with background) | `session.py` |

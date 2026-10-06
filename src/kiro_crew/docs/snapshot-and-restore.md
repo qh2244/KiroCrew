@@ -4,8 +4,9 @@
 portable `.tar.gz`, and `kirocrew restore` unpacks it, on this machine or a
 different one. Use it before an upgrade you are unsure about, to move your setup
 to a new laptop, or to merge the memory from two machines you have been using in
-parallel. Snapshots are **not** automatic: nothing takes one for you, so if you
-want a routine backup, schedule the command yourself.
+parallel. Core snapshots are **not** automatic: unless you configure the AWS
+Control app's nightly off-host backup, nothing takes one for you. For a routine
+local backup, schedule the command yourself.
 
 ## Quick Start
 
@@ -33,17 +34,46 @@ Both commands refuse to run on a platform that cannot open a directory relative 
 |-----------|-------|
 | memory | `memory.db`, `memory_index.db`, `workspace/memory/`, `workspace/knowledge/`, `memory_stores/` |
 | crons | `crons.json` |
-| config | `config.json`, `session_map.json`, `hooks.json`, `project_dir`, `workspace_dir` |
+| config | `config.json`, `config.local.json`, `session_map.json`, `hooks.json`, `ui-prefs.json` (the dashboard's browser-held settings), `notification_settings.json` (notification mutes and priorities), `project_dir`, `workspace_dir` |
 | skills | `skills/` directory |
 | workspace | `workspace/`, `plan_memory/` directories |
 | notifications | `notifications.jsonl` |
 | security | `telemetry_salt` |
+| artifacts | `artifacts/` directory — `--mode replace` only (folder assignments not captured yet) |
+| uploads | `uploads/` directory — `--mode replace` only |
 
 `memory` is self-contained: it names the markdown half of memory (preferences,
 projects, history) and the knowledge base explicitly, so `--components memory`
 restores your recall without also restoring every unrelated working file in
 `workspace/`. Selections may overlap — asking for both `memory` and `workspace`
 stages the shared paths once.
+
+`artifacts` carries the artifact library — every report, log and generated file
+saved from a session. `uploads` carries the files handed to the product from your own
+disk. Both are absent on a home that has never made one, and absent is not a failure:
+`kirocrew snapshot` writes a bundle without them.
+
+**Folder assignments do not ride.** `artifact_folders.json` — the index naming which
+folder each artifact sits in — is not carried, so restored artifacts arrive at the
+root of the library rather than in the folders they were in. The files themselves are
+all there; only the filing is lost, and the folder store already shows an artifact at
+the root when it does not recognise the folder id on it. Carrying the index is
+follow-up work: it is a record format whose consumers read fields off each entry, so
+it needs its own answer for what a restore does with a record those consumers cannot
+use, and shipping it half-answered is worse than leaving the filing behind.
+
+**These two are `--mode replace` only.** A merge copies file by file and never
+overwrites, and that granularity does not fit a library: an artifact is a directory whose
+files describe each other — `meta.json` names the current version, `current.html` is that
+version's body, `versions/` holds the older ones, `comments.json` the discussion — and a
+slug comes from the artifact's name, so two machines can easily hold the same slug for
+unrelated content. Filling in whichever files your copy happens to lack would attach one
+artifact's history to another's body. Replace has no such problem: it swaps the tree whole
+and keeps your previous one in the pre-restore backup directory.
+
+So `kirocrew restore --mode merge` says these two were skipped and imports the rest, and
+refuses outright if they are all you asked for. Merging a library artifact by artifact
+needs a rule for when two artifacts are the same artifact; that is follow-up work.
 
 `workspace/hygiene_data/` and `workspace/insert_facts*.py` are excluded: they are
 large and regenerable.
@@ -181,6 +211,9 @@ into `memory_stores/.member-backups/pre-restore-<timestamp>/` inside the data ho
 where agents cannot read them. Other components go into `pre-restore-<timestamp>/`
 at the data-home root. The saved paths are printed, so a wrong-snapshot restore
 is recoverable. If rollback cannot finish, the failure report names both locations.
+Rollback restores only paths whose mutation actually began. A phase-one copy of a
+later, untouched tree is not written back over live data that arrived while an earlier
+component was being replaced.
 
 ### What merge does per component
 
@@ -189,12 +222,41 @@ is recoverable. If rollback cannot finish, the failure report names both locatio
   imported with fresh IDs. If either cron file has a JSON shape the merger cannot use, the cron merge is skipped.
 - **Notifications**: deduplicated by timestamp
 - **Config and security**: only files that are missing are restored, never
-  overwritten
+  overwritten. Every running install already has a `config.json`, so a merge
+  usually restores none of the bundle's settings; each settings file kept that
+  way is named (`↩️  config.json: kept the existing file; the bundle's copy was
+  NOT merged into it ...`) and `✅ config` is printed only when no setting was
+  left behind. Host state in the same component (`session_map.json`,
+  `project_dir`, `workspace_dir`) keeps this machine's copy silently. A bundle
+  `ui-prefs.json` or `notification_settings.json` that its own store would read
+  as empty, or refuse, stops the restore before anything is installed, in either
+  mode. A restored `config.json`, `config.local.json` or `ui-prefs.json` is
+  installed owner-only, as its own writer creates it. A bundle's `config.local.json` is never installed by a merge, even
+  where the receiving install has none: that overlay outranks `config.json`, so
+  it is reported (`↩️  config.local.json: not applied ...`) instead. To take the
+  bundle's settings, re-run with `--mode replace --components config`, which
+  saves the current files in the pre-restore backup first.
 - **Workspace and skills**: only files that do not exist at the destination are
   copied
 
 So a merge never destroys anything on the receiving machine. If you want the
 snapshot to win, use `--mode replace`.
+
+**The dashboard's import follows the same rule for settings.** The import on
+Settings > Imports (a `.zip` from the dashboard's export) defaults to Merge too,
+and its Merge never overwrites a settings document: `config.json`,
+`ui-prefs.json` (the browser-held settings) and `notification_settings.json` are
+installed only where this install has none, and one this install already has is
+kept exactly as it is. Like `kirocrew restore`, it never installs the archive's
+`config.local.json`, even where this install has none, because that overlay
+outranks `config.json`. The result names every settings file it kept, so a Merge
+that brought none of your settings back says so. To restore the archive's
+settings over this install's, choose Replace in the mode menu and import again:
+Replace installs all four files, saving the ones it replaces to
+`pre-restore-<timestamp>/` first. A settings file in the archive that is not
+usable is named in the result and never installed, in either mode.
+Memory, crons, workspace files and skills follow the never-overwrite rules
+above in both tools.
 
 #### Known limitation: the knowledge database is not row-merged
 

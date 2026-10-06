@@ -36,7 +36,7 @@ Lark).
 5. **Publish the app** so your tenant can install it.
 6. **Find your open_id** — the console's API Explorer, or any inbound message
    in the gateway log, shows the sender's `open_id` (it starts with `ou_`).
-7. **Paste it into Settings** — open **Settings → Channels → Feishu**, put the
+7. **Paste it into Settings** — open **Settings → Messaging Channels → Feishu**, put the
    App ID and App Secret in their fields, add your `open_id` to the allow-list,
    turn the channel on, and save. Saving writes the two secrets to
    `~/.kiro/crew/.env` (owner-only, `0600`) and the rest to `config.json`, so
@@ -160,7 +160,10 @@ Known gaps, all follow-up work rather than defects:
 
 - **No streaming.** Feishu supports `PATCH /im/v1/messages/{id}`, so
   edit-in-place streaming is a natural next step.
-- **Text only.** Non-text messages (images, files, audio) are ignored inbound.
+- **Text only.** Non-text messages (images, files, audio) are not read inbound.
+  The bot answers with a short line saying so rather than staying silent, so a
+  photo does not look like a dead bot — but only to a sender who is already on
+  the allow-list, and in a group only one that is allow-listed too.
 - **Replies only.** The bot answers an inbound message and cannot start a
   conversation, so it is not a proactive-notification target.
 - **The panel configures the channel; it does not install it.** `lark-oapi` is an

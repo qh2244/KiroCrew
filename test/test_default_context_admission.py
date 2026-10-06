@@ -7,6 +7,7 @@ owns its memory, catalog, prompt and configuration; all data stays under tmp_pat
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -28,8 +29,24 @@ pytestmark = [
 ]
 
 
+class _FrozenClock(datetime):
+    """A ``datetime`` whose ``now()`` does not advance.
+
+    The prompt carries a minute-resolution ``[CURRENT DATE]`` line, so two builds
+    that straddle a minute boundary differ in that line alone -- and across
+    midnight the weekday name changes length, so an exact-fit cap taken from the
+    first build does not fit the second. Tests here compare builds byte for
+    byte and size caps from them, so every build reads one instant.
+    """
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        return datetime(2026, 1, 1, 12, 0).replace(tzinfo=tz)
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctx, "datetime", _FrozenClock)
     cfg = KiroCrewConfig()
     monkeypatch.setattr(ctx.KiroCrewConfig, "load", lambda: cfg)
     monkeypatch.setattr(ctx, "agent_skill_globs", lambda agent: [])
@@ -45,7 +62,13 @@ def rig(tmp_path, monkeypatch):
     skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
     lessons = LessonStore(base_dir=tmp_path / "lessons")
     builder = ctx.ContextBuilder(memory=memory, skills=skills, lessons=lessons, hooks=HookManager())
-    return builder, memory, skills, lessons, cfg
+    try:
+        yield builder, memory, skills, lessons, cfg
+    finally:
+        # The loader's skill search index is a SQLite connection (``db`` +
+        # ``-wal`` + ``-shm``) and its first discovery starts the
+        # ``skill-catalog-refresh`` worker; production closes both by exiting.
+        skills.close()
 
 
 def seed_skill(root: Path, name: str, *, always=False, body="Synthetic procedure"):
@@ -59,16 +82,15 @@ def seed_skill(root: Path, name: str, *, always=False, body="Synthetic procedure
 
 
 class TestDefaultMemory:
-    def test_fresh_ordinary_context_keeps_preferences_not_activity(self, rig, monkeypatch):
+    def test_fresh_ordinary_context_keeps_preferences_and_bounded_activity(self, rig):
         builder, memory, _, _, _ = rig
         memory.write_preferences("# Preferences\nAlways preserve approved safety controls.\n")
-        monkeypatch.setattr(
-            memory, "read_recent_history", Mock(side_effect=AssertionError("full history read"))
-        )
         memory.write_projects("# Payment migration\n" + "Details stay on demand.\n" * 100)
         text, _ = builder.build_message("Fix today's task", True, session_key="dashboard:synthetic")
         assert "Payment migration" in text
+        # The projects file is cut at its own cap, never carried whole.
         assert "Details stay on demand.\n" * 100 not in text
+        assert "[truncated]" in text
         assert "Always preserve approved safety controls." in text
         assert "memory_recall" in text
         assert text.endswith("Fix today's task")
@@ -476,6 +498,79 @@ class TestBackgroundBudget:
         finally:
             store.close()
 
+    def test_startup_directive_tier_is_bound_by_lessons_startup_both_paths(self, rig, tmp_path):
+        # The four startup renderers pass ``directive_budget=caps.lessons_startup``
+        # and hand each store the model-safe ceiling as the outer bound the tier is
+        # taken smaller than (``hard_cap`` on the vector store, ``cap`` on the JSONL
+        # store -- same role, different name). This drives the FULL startup path
+        # through ``build_session_context`` -- not the stores directly -- so that
+        # reverting ``directive_budget`` at any renderer to ``caps.lessons`` reddens
+        # this test. With a rule set far larger than the startup allowance, the
+        # rendered ``[Learned corrections]`` block must be bound at
+        # ``caps.lessons_startup`` (~37,000): greater than the ordinary
+        # ``caps.lessons`` (~7,458, the pre-fix regression this PR undoes) and no
+        # larger than ``caps.lessons_startup`` plus header/footer framing (so not
+        # the ceiling). At the 200K window used here the ceiling is 100,000, well
+        # above 37,000, so only the startup allowance can bind.
+        builder, memory, _, lessons, _ = rig
+        caps = ctx._resolve_caps(200_000)
+        assert caps.lessons_startup > caps.lessons  # guards the fixture's premise
+        assert caps.protected_context > caps.lessons_startup  # ceiling not the binder
+        frame_slack = 2_000
+
+        def rule_block(text: str) -> int:
+            start = text.find("[Learned corrections")
+            end = text.find("[End of learned corrections]")
+            assert start >= 0 and end > start
+            return len(text[start:end])
+
+        # ~200 rules of ~825 chars ~ 165,000 chars of rules: far above 37,000 and
+        # far below the 100,000 ceiling, so only the startup allowance can bind.
+        def make_rows(prefix):
+            return [
+                {
+                    "ts": f"2026-03-{(i % 28) + 1:02d}T00:00:00+00:00",
+                    "rule": f"{prefix} rule {i:03d} keep this rule intact "
+                    + (f"word{i:03d} " * (825 // 8)),
+                    "category": "tool",
+                    "negative": None,
+                    "repo_scope": None,
+                }
+                for i in range(200)
+            ]
+
+        # ---- JSONL path: the rig's default LessonStore, no vector store ----
+        lessons.path.parent.mkdir(parents=True, exist_ok=True)
+        lessons.path.write_text(
+            "".join(json.dumps(r) + "\n" for r in make_rows("JSONL")), encoding="utf-8"
+        )
+        jtext = builder.build_session_context(
+            session_key="dashboard:synthetic", model_window=200_000
+        )
+        jlen = rule_block(jtext)
+        assert caps.lessons < jlen <= caps.lessons_startup + frame_slack
+
+        # ---- Vector path: attach a populated vector store, which wins over JSONL ----
+        vector = VectorMemoryStore(db_path=tmp_path / "startup-vec.db")
+        vector.init()
+        try:
+            for i, r in enumerate(make_rows("VECTOR")):
+                vector.set_semantic(
+                    f"lesson.{i:012x}",
+                    {"rule": r["rule"], "category": "tool", "negative": None},
+                    confidence=1.0,
+                    source="user_explicit",
+                )
+            vector.embed_fn = Mock(side_effect=AssertionError("background model call"))
+            memory.vector_store = vector
+            vtext = builder.build_session_context(
+                session_key="dashboard:synthetic", model_window=200_000
+            )
+        finally:
+            vector.close()
+        vlen = rule_block(vtext)
+        assert caps.lessons < vlen <= caps.lessons_startup + frame_slack
+
 
 class TestExactMetering:
     @pytest.mark.parametrize("lifecycle", ["fresh", "warm", "resume", "reinjection", "minimal"])
@@ -729,6 +824,7 @@ def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch
         member_id=cfg.agents["writer"].member_id,
         store_id=store,
     )
+    skills: SkillsLoader | None = None
     try:
         # Oldest, and the only rule that mentions the request term. Recency order
         # would place it LAST; relevance ranking places it first. set_semantic
@@ -767,9 +863,10 @@ def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch
         monkeypatch.setattr(ctx, "_memory_stores", {})
         monkeypatch.setattr(ctx, "_vector_stores", {store: tier})
 
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         builder = ctx.ContextBuilder(
             memory=MemoryStore(workspace=tmp_path / "global"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            skills=skills,
             lessons=LessonStore(base_dir=tmp_path / "lessons"),
             hooks=HookManager(),
         )
@@ -785,3 +882,5 @@ def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch
         assert "omitted" in text and "use memory_recall." in text
     finally:
         tier.close()
+        if skills is not None:
+            skills.close()

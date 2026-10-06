@@ -39,13 +39,14 @@ import os
 import shutil
 import stat
 import stat as _stat
-from collections.abc import Iterable, Mapping
-from contextlib import suppress
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Callable
 
 from kiro_crew.atomic_write import atomic_write, atomic_write_at
+from kiro_crew.platform_compat import open_file_no_reparse, pin_directory
 
 __all__ = [
     "PUT_BACK_FAILED",
@@ -76,6 +77,7 @@ __all__ = [
     "stat_at",
     "open_dir_pinned",
     "open_in_pinned_parent",
+    "open_pinned_descendant_dir",
     "open_verified_chain",
     "pin_parent",
     "put_back_no_clobber",
@@ -87,6 +89,7 @@ __all__ = [
     "supports_pinned_tree_walk",
     "supports_pinned_walk",
     "unlink_verified",
+    "unlink_verified_by_name",
 ]
 
 
@@ -308,9 +311,12 @@ def pin_parent(
                 if exc.errno in (errno.ELOOP, errno.ENOTDIR):
                     raise refusal(
                         f"refusing to write the {what}: the directory {component!r} on "
-                        "the way to it became a symbolic link after the path was "
-                        "checked. A parent swapped for a link redirects the write "
-                        "however carefully the final name is opened, so it is refused."
+                        "the way to it is not usable: it either became a symbolic "
+                        "link after the path was checked, was one all along because "
+                        "this path was handed in unresolved - which the walk cannot "
+                        "tell apart - or is not a directory at all. Each of those "
+                        "redirects or blocks the write however carefully the final "
+                        "name is opened, so it is refused."
                     ) from exc
                 raise
             os.close(dir_fd)
@@ -487,6 +493,58 @@ def fd_real_path(fd: int) -> str | None:
     except (OSError, ValueError, ImportError):
         pass
     return None
+
+
+def open_fenced_for_read(
+    resolved: Path | str,
+    *,
+    fence: Callable[[str], bool],
+    refusal: type[Exception] = OSError,
+) -> int:
+    """Open *resolved* for reading and return a descriptor validated as an inode.
+
+    *resolved* is a path the caller has already canonicalised and judged with
+    *fence* (``True`` means refuse). A by-name open after that judgement is a
+    check-to-open window: the artifact directory and the agents directories are
+    agent-writable, so the name can be re-pointed at a credential file between
+    the two. The open refuses a link at the final component on every platform
+    (:func:`kiro_crew.platform_compat.open_file_no_reparse`), the descriptor
+    must be a regular file with a single link (a hardlink to a credential file
+    has a benign ``realpath``, so the link count is the only tell), and the
+    kernel's own path for the opened inode is read back with
+    :func:`fd_real_path`. *fence* is asked again exactly when that path differs
+    from *resolved*: a matching path is the question the caller already
+    answered, and on the event loop every extra call is a resolver-pool
+    submission. A missing kernel path fails closed.
+
+    The caller owns the returned descriptor. Every refusal closes it first and
+    raises *refusal*; a missing file surfaces as the ordinary
+    ``FileNotFoundError`` from the open.
+    """
+    resolved_str = os.fspath(resolved)
+    try:
+        fd = open_file_no_reparse(resolved_str, nonblocking=True)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise refusal(f"refusing to read through a link: {resolved_str}") from exc
+        raise
+
+    try:
+        opened = os.fstat(fd)
+        if not _stat.S_ISREG(opened.st_mode):
+            raise refusal(f"refusing to read a non-regular file: {resolved_str}")
+        if opened.st_nlink != 1:
+            raise refusal(f"refusing to read a hardlinked file: {resolved_str}")
+        fd_real = fd_real_path(fd)
+        if fd_real is None:
+            raise refusal(f"refusing to read an unverifiable file: {resolved_str}")
+        if os.path.normcase(fd_real) != os.path.normcase(resolved_str):
+            if fence(fd_real):
+                raise refusal(f"refusing to read sensitive path: {fd_real}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def is_reparse_point(path: str | Path) -> bool:
@@ -1229,6 +1287,120 @@ def create_and_open_dir_pinned(
         os.close(parent_fd)
 
 
+@contextmanager
+def open_pinned_descendant_dir(
+    root: str | Path,
+    rel_dir_parts: Iterable[str],
+    *,
+    what: str,
+    create: bool = False,
+    refusal: type[Exception] = PinnedPathRefusal,
+) -> Iterator[int | None]:
+    """Walk *rel_dir_parts* below *root* one descriptor at a time, yielding the leaf.
+
+    A caller that holds a root it trusts and a relative chain of DIRECTORY components
+    it has already validated for containment (no ``..``, no absolute, no separator
+    tricks -- e.g. an art path already through a lexical gate) needs to reach the leaf
+    directory WITHOUT re-resolving any component by name, because between a
+    containment check and the open every ancestor is swappable by a same-uid process
+    when the tree is agent-writable. This is the multi-component generalisation of
+    :func:`create_and_open_dir_pinned`: that one pins the chain ABOVE a single final
+    directory and creates only that one; this one starts from an already-open root and
+    walks (optionally creating) a whole relative chain below it, refusing a link at
+    EVERY component, the root included.
+
+    Yields, for the life of the ``with`` block:
+
+    * on a platform that can pin (:func:`supports_pinned_walk`), the leaf directory's
+      DESCRIPTOR (``int``). Every component from *root* down is opened
+      ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW`` relative to the previous one's fd, so a
+      component that is (or becomes) a symlink fails the open and is refused rather
+      than followed, and a component reached once is fixed. With *create* each missing
+      component is ``mkdir``-ed ``dir_fd``-relative first, then opened the same way --
+      the create tolerates an existing directory, the open still refuses a link that
+      replaced it. Use it as ``dir_fd=`` for the leaf's own contents (``os.open`` a
+      file under it, or :func:`atomic_write`'s ``parent_dir_fd``); the whole fd chain
+      is closed on exit;
+    * ``None`` on a platform that cannot pin (Windows: no ``dir_fd`` support). There
+      the chain is validated by ``lstat`` -- the root and every component are refused
+      when a symlink, a reparse point, or (with *create* off, or once created) a
+      non-directory -- and, with *create*, a missing component is ``mkdir``-ed by name.
+      The caller then addresses the leaf BY NAME (``root`` joined with
+      *rel_dir_parts*), which is the same residual by-name posture
+      :func:`write_file_pinned` and the removal helpers document for this platform:
+      the ancestor-swap window between the ``lstat`` and the by-name use is not closed
+      here because the platform cannot pin a directory at all, and no supported
+      configuration relies on it. The ``lstat`` refusal of a PLANTED link -- the leg
+      that needs no race -- is kept.
+
+    Empty *rel_dir_parts* means the leaf IS *root*: the pinned arm yields *root*'s own
+    ``O_NOFOLLOW`` descriptor (a linked root is refused), and the by-name arm yields
+    ``None`` after ``lstat``-refusing a linked root.
+
+    Any refusal raises *refusal* (default :class:`PinnedPathRefusal`); a caller that
+    prefers a soft outcome catches it. ``create=False`` plus a missing component is a
+    refusal, not a create.
+    """
+    parts = tuple(rel_dir_parts)
+    root_path = Path(root)
+    if not supports_pinned_walk():
+        # By-name (Windows) arm: lstat the root and every component, refusing a link,
+        # a reparse point, or a non-directory; create missing components when asked.
+        current = root_path
+        try:
+            rst = current.lstat()
+        except OSError as exc:
+            raise refusal(f"refusing to use the {what}: {current} cannot be stat-ed") from exc
+        if is_reparse_point(current) or not _stat.S_ISDIR(rst.st_mode):
+            raise refusal(f"refusing to use the {what}: {current} is a link or not a directory")
+        for part in parts:
+            current = current / part
+            try:
+                lst = current.lstat()
+            except FileNotFoundError:
+                if not create:
+                    raise refusal(f"refusing to use the {what}: {current} is missing") from None
+                current.mkdir(0o700)
+                continue
+            except OSError as exc:
+                raise refusal(f"refusing to use the {what}: {current} cannot be stat-ed") from exc
+            if is_reparse_point(current) or not _stat.S_ISDIR(lst.st_mode):
+                raise refusal(f"refusing to use the {what}: {current} is a link or not a directory")
+        yield None
+        return
+
+    # Pinned (POSIX) arm: open the root O_NOFOLLOW, then walk the chain fd-to-fd.
+    open_fds: list[int] = []
+    try:
+        try:
+            parent = os.open(root_path, dir_flags())
+        except OSError as exc:
+            raise refusal(
+                f"refusing to use the {what}: {root_path} is a link or not a directory"
+            ) from exc
+        open_fds.append(parent)
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=parent)
+                except FileExistsError:
+                    pass
+            try:
+                child = os.open(part, dir_flags(), dir_fd=parent)
+            except OSError as exc:
+                raise refusal(
+                    f"refusing to use the {what}: {part!r} on the way to it is a link "
+                    "or not a directory"
+                ) from exc
+            open_fds.append(child)
+            parent = child
+        yield parent
+    finally:
+        for fd in open_fds:
+            with suppress(OSError):
+                os.close(fd)
+
+
 def stage_tree_pinned(
     src: str | Path,
     dst: str | Path,
@@ -1927,7 +2099,13 @@ def remove_dir_verified(
     return StagedRemoval(removed=True)
 
 
-def unlink_verified(holder_fd: int, name: str, expect: tuple[int, int]) -> bool:
+def unlink_verified(
+    holder_fd: int,
+    name: str,
+    expect: tuple[int, int],
+    *,
+    on_error: Callable[[OSError], None] | None = None,
+) -> bool:
     """Unlink *name* under *holder_fd*, only if it is still ``(st_dev, st_ino)`` *expect*.
 
     The residual is irreducible and better stated than implied: POSIX has no
@@ -1936,6 +2114,11 @@ def unlink_verified(holder_fd: int, name: str, expect: tuple[int, int]) -> bool:
     what turns "delete whatever answers to this name" into "delete this object, or nothing".
     The remaining window needs a swap landing between two adjacent syscalls, and the
     directory holding the name was itself reached only through verified descriptors.
+
+    *on_error* receives the exception when the UNLINK itself is refused -- a permission or
+    read-only mount, never an identity mismatch, which is a deliberate "no" and stays
+    silent. Both still answer ``False``; the callback is how a caller that must report
+    the first kind tells it from the second.
     """
     try:
         info = os.stat(name, dir_fd=holder_fd, follow_symlinks=False)
@@ -1945,9 +2128,49 @@ def unlink_verified(holder_fd: int, name: str, expect: tuple[int, int]) -> bool:
         return False
     try:
         os.unlink(name, dir_fd=holder_fd)
-    except OSError:
+    except OSError as exc:
+        if on_error is not None:
+            on_error(exc)
         return False
     return True
+
+
+def unlink_verified_by_name(
+    parent: Path,
+    name: str,
+    expect: tuple[int, int],
+    *,
+    on_error: Callable[[OSError], None] | None = None,
+) -> bool:
+    """Unlink *parent/name* only while it holds ``(st_dev, st_ino)`` *expect*.
+
+    This is the path-only sibling of :func:`unlink_verified` for the Windows
+    branch and client-side asides that have no directory descriptor. It pins
+    the parent, delegates to :func:`unlink_verified` on POSIX, and checks the
+    regular-file identity under the pin before unlinking on Windows. An absent
+    or mismatched name is a deliberate refusal and returns ``False`` without
+    deleting anything.
+    """
+    pin = pin_directory(parent)
+    try:
+        if os.name != "nt":
+            return unlink_verified(pin, name, expect, on_error=on_error)
+        target = parent / name
+        try:
+            info = os.stat(target, follow_symlinks=False)
+        except OSError:
+            return False
+        if not _stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != expect:
+            return False
+        try:
+            os.unlink(target)
+        except OSError as exc:
+            if on_error is not None:
+                on_error(exc)
+            return False
+        return True
+    finally:
+        os.close(pin)
 
 
 #: Outcomes of :func:`put_back_no_clobber`. ``None`` means the name is back.

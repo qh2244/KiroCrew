@@ -2,7 +2,6 @@
 name: pod-e2e
 description: "ONLY for developing Kiro Crew itself -- if the project you are working on is anything else, ignore this skill: it drives Kiro Crew's own pod tooling, which does not exist in another repository. Boots a Kiro Crew feature worktree's full stack as an ISOLATED throwaway pod and proves it boots, authenticates and renders (headless Playwright), without touching the live gateway. It does NOT run the worktree's test suite -- run the tests your change touches yourself and let CI own the full suite. Use when asked to e2e-test / smoke-test / verify a Kiro Crew worktree's feature hands-off, drive browser checks on a pod, or prove a new backend route + UI work together. NOT for testing the live instance, and NOT a general-purpose e2e or smoke-test skill."
 triggers: e2e test, smoke test, pod test, verify worktree, test pod, run e2e, end to end
-repo_scope: src/kiro_crew
 ---
 
 # pod-e2e — test a worktree against an isolated full-stack pod
@@ -240,8 +239,9 @@ full suite.
    chromium) loads `/?token=` headless, asserts the SPA rendered (screenshots
    `fe-smoke.png`), then exec's the optional `PLAYWRIGHT_SPEC` with a live authed
    `page` in scope.
-   - If the Playwright interpreter is not executable, the FE phase **skips
-     gracefully** (no failure, just a warning).
+   - If the Playwright interpreter is not executable, the FE phase **fails** — it
+     does not skip. A run that captured zero screenshots must never report a green
+     summary. `--api-only` is the one clean skip.
    - `--video` requires `ffmpeg` for mp4 transcoding; if absent, the `.webm` is
      kept but no `.mp4` is produced.
    - **Bounded, always.** The whole phase runs under `timeout`
@@ -355,17 +355,15 @@ Then return a QA VERDICT, not a raw dump:
      (b) a flaky/timing issue, or (c) an environment problem (missing venv,
      missing dist, port clash)? Cite the log line or screenshot that proves it.
   4. The ARTIFACT_DIR path so the dev can open screenshots/video.
-""", solo_reason="bulk_data")
+""")
 ```
 
-`solo_reason` is required: this is ONE sub-agent for one task, and `spawn_run`
-refuses that unless told why. The e2e run is a legitimate `bulk_data` case --
-Playwright output, videos and pod logs would flood your context, and only the
-verdict is needed back.
+One sub-agent is right here: Playwright output, videos and pod logs would
+flood your context, and only the verdict is needed back.
 
 ### When to delegate vs run inline
 - **Delegate to a QA agent** when the suite is long (Playwright + video) and
-  its raw output would swamp your context -- that is the `bulk_data` reason.
+  its raw output would swamp your context -- that is the bulk-output reason to spawn.
 - **Run inline** yourself (default for a quick smoke): you want the result in
   your own turn, and "not derailing my context" is not a reason to delegate.
 
@@ -435,9 +433,11 @@ QA screenshots and demo videos follow a **review-then-attach** contract:
      path is rewritten in place to a permanent
      `https://github.com/user-attachments/assets/<uuid>` URL; an attached file the
      body does not reference is appended at the end. Limits: 10 MB per image/GIF,
-     100 MB per video. `--attach` needs push access to the repository -- a fork
-     contributor without it drags the file into the description in the web UI,
-     which yields the same URL.
+     100 MB per video. `--attach` needs push access to the repository (its upload
+     endpoint 404s on read permission, cli/cli#14302) -- a fork contributor without
+     it either drags the file into the description in the web UI, which yields the
+     same URL, or commits it with `git add -f temp-screenshots/<topic>/shot.png`
+     and references that repository-relative path; the review lanes read both.
    - Verify the body update landed: `gh api repos/<o>/<r>/pulls/<n> --jq .body | grep -c user-attachments`
      prints the number of files you attached.
    - The URL is tied to no commit or branch, so a later amend, force-push, branch

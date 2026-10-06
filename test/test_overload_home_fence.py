@@ -33,6 +33,17 @@ _HOME = os.path.expanduser("~")
 _CREW = os.path.join(_HOME, ".kiro", "crew")
 
 
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every launcher-building test here reads the generated mask list; none is about
+    that probe, and a real ssh spawned from the test process is a host dependency
+    the launcher text must not vary with. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+
+
 def _real_paths(scratch: Path | None = None) -> dict[str, str]:
     """The modules' own layout, computed against a scratch home (so the test
     never opens anything under the operator's real crew home) and rebased onto
@@ -66,13 +77,7 @@ class TestSandboxDisposition:
     @pytest.mark.skipif(os.name == "nt", reason="POSIX launcher only")
     @pytest.mark.parametrize("mode", ("standard", "strict"))
     def test_the_launcher_masks_the_new_dirs(self, mode: str) -> None:
-        import json
-        import re
-
-        script = sandbox._build_launcher_script(mode)
-        match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
-        assert match
-        masked = set(json.loads(match.group(1)))
+        masked = set(sandbox._spawn_plan("namespace", mode).sensitive_dirs)
         assert os.path.join(_CREW, "tasks") in masked
 
 
@@ -95,18 +100,13 @@ class TestScratchConfidentiality:
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX launcher only")
     def test_a_second_session_view_cannot_read_the_first_session_log(self) -> None:
-        import json
-        import re
-
         root = os.path.join(_CREW, "scratch")
         a_dir, b_dir = os.path.join(root, "session-aaaa"), os.path.join(root, "session-bbbb")
         a_log = os.path.join(a_dir, "build.log")
 
         def view(own: str) -> tuple[list[str], list[str]]:
-            script = sandbox._build_launcher_script("standard", extra_private_dirs=(own,))
-            hidden = json.loads(re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S).group(1))
-            windows = json.loads(re.search(r"PRIVATE_DIRS = (\[.*?\])\n", script, re.S).group(1))
-            return hidden, windows
+            plan = sandbox._spawn_plan("namespace", "standard", extra_private_dirs=(own,))
+            return list(plan.sensitive_dirs), list(plan.windows)
 
         a_hidden, a_windows = view(a_dir)
         b_hidden, b_windows = view(b_dir)
@@ -129,8 +129,10 @@ class TestScratchConfidentiality:
                 and f'(require-not (subpath "{own}"))' in line
                 for line in rules
             ), op
-        # Nothing re-allows the root or a sibling.
-        assert not any(line.startswith("(allow") and root in line for line in rules)
+        # Nothing re-allows a sibling; the root is re-opened for stat only, so
+        # ``realpath`` of the own window resolves.
+        allows = [line for line in rules if line.startswith("(allow")]
+        assert allows == [f'(allow file-read-metadata (literal "{root}"))'], allows
 
     def test_the_spawn_sites_hand_their_scratch_back_as_a_private_window(self) -> None:
         import inspect

@@ -12,6 +12,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import chat, chat_voice, handlers, openai_compat
+from kiro_crew.dashboard.handlers import debug as debug_handlers
 
 
 def register(app: web.Application) -> None:
@@ -47,10 +48,24 @@ def register(app: web.Application) -> None:
         "/api/crew-log/units/{unit}/projection/{name}", handlers.api_crew_log_unit_projection
     )
     app.router.add_get("/api/crew-log/units/{unit}/page", handlers.api_crew_log_unit_page)
+    # The five debug reads the ``kirocrew-debug`` MCP server proxies. Same door
+    # class as the crew-log block above -- an internal caller scoped on the session
+    # key it forwards, never a browser cookie -- which is why they register beside
+    # it rather than among the system routes. All five are literal paths under one
+    # prefix, which is also the single entry ``server._STRICT_INTERNAL_API_PATHS``
+    # needs, so a sixth route cannot land outside the strict transport by omission.
+    # Authorization is in each handler, and it is STRICTER than the crew log's: the
+    # four host-wide views (gateway, threads, processes, snapshots) are the owner's
+    # own dashboard tab alone, because a dispatch tree bounds whose conversation you
+    # may read and does not bound a view of the host.
+    app.router.add_get("/api/debug/gateway", debug_handlers.api_debug_gateway)
+    app.router.add_get("/api/debug/refusals", debug_handlers.api_debug_refusals)
+    app.router.add_get("/api/debug/threads", debug_handlers.api_debug_threads)
+    app.router.add_get("/api/debug/processes", debug_handlers.api_debug_processes)
+    app.router.add_get("/api/debug/snapshots", debug_handlers.api_debug_snapshots)
     app.router.add_get("/api/capability/mcp/registry", handlers.api_capability_mcp_registry)
     app.router.add_post("/api/chat/slots/{slot}/resume", chat.api_chat_slot_resume)
     app.router.add_post("/api/chat/slots/{slot}/approve", chat.api_chat_slot_approve)
-    app.router.add_post("/api/chat/slots/{slot}/plan-action", chat.api_chat_plan_action)
     app.router.add_post("/api/chat/mode", chat.api_chat_mode)
     app.router.add_post("/api/chat/nav/resolve-links", chat.api_chat_nav_resolve_links)
     app.router.add_post("/api/chat/slots/{slot}/generate-title", chat.api_chat_slot_generate_title)
@@ -74,9 +89,13 @@ def register(app: web.Application) -> None:
     # order numbers. Registered BEFORE the "{id}" delete so its literal path is
     # not shadowed by the id parameter.
     app.router.add_post("/api/chat/folders/reorder", chat.api_chat_folder_reorder)
+    # Bulk delete of folders that hold no live session (dry run first). A literal
+    # path, registered before the "{id}" delete for the same reason as reorder.
+    app.router.add_post("/api/chat/folders/cleanup", chat.api_chat_folders_cleanup)
     app.router.add_delete("/api/chat/folders/{id}", chat.api_chat_folder_delete)
     app.router.add_patch("/api/chat/slots/{slot}/folder", chat.api_chat_slot_folder)
     app.router.add_patch("/api/chat/slots/{slot}/pin", chat.api_chat_slot_pin)
+    app.router.add_patch("/api/chat/slots/{slot}/todo", chat.api_chat_slot_todo)
     app.router.add_patch("/api/chat/slots/{slot}/mode", chat.api_chat_slot_mode)
     # Message pins
     app.router.add_get("/api/chat/pins", chat.api_chat_pins_list)
@@ -86,6 +105,7 @@ def register(app: web.Application) -> None:
     # Tags
     app.router.add_get("/api/chat/tags", chat.api_chat_tags)
     app.router.add_post("/api/chat/tags", chat.api_chat_tag_create)
+    app.router.add_post("/api/chat/tags/{id}/adopt", chat.api_chat_tag_adopt)
     app.router.add_patch("/api/chat/tags/{id}", chat.api_chat_tag_update)
     app.router.add_delete("/api/chat/tags/{id}", chat.api_chat_tag_delete)
     app.router.add_put("/api/chat/slots/{slot}/tags", chat.api_chat_slot_tags)

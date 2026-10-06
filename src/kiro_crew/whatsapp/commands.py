@@ -30,9 +30,11 @@ either needs a capability this channel does not have, crosses a trust boundary a
 phone must not, or would grow a second settings surface:
 
 - ``/model``: the picker is a list of the advertised models. With no buttons it
-  would degrade to a numbered text list, and the digits ``1``/``2``/``3``
-  already mean "answer the pending tool approval" on this channel
-  (``messaging/approval.py``), so the two grammars would collide.
+  has nowhere to render: this renderer strips a complete ``[OPTIONS:]`` trailer
+  rather than numbering it, so the picker would arrive with no choices at all. A
+  hand-written numbered list would avoid that and then collide with the digits
+  ``1``/``2``/``3``, which already mean "answer the pending tool approval" on this
+  channel (``messaging/approval.py``).
 - ``/yolo``: a blanket auto-approve grant. The per-tool prompt is already
   answerable by typing a digit, and a grant typed on a phone widens what a
   borrowed or unlocked handset can do on the operator's machine.
@@ -156,6 +158,7 @@ COMPACTED_TEXT = "Context compacted."
 COMPACT_BUSY_TEXT = "Still working on the last message; try /compact again shortly."
 COMPACT_NOTHING_TEXT = "There's no conversation to compact yet."
 COMPACT_FAILED_TEXT = "Couldn't compact the context; please try again."
+COMPACT_TIMED_OUT_TEXT = "Compaction timed out."
 #: The manual-``/compact`` refusals are NOT held here. This surface and iMessage
 #: said the same three sentences with only a leading glyph between them, so they
 #: come from ``messaging.commands.compact_refusal_plain_text``. A wording that

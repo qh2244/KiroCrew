@@ -31,12 +31,13 @@ from kiro_crew.config.sections import (
     DECISION_PROVIDER_ENDPOINT_DEFAULT,
     DecisionProviderConfig,
     DecisionsConfig,
+    NudgeWakeConfig,
 )
 from kiro_crew.decisions import consent as consent_mod
 from kiro_crew.decisions import gate as gate_mod
 from kiro_crew.decisions import log as log_mod
 from kiro_crew.decisions.gate import DECISION_POINT_NAMES, decide, in_bucket, is_enabled
-from kiro_crew.decisions.types import Answer, Choice
+from kiro_crew.decisions.types import Answer, Choice, Noul, Score
 
 # ---------------------------------------------------------------------------
 # Fixtures and doubles
@@ -61,7 +62,12 @@ QUESTIONS = [Choice(id="verdict", prompt="Which skill?", options=["NONE", "DUP"]
 
 
 def _config(
-    *, bucket: int = 100, timeout_ms: int = 1000, endpoint: str = "", model: str | None = None
+    *,
+    bucket: int = 100,
+    timeout_ms: int = 1000,
+    endpoint: str = "",
+    model: str | None = None,
+    judge_provider: str | None = None,
 ):
     """A config object shaped like the one ``decide`` reads off the live snapshot.
 
@@ -71,6 +77,9 @@ def _config(
     it is the keystone, patched by the ``consent`` fixture. An empty *endpoint*
     keeps the dataclass default, which is the one the fixture consents to; a
     ``None`` *model* keeps the dataclass default too.
+
+    *judge_provider* selects which lane serves :data:`gate.JUDGE_POINT`, whose
+    authority is a lane rather than a scope. ``None`` keeps the dataclass default.
     """
     kwargs: dict = {"timeout_ms": timeout_ms}
     if endpoint:
@@ -78,7 +87,10 @@ def _config(
     if model is not None:
         kwargs["model"] = model
     provider = DecisionProviderConfig(**kwargs)
-    return SimpleNamespace(decisions=DecisionsConfig(bucket=bucket, provider=provider))
+    decisions_kwargs: dict = {"bucket": bucket, "provider": provider}
+    if judge_provider is not None:
+        decisions_kwargs["nudge_wake"] = NudgeWakeConfig(provider=judge_provider)
+    return SimpleNamespace(decisions=DecisionsConfig(**decisions_kwargs))
 
 
 @pytest.fixture(autouse=True)
@@ -417,7 +429,9 @@ class TestGovernanceWithdrawsTheSeam:
 
         calls: list[str] = []
 
-        def _probe(surface_key: str = capability.DASHBOARD_SURFACE_KEY) -> bool:
+        def _probe(
+            surface_key: str = capability.DASHBOARD_SURFACE_KEY, *, local: bool = False
+        ) -> bool:
             calls.append(surface_key)
             return denied
 
@@ -583,6 +597,8 @@ class TestPointName:
             "message.steer",
             "model.route",
             "compaction.keep",
+            "memory.recall",
+            "nudge.wake",
         )
 
     @pytest.mark.parametrize("unknown", ["skills.dedupe", "cron.novelty", "", "skills.Select"])
@@ -601,15 +617,20 @@ class TestPointName:
     def test_every_shipped_name_is_admitted(self, install_impl, monkeypatch):
         """Each shipped point, given the egress scope its own request needs.
 
-        Two points carry a category the main switch never described, so consent alone
-        does not admit either -- ``tool.risk`` needs the keystone's ``tool_args``
-        scope and ``compaction.keep`` needs its ``compaction`` one. Both are granted
-        here rather than dropping those points from the loop, because "every shipped
-        name" is the claim and a loop that skipped one would stop making it.
+        Three points carry a category the main switch never described, so consent
+        alone does not admit any of them -- ``tool.risk`` needs the keystone's
+        ``tool_args`` scope, ``compaction.keep`` its ``compaction`` one and
+        ``memory.recall`` its ``memory_text`` one. All are granted here rather than
+        dropping those points from the loop, because "every shipped name" is the claim
+        and a loop that skipped one would stop making it.
+
+        Granted through the gate's own table rather than by naming the readers: a point
+        added with a fourth scope is then admitted by this loop automatically, so the
+        test keeps asserting what it says instead of silently narrowing to three.
         """
         install_impl(_RecordingOracle())
-        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
-        monkeypatch.setattr(consent_mod, "consented_compaction", lambda *_a, **_kw: True)
+        for reader_name, _category in gate_mod._POINT_SCOPES.values():
+            monkeypatch.setattr(consent_mod, reader_name, lambda *_a, **_kw: True)
         for name in DECISION_POINT_NAMES:
             assert is_enabled(name, config=_config()) is True
 
@@ -635,6 +656,41 @@ class TestPointName:
         monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
         assert is_enabled("tool.risk", config=_config()) is True
         assert is_enabled("compaction.keep", config=_config()) is False
+
+    def test_the_memory_point_is_refused_without_its_own_scope(self, install_impl, monkeypatch):
+        """And neither scope beside it grants it.
+
+        A recalled memory is text the agent wrote down turns or days ago, which is not
+        what either other scope was reviewed as, so an install that granted both must
+        still be inert for ``memory.recall``.
+        """
+        install_impl(_RecordingOracle())
+        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
+        monkeypatch.setattr(consent_mod, "consented_compaction", lambda *_a, **_kw: True)
+        assert is_enabled("tool.risk", config=_config()) is True
+        assert is_enabled("compaction.keep", config=_config()) is True
+        assert is_enabled("memory.recall", config=_config()) is False
+
+    def test_every_scoped_point_is_inert_on_a_keystone_recording_no_scope(self, install_impl):
+        """The state every install consented before the scopes existed is in.
+
+        Driven off the gate's own table so a point added with a new scope is covered
+        without this test being touched, and with NO point exempted: the assertion is
+        universal or it is not a ratchet.
+
+        :data:`gate.JUDGE_POINT` reaches it by pinning the lane whose authority IS the
+        scope. That point carries two lanes (``is_enabled`` resolves them through
+        ``_judge_authority``): the small-model lane needs no scope, so under the default
+        ``auto`` the point is authorized with nothing recorded, while the Jev lane sends
+        to a third party and needs this point's own scope. Pinning ``jev`` therefore asks
+        the question this ratchet exists to ask, and answers it for the same reason every
+        other row answers it.
+        """
+        install_impl(_RecordingOracle())
+        assert is_enabled("skills.select", config=_config()) is True
+        assert is_enabled("message.steer", config=_config()) is True
+        for name in gate_mod._POINT_SCOPES:
+            assert is_enabled(name, config=_config(judge_provider=gate_mod.LANE_JEV)) is False, name
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +820,23 @@ class TestScrub:
     def test_a_credential_in_a_choice_option_is_found(self, install_impl, log_home):
         oracle = install_impl(_ExplodingOracle())
         questions = [Choice(id="q", prompt="which?", options=["fine", _AWS_KEY_SAMPLES[0]])]
+        assert asyncio.run(decide(POINT, "clean state", questions, config=_config())) is None
+        assert oracle.entered is False
+        assert log_home()[0]["scrubbed"] is True
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda key: Noul(id="q", prompt="yes?", true_means=f"the key is {key}"),
+            lambda key: Noul(id="q", prompt="yes?", false_means=f"the key is {key}"),
+            lambda key: Score(id="q", prompt="how?", levels=["fine", f"the key is {key}"]),
+        ],
+        ids=["noul-true", "noul-false", "score-level"],
+    )
+    def test_a_credential_in_a_noul_or_score_rubric_is_found(self, install_impl, log_home, make):
+        """Every rubric field the wire carries is scanned, whatever its type."""
+        oracle = install_impl(_ExplodingOracle())
+        questions = [make(_AWS_KEY_SAMPLES[0])]
         assert asyncio.run(decide(POINT, "clean state", questions, config=_config())) is None
         assert oracle.entered is False
         assert log_home()[0]["scrubbed"] is True
@@ -915,6 +988,20 @@ class TestErrors:
             (Choice(id="q", prompt="?", options=["A"]), Answer(id="q", value="A", p=True)),
             # An answer keyed to a question that was not asked.
             (Choice(id="q", prompt="?", options=["A"]), Answer(id="other", value="A", p=0.5)),
+            # A Noul whose value is not a probability.
+            (Noul(id="q", prompt="?"), Answer(id="q", value=1.2, p=0.9)),
+            (Noul(id="q", prompt="?"), Answer(id="q", value=True, p=0.9)),
+            (Noul(id="q", prompt="?"), Answer(id="q", value="yes", p=0.9)),
+            # A Score outside its own level range, or not a number.
+            (Score(id="q", prompt="?", levels=["lo", "hi"]), Answer(id="q", value=1.5, p=0.9)),
+            (Score(id="q", prompt="?", levels=["lo", "hi"]), Answer(id="q", value=-0.1, p=0.9)),
+            (Score(id="q", prompt="?", levels=["lo", "hi"]), Answer(id="q", value="hi", p=0.9)),
+            (
+                Score(id="q", prompt="?", levels=["lo", "hi"]),
+                Answer(id="q", value=float("nan"), p=0.9),
+            ),
+            # A Score with fewer than two levels has no valid value at all.
+            (Score(id="q", prompt="?", levels=["only"]), Answer(id="q", value=0.0, p=0.9)),
         ],
     )
     def test_an_out_of_domain_answer_is_recorded_as_an_error(
@@ -927,6 +1014,40 @@ class TestErrors:
         install_impl(_Fixed())
         assert asyncio.run(decide(POINT, "hi", [question], config=_config())) is None
         assert log_home()[0]["error"] == gate_mod.ERROR_INVALID_RESULT
+
+    @pytest.mark.parametrize(
+        "question,answer",
+        [
+            (Noul(id="q", prompt="?"), Answer(id="q", value=0.2, p=0.8)),
+            (Noul(id="q", prompt="?"), Answer(id="q", value=1, p=1.0)),
+            (Score(id="q", prompt="?", levels=["a", "b", "c"]), Answer(id="q", value=1.05, p=0.95)),
+            (Score(id="q", prompt="?", levels=["a", "b", "c"]), Answer(id="q", value=2, p=1.0)),
+        ],
+    )
+    def test_an_in_domain_noul_or_score_answer_is_returned(self, install_impl, question, answer):
+        class _Fixed:
+            async def ask(self, state, questions):
+                return {question.id: answer}
+
+        install_impl(_Fixed())
+        assert asyncio.run(decide(POINT, "hi", [question], config=_config())) == {"q": answer}
+
+    def test_a_choice_value_does_not_satisfy_a_noul_or_score(self):
+        """Each type is checked against its own domain; no type borrows another's."""
+        assert not gate_mod._answers_are_valid(
+            {"q": Answer(id="q", value="A", p=0.9)}, [Noul(id="q", prompt="?")]
+        )
+        assert not gate_mod._answers_are_valid(
+            {"q": Answer(id="q", value=0.5, p=0.9)}, [Choice(id="q", prompt="?", options=["A"])]
+        )
+
+    def test_a_question_of_no_known_type_is_out_of_domain_not_an_exception(self):
+        """``_answers_are_valid`` runs outside ``decide``'s ``try``, so it must not raise."""
+        stranger = SimpleNamespace(id="q", prompt="?")
+        assert (
+            gate_mod._answers_are_valid({"q": Answer(id="q", value="A", p=0.5)}, [stranger])
+            is False
+        )
 
     def test_cancellation_propagates_and_writes_no_row(self, install_impl, log_home):
         """A caller going away is not a provider failure."""

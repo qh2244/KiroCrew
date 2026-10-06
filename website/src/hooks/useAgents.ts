@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 
@@ -21,10 +22,14 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
  *   the roster without changing `sessionKey`. Omit on surfaces with no slot
  *   context (the roster is then global-only and cannot go stale this way).
  *
- * @returns `choices` — every catalog row, members and templates alike, keyed by
- *   (selection_kind, name). The list a picker that can express the namespace
- *   renders (the chat agent pop-up): a member and a template of one name are two
- *   rows there, and picking one sends its kind.
+ * @returns `choices` — the catalog rows a namespace-aware picker (the chat agent
+ *   pop-up) renders, keyed by (selection_kind, name). Unless the gateway's
+ *   `dashboard.crewmates_in_agent_picker` config is `true` (read from the shared
+ *   `['kirocrewConfig']` query, like `useCrewmateThreadsFlag`), a member row is
+ *   withheld when a listed template reaches the same binding (see
+ *   `withoutCoveredCrewmates`); a crewmate no template covers stays pickable.
+ *   With the key on, every member is listed, a member and a template of one name
+ *   are two rows here, and picking one sends its kind.
  * @returns `agents` — the same catalog folded to ONE row per name for the
  *   name-only consumers (the schedule form's `agent_id`, the channel and project
  *   pages, the keyboard cycle). A member wins the fold because the backend's
@@ -47,6 +52,14 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
 export function useAgents(refreshTrigger: number, sessionKey?: string, projectDir?: string) {
   const [choices, setChoices] = useState<KiroCrewAgent[]>([])
   const [defaultAgent, setDefaultAgent] = useState('')
+  // Closed until the config says otherwise: a missing or failed read keeps
+  // the templates-only pop-up the gateway ships with.
+  const memberChoicesQuery = useQuery<{ dashboard?: { crewmates_in_agent_picker?: boolean } }, Error, boolean>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    select: (c) => c?.dashboard?.crewmates_in_agent_picker === true,
+  })
+  const memberChoices = memberChoicesQuery.data === true
   const [error, setError] = useState(false)
   const [reloading, setReloading] = useState(false)
   const [reloadTick, setReloadTick] = useState(0)
@@ -97,8 +110,38 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   }, [refreshTrigger, sessionKey, projectDir, reloadTick])
 
   const agents = useMemo(() => foldByName(choices), [choices])
+  // Filtered AFTER the fold, so hiding a member from the pop-up never changes
+  // which row a bare name resolves to for the name-only consumers.
+  const pickerChoices = useMemo(
+    () => (memberChoices ? choices : withoutCoveredCrewmates(choices)),
+    [choices, memberChoices],
+  )
 
-  return { agents, choices, defaultAgent, error, reload, reloading }
+  return { agents, choices: pickerChoices, defaultAgent, error, reload, reloading }
+}
+
+/**
+ * The pop-up's rows while `dashboard.crewmates_in_agent_picker` is off (the
+ * default). A crewmate is withheld
+ * only when a listed template already reaches the same thing:
+ *
+ * - a template of the SAME name is listed, or
+ * - the crewmate has no memory of its own (`memory_store === 'default'`) and runs
+ *   a listed template -- picking that template is the identical binding (the
+ *   built-in `default` crew is this case).
+ *
+ * Every other crewmate stays: one made by hand under its own name with its own
+ * memory, and one whose agent is its own private copy (the catalog never lists a
+ * private copy as a template). Withholding those left no way to pick them from a
+ * chat at all.
+ */
+export function withoutCoveredCrewmates(choices: KiroCrewAgent[]): KiroCrewAgent[] {
+  const templates = new Set(
+    choices.filter(c => c.selection_kind === 'template').map(c => c.name),
+  )
+  const covered = (c: KiroCrewAgent) =>
+    templates.has(c.name) || (c.memory_store === 'default' && templates.has(c.kiro_agent))
+  return choices.filter(c => c.selection_kind !== 'member' || !covered(c))
 }
 
 /** One row per name, member first — see `agents` in the hook's docs. */

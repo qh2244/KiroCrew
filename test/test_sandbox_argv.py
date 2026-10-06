@@ -6,7 +6,6 @@ import ast
 import asyncio
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import kiro_crew.sandbox as sandbox_mod
+from kiro_crew import sandbox_plan
 from kiro_crew.sandbox import (
     _CC_FILES,
     _SENSITIVE_ENV_PREFIXES,
@@ -27,6 +27,8 @@ from kiro_crew.sandbox import (
     _build_seatbelt_profile,
     _resolve_agent_executable,
     _ssh_supports_accept_new,
+    _voice_runtime_parent_paths,
+    _voice_runtime_sandbox_paths,
     detect_backend,
     namespace_argv,
     reset_backend,
@@ -1002,8 +1004,13 @@ class TestWritableCarveouts:
     @_POSIX_ONLY
     def test_launcher_refuses_unsafe_carveout(self, monkeypatch, tmp_path):
         home, _probe = self._relocated_home(monkeypatch, tmp_path)
-        script = _build_launcher_script("standard", extra_writable_dirs=(str(home / "run"),))
-        assert "WRITABLE_DIRS = []" in script
+        run_dir = str(home / "run")
+        plan = sandbox_mod._spawn_plan("namespace", "standard", extra_writable_dirs=(run_dir,))
+        assert plan.writable == ()
+        # The sealed parent itself holds the hidden voice runtime, which it would re-open.
+        refused = [r for r in plan.refusals if r.kind == "carve-out"]
+        assert [r.args[0] for r in refused] == [run_dir]
+        assert "would be re-opened by it" in refused[0].args[1]
 
     @_POSIX_ONLY
     def test_launcher_seals_before_carveout_rebind(self, monkeypatch, tmp_path):
@@ -1017,6 +1024,34 @@ class TestWritableCarveouts:
         home, probe = self._relocated_home(monkeypatch, tmp_path)
         script = _build_launcher_script("standard", extra_writable_dirs=(str(probe),))
         assert script.index("for d in READONLY_DIRS:") < script.index("for d in WRITABLE_DIRS:")
+
+    @_POSIX_ONLY
+    @pytest.mark.parametrize("level", ["strict", "standard", "cc"])
+    def test_launcher_seals_before_hiding(self, monkeypatch, tmp_path, level):
+        """The READONLY seal must precede the SENSITIVE_DIRS hide.
+
+        Same kernel property as the carve-out pin above, in the other
+        direction: ``run/voice-runtime`` is hidden and its parent ``run`` is
+        sealed, and a non-recursive self-bind of ``run`` issued AFTER the hide
+        masks it -- the real leaf becomes readable through the new mount.
+        Seal first, then hide ON the sealed parent. The carve-out loop stays
+        last, so the three loops are seal < hide < carve-out. Every tier, since
+        all three emit the same launcher body.
+        """
+        home, probe = self._relocated_home(monkeypatch, tmp_path)
+        script = _build_launcher_script(level, extra_writable_dirs=(str(probe),))
+        seal = script.index("for d in READONLY_DIRS:")
+        hide = script.index("for d in SENSITIVE_DIRS:")
+        carve = script.index("for d in WRITABLE_DIRS:")
+        assert seal < hide < carve
+        # The pair this pin exists for is actually emitted: the leaf is hidden
+        # and its parent is sealed, in the lists the two loops consume.
+        voice_roots = _voice_runtime_sandbox_paths()
+        voice_parents = _voice_runtime_parent_paths()
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+        assert set(hidden) >= set(voice_roots)
+        assert set(readonly) >= set(voice_parents)
 
     @_POSIX_ONLY
     def test_launcher_carveout_mounts_fail_open(self, monkeypatch, tmp_path):
@@ -1034,18 +1069,24 @@ class TestWritableCarveouts:
         """A caller-re-exposed (``extra_visible_dirs``) tree must still refuse
         a writable window: exposure cancels the hide, not the write seal, so
         the validator's guard set must include the ``unhidden`` entries (the
-        ``+ unhidden`` term in the builder is load-bearing)."""
+        ``+ unhidden`` term in the planner is load-bearing)."""
         home, _probe = self._relocated_home(monkeypatch, tmp_path)
         exposed = home / "run" / "exposed-tree"
         inside = exposed / "scratch"
         inside.mkdir(parents=True)
-        script = _build_launcher_script(
+        plan = sandbox_mod._spawn_plan(
+            "namespace",
             "standard",
             extra_hidden_dirs=(str(exposed),),
             extra_visible_dirs=(str(exposed),),
             extra_writable_dirs=(str(inside),),
         )
-        assert "WRITABLE_DIRS = []" in script
+        assert plan.writable == ()
+        assert str(exposed) not in plan.sensitive_dirs
+        assert [c.path for c in plan.cancellations] == [str(exposed)]
+        assert [r.args for r in plan.refusals if r.kind == "carve-out"] == [
+            (str(inside), f"it lies inside sealed subtree {str(exposed)!r}")
+        ]
 
     def test_symlinked_data_home_emits_both_spellings(self, monkeypatch, tmp_path):
         """A symlinked data home (supported) must carve BOTH spellings:
@@ -1072,8 +1113,9 @@ class TestWritableCarveouts:
         hidden = home / "run" / "secrets"
         inside = hidden / "scratch"
         inside.mkdir(parents=True)
-        approved = sandbox_mod._writable_carveout_spellings(
+        approved, _refusals = sandbox_plan.writable_carveouts(
             (str(inside),),
+            sandbox_mod._carveout_probes((str(inside),)),
             subtree_guards=[str(hidden)],
             literal_guards=[],
             carveable_parents=[str(home / "run")],
@@ -1363,10 +1405,10 @@ class TestSealedRuntimeParentPredicate:
 class TestBuildLauncherScript:
     @_POSIX_ONLY
     def test_strict_script_contains_dirs(self):
-        script = _build_launcher_script("strict")
-        assert "SENSITIVE_DIRS" in script
-        assert ".aws" in script
-        assert ".gnupg" in script
+        plan = sandbox_mod._spawn_plan("namespace", "strict")
+        home = str(Path.home())
+        assert os.path.join(home, ".aws") in plan.sensitive_dirs
+        assert os.path.join(home, ".gnupg") in plan.sensitive_dirs
 
     @_POSIX_ONLY
     def test_strict_script_denies_namespace_escape_not_hardlinks(self):
@@ -1453,9 +1495,11 @@ class TestBuildLauncherScript:
 
     @_POSIX_ONLY
     def test_standard_script_excludes_aws(self):
-        script = _build_launcher_script("standard")
-        # Standard dirs don't include .aws
-        assert "HIDE_SSH = False" in script
+        plan = sandbox_mod._spawn_plan("namespace", "standard")
+        # Standard dirs don't include .aws, and ~/.ssh stays unmasked.
+        assert os.path.join(str(Path.home()), ".aws") not in plan.sensitive_dirs
+        assert plan.hide_ssh is False
+        assert sandbox_plan.namespace_payload(plan)["hide_ssh"] == 0
 
     @_POSIX_ONLY
     def test_auth_staging_is_hidden_except_for_trusted_auth_spawn(self):
@@ -1464,8 +1508,9 @@ class TestBuildLauncherScript:
         workspace = staging / "auth-123"
         data_home = home / ".kiro" / "crew"
 
-        regular_script = _build_launcher_script("standard")
-        auth_script = _build_launcher_script(
+        regular_plan = sandbox_mod._spawn_plan("namespace", "standard")
+        auth_plan = sandbox_mod._spawn_plan(
+            "namespace",
             "standard",
             extra_hidden_dirs=(str(data_home),),
             extra_visible_dirs=(str(workspace),),
@@ -1477,22 +1522,28 @@ class TestBuildLauncherScript:
             extra_visible_dirs=(str(workspace),),
         )
 
-        assert str(staging) in regular_script
+        assert str(staging) in regular_plan.sensitive_dirs
         assert str(staging) in regular_profile
-        assert str(staging) not in auth_script
+        # The auth spawn's own workspace lifts the staging mask, and no field of the
+        # launcher's data names the staging tree any more.
+        assert (
+            sandbox_plan.Cancellation(path=str(staging), by=(str(workspace),), read_only=False)
+            in auth_plan.cancellations
+        )
+        assert str(staging) not in repr(sandbox_plan.namespace_payload(auth_plan))
         assert str(staging) not in auth_profile
-        assert str(data_home) in auth_script
+        assert str(data_home) in auth_plan.sensitive_dirs
         assert str(data_home) in auth_profile
 
     @_POSIX_ONLY
     def test_a_file_valued_hidden_path_reaches_the_file_loop(self, tmp_path):
-        """A hidden path that is a FILE must reach ``SENSITIVE_FILES``.
+        """A hidden path that is a FILE must reach the launcher's file-masking stage.
 
-        The two launcher loops hide each kind differently — a directory gets an empty
-        dir bind-mounted over it, a file gets an empty temp file — and the dir loop is
-        guarded by ``if os.path.isdir(target)``. So a file entry matched neither it nor
-        the file loop and was SILENTLY SKIPPED: the caller asked for it to be hidden,
-        got no error, and the file stayed readable.
+        The launcher's two stages hide each kind differently — a directory gets an
+        empty dir bind-mounted over it, a file gets an empty temp file — and each
+        takes only the entries of its own kind. So a file entry offered to the
+        directory stage alone would be SILENTLY SKIPPED: the caller asked for it to be
+        hidden, got no error, and the file stayed readable.
 
         Not hypothetical: ``security.sensitive_home_dirs()`` is not all directories
         (``sel_hmac.key``, ``token_signing.key``, ``.kiro/crew/.env`` are files), and
@@ -1506,74 +1557,93 @@ class TestBuildLauncherScript:
         secret.write_text("s3cret", encoding="utf-8")
         real_dir = tmp_path / "creds"
         real_dir.mkdir()
+        (real_dir / "id").write_text("key", encoding="utf-8")
 
-        script = _build_launcher_script("strict", extra_hidden_dirs=(str(secret), str(real_dir)))
-        dirs = json.loads(re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S).group(1))
-        files = json.loads(re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1))
+        plan = sandbox_mod._spawn_plan(
+            "namespace", "strict", extra_hidden_dirs=(str(secret), str(real_dir))
+        )
 
-        # The file reaches the loop that can actually hide it.
-        assert str(secret) in files, "a file-valued hidden path cannot be hidden"
-        # And the directory still reaches its own loop.
-        assert str(real_dir) in dirs
+        # The file reaches the stage that can actually hide it.
+        assert str(secret) in plan.sensitive_files, "a file-valued hidden path cannot be hidden"
+        # And the directory still reaches its own stage.
+        assert str(real_dir) in plan.sensitive_dirs
 
-    def test_the_builder_does_not_stat_the_hidden_paths(self):
-        """No filesystem probe in ``_build_launcher_script`` — it runs ON THE LOOP.
+    def test_the_builder_does_not_stat_the_hidden_paths(self, monkeypatch, tmp_path):
+        """No filesystem probe of a hidden path while the launcher is built.
 
-        An earlier version of this fix classified each path here with
-        ``os.path.isfile()``. That is 52 stats per async spawn on the gateway's single
-        loop, and on a stalled NFS home each one blocks — freezing every session, cron
-        and the liveness heartbeat. The child already re-checks with its own
-        ``isdir``/``isfile`` per loop, so whichever branch matches does the work and the
-        other skips; letting it decide keeps the syscalls where they were already
+        Classifying each path here with ``os.path.isfile()`` would be 52 stats per
+        async spawn on the gateway's single loop, and on a stalled NFS home each one
+        blocks — freezing every session, cron and the liveness heartbeat. The child already re-checks with its own
+        ``isdir``/``isfile`` per stage, so whichever stage matches does the work and
+        the other skips; letting it decide keeps the syscalls where they were already
         happening and where blocking costs only that one spawn.
 
-        An AST check rather than a mock, because the point is that no such call exists
-        at all.
+        Every ``stat`` and ``lstat`` the build makes is recorded, and so is every
+        ``os.path`` predicate: on POSIX ``isfile``, ``isdir``, ``exists``, ``islink`` and
+        ``realpath`` reach ``stat``/``lstat``, but on Windows ``isdir`` and ``exists``
+        are ``nt._path_*`` builtins that never call ``os.stat``. None may name a hidden
+        path or anything under one.
         """
-        import ast
-        import inspect
+        hidden = []
+        for index in range(52):
+            path = tmp_path / f"hidden-{index}"
+            if index % 2:
+                path.mkdir()
+            else:
+                path.write_text("s", encoding="utf-8")
+            hidden.append(str(path))
+        probed: list[str] = []
 
-        from kiro_crew import sandbox
+        def _recording(real):
+            def _probe(path, *args, **kwargs):
+                if not isinstance(path, int):
+                    probed.append(os.fsdecode(os.fspath(path)))
+                return real(path, *args, **kwargs)
 
-        tree = ast.parse(inspect.getsource(sandbox._build_launcher_script))
-        probes = [
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"isfile", "isdir", "exists", "stat", "lstat"}
-        ]
-        assert (
-            probes == []
-        ), f"_build_launcher_script stats the filesystem on the event loop: {probes}"
+            return _probe
+
+        monkeypatch.setattr(os, "stat", _recording(os.stat))
+        monkeypatch.setattr(os, "lstat", _recording(os.lstat))
+        for predicate in ("isfile", "isdir", "exists", "lexists", "islink", "realpath"):
+            monkeypatch.setattr(os.path, predicate, _recording(getattr(os.path, predicate)))
+        # The namespace plan asks this process for its uid and gid, which Windows has
+        # no call for; a stand-in there keeps this check as platform-neutral as the
+        # property it states.
+        monkeypatch.setattr(os, "getuid", getattr(os, "getuid", lambda: 0), raising=False)
+        monkeypatch.setattr(os, "getgid", getattr(os, "getgid", lambda: 0), raising=False)
+
+        _build_launcher_script("strict", extra_hidden_dirs=tuple(hidden))
+
+        touched = sorted(
+            {p for p in probed if any(p == h or p.startswith(h + os.sep) for h in hidden)}
+        )
+        assert touched == [], f"the launcher build stats hidden paths: {touched}"
 
     @_POSIX_ONLY
     def test_every_sensitive_path_reaches_a_loop_that_can_hide_it(self):
         """Whole-list check against the real sensitive-path list.
 
-        Both loops self-guard, so a path present in both is hidden by whichever branch
+        Both stages self-guard, so a path present in both is hidden by whichever stage
         matches its actual type — and a future entry that happens to be a file cannot
         silently stop being hidden.
         """
-        import os
-
         from kiro_crew import security
 
         home = os.path.expanduser("~")
         extra = tuple(os.path.join(home, rel) for rel in security.sensitive_home_dirs())
-        script = _build_launcher_script("strict", extra_hidden_dirs=extra)
-        dirs = json.loads(re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S).group(1))
-        files = json.loads(re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1))
+        plan = sandbox_mod._spawn_plan("namespace", "strict", extra_hidden_dirs=extra)
 
         for path in extra:
-            assert path in dirs, f"{path} never reaches the directory loop"
-            assert path in files, f"{path} never reaches the file loop"
+            assert path in plan.sensitive_dirs, f"{path} never reaches the directory loop"
+            assert path in plan.sensitive_files, f"{path} never reaches the file loop"
 
     @_POSIX_ONLY
     def test_cc_script_exposes_aws_config(self):
-        script = _build_launcher_script("cc")
-        assert ".aws/config" in script
-        assert "EXPOSE_FILES" in script
+        plan = sandbox_mod._spawn_plan("namespace", "cc")
+        aws = os.path.join(str(Path.home()), ".aws")
+        # The tree is masked and its config is restored read-only into the mask.
+        assert aws in plan.sensitive_dirs
+        assert (os.path.join(aws, "config"), "config") in plan.expose
 
     @_POSIX_ONLY
     def test_script_scrubs_env_vars(self):
@@ -1630,6 +1700,37 @@ class TestBuildLauncherScript:
             ), f"{level}: launcher references un-importable module(s) {forbidden}"
 
 
+class TestAgentEnvPassthroughContract:
+    """Pin the claude-code-provider env-passthrough contract.
+
+    Inherited ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` variables must keep flowing
+    to claude-harness children (docs/system-specs/modules/claude-code-provider.md,
+    env-passthrough section); the custom-endpoint guide
+    (docs/guides/custom-llm-backend.md) depends on them reaching the child. If
+    either scrub list grows to cover these namespaces, this fails red — the
+    failure a green-CI hardening pass would otherwise ship silently.
+    """
+
+    _PASSTHROUGH_KEYS = [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    ]
+
+    def test_anthropic_and_claude_code_env_survive_agent_subprocess_scrub(self):
+        # Both lists are prefix-matched (``startswith`` in ``scrub_env`` and
+        # ``scrub_agent_denied_env``), so assert prefix semantics, not bare
+        # membership — a prefix entry like "ANTHROPIC_" would never equal a key.
+        for key in self._PASSTHROUGH_KEYS:
+            assert not any(key.startswith(p) for p in _SENSITIVE_ENV_PREFIXES), key
+            assert not any(key.startswith(p) for p in sandbox_mod._AGENT_DENIED_ENV_KEYS), key
+        # And the ACP spawn path's own parent-side scrub passes them through.
+        env = {key: "x" for key in self._PASSTHROUGH_KEYS}
+        assert sandbox_mod.scrub_agent_subprocess_env(env) == env
+
+
 @_POSIX_ONLY
 class TestHardlinkScanBudget:
     """Step-7 pre-exec hardlink scan: per-root budgets + loud truncation.
@@ -1653,14 +1754,18 @@ class TestHardlinkScanBudget:
         # filesystem, so it must not enter the match set: when every
         # credential has nlink == 1 the CWD + /tmp walk is skipped and the
         # common healthy-host spawn pays nothing (and emits no truncation
-        # warning). Both collection loops (SENSITIVE_DIRS and
-        # SENSITIVE_FILES) carry the gate.
+        # warning). BOTH collection loops carry the gate: SENSITIVE_DIRS
+        # (depth 1) and SENSITIVE_FILES. The per-app credentials one level below
+        # a mask root reach the child as inodes the PARENT read -- it cannot stat
+        # them itself, because it masks that tree in this same process -- and the
+        # parent applies the same gate before sending one. The count is how this
+        # notices a third loop added without the gate.
         #
         # REGULAR FILES only, and that half is not cosmetic: every directory has
         # nlink >= 2, and SENSITIVE_FILES carries directories on purpose, so a bare
         # nlink test armed the walk on every spawn. Behaviour is covered in
-        # test_sandbox_hardlink_scan.py; this is the source-level pin that both
-        # collection loops still carry the gate.
+        # test_sandbox_hardlink_scan.py; this is the source-level pin that every
+        # collection loop still carries the gate.
         script = _build_launcher_script("strict")
         assert script.count("if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:") == 2
 
@@ -1723,8 +1828,8 @@ class TestHardlinkScanBudget:
         assert "_SKIP_TMP_DIR_PREFIXES" not in script
 
     def test_generated_script_compiles_at_every_level(self):
-        # Proves the f-string brace escaping in the template produced
-        # syntactically valid Python for every sandbox level.
+        # Proves the rendered launcher is syntactically valid Python for every
+        # sandbox level.
         for level in ("strict", "standard", "cc"):
             compile(_build_launcher_script(level), "<launcher>", "exec")
 
@@ -2013,6 +2118,39 @@ class TestNamespaceArgv:
         assert result[5] == "acp"
         # Cleanup temp file
         os.unlink(result[3])
+
+    @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
+    def test_established_target_that_cannot_be_restatted_refuses(self, mock_resolve, tmp_path):
+        """A ``_required_targets`` entry whose ``lstat`` now fails must FAIL CLOSED.
+
+        A pre-spawn materialiser reports a target as established (present). If an
+        ``lstat`` of that name then fails while the launcher builds -- renamed aside
+        or its permission revoked, the ordinary racing data-home write this module
+        already assumes -- carrying NO identity would leave ``_carried_occupant``
+        returning ``None`` in the child, the substitution refusal never fires, and a
+        decoy left at the name is sealed while the original stays writable elsewhere.
+        ``namespace_argv`` must raise :class:`SandboxCeilingUnsealable` instead of
+        masking whatever took the name's place.
+        """
+        established_name = str(tmp_path / "phantom-ceiling")
+        real_lstat = os.lstat
+
+        def _lstat_fails_for_target(path, *a, **k):  # noqa: ANN001, ANN202
+            if os.fspath(path) == established_name:
+                raise OSError(2, "vanished")
+            return real_lstat(path, *a, **k)
+
+        def _establish(established=None):  # noqa: ANN001, ANN202
+            if established is not None:
+                established.append(established_name)
+            return []
+
+        with (
+            patch("kiro_crew.sandbox._materialize_sealable_ceilings", side_effect=_establish),
+            patch("kiro_crew.sandbox.os.lstat", side_effect=_lstat_fails_for_target),
+        ):
+            with pytest.raises(sandbox_mod.SandboxCeilingUnsealable):
+                namespace_argv(["kiro-cli"], "strict")
 
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_launcher_script_is_executable(self, mock_resolve):

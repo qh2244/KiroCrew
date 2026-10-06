@@ -9,7 +9,7 @@ successful swap is observable before it is recorded.
 ## Configuration
 
 `AgentConfig.fallback_model` is normalized by
-`config/loader.py:coerce_fallback_model`. `llm_helpers.configured_fallback_chain`
+`config/sections.py:coerce_fallback_model`. `llm_helpers.configured_fallback_chain`
 is the shared derivation used by the fallback callers:
 
 - The automatic-routing sentinel is the field default; its configured value
@@ -33,7 +33,7 @@ The fallback path is eligible only after the normal transient retry budget is
 spent on a transient error with no qualifying prior activity. Each surface
 tracks that condition in its own stream loop: `llm_helpers.stream_and_collect`
 requires no result text or tool activity, `dashboard/chat_runner.py` requires
-no emitted or thought activity, and `subagent._stream_with_transient_retry`
+no emitted or thought activity, and `subagent_manager/run.py::RunEventCoordinator._run_impl`'s nested `_stream_with_transient_retry`
 requires no activity. Post-activity recovery does not enter the model-fallback
 walk.
 
@@ -85,7 +85,7 @@ and each error surface must receive the same safe text.
   pre-activity transient branch, persists a notice, and requeues the same
   message as a synthetic recovery item. Its fallback condition excludes nested
   prompts. On exhaustion it renders the slot-local walk in the terminal error.
-- `subagent._stream_with_transient_retry` follows the zero-activity branch,
+- `subagent_manager/run.py::RunEventCoordinator._run_impl`'s nested `_stream_with_transient_retry` follows the zero-activity branch,
   uses the shared candidate helper, and applies `annotate_model_fallback` to
   the completed result.
 
@@ -195,7 +195,45 @@ families — a different model routinely accepts what another's filter declined
   correction, or rebind can land in that window; a tripped check aborts
   the replay with the same cancellation notice the drain purge uses, the
   allowance stays spent, and the model swap is unwound by the next genuine
-  turn's restore probe. A genuine new message drops a stale record (a Stop
+  turn's restore probe. The abort returns before the turn's `try`, so
+  `_run_chat`'s exit guard runs the turn's tail (learn-cron-dashboard.md,
+  "Every turn exit runs the turn's tail"): the superseding message
+  dispatches unless the sub-agent hold or the admission sweep keeps it, and
+  otherwise `_finish_queue_cycle` starts an armed synthesis or sends the
+  terminal `chat_done`. The later pre-stream supersession abort sits inside
+  the `try` and leaves the tail to the turn's `finally`. The model-access
+  and image-history replays carry the same consume-seam check and the same
+  exit, and all three families revoke by one rule
+  (`RecoveryReplays.revalidate` in `dashboard/recovery_replays.py`: a
+  rebind away from the recorded
+  session, a Stop past the enqueue snapshots or in flight, or user input
+  queued behind the replay), at the drain and again at the consume seam,
+  each posting its family's cancellation notice. The model-access replay is
+  identified only by the queue id its swap recorded: the drain matches the
+  drained entry against it and claims it for the turn (`_run_chat`'s
+  `_replay`), which keeps
+  the spent one-shot for that replay alone, so a record whose entry left the
+  queue another way (a hard kill's clear, the admission sweep) can never
+  make a later turn read as the replay. A sub-agent completion the model
+  never consumed is classified once, at the requeue
+  (`_replay_owes_delivery`), and only when the turn's message IS the
+  completion: dispatched as one, or a recovery entry `_queue_recovery`
+  marked as its verbatim requeue (`_replays_completion`). It is a result the
+  parent is still owed, so a
+  model-access or image-history requeue queues it as the completion it is
+  (`SUBAGENT_COMPLETION_KIND`, as the sign-in retry does), with no family
+  record, and a soft Stop in flight does not skip the model-access swap
+  for it; a hard kill (`_stop_state == "killing"`) discards it like the rest
+  of the queue. Nothing else revokes it, the admission sweep exempts it like any queued
+  completion, and a newer user message runs after it. Without a family
+  record its turn refreshes the model-access one-shot like any completion
+  turn; the bound on a second swap is then the candidate selector itself,
+  because a swap fires only for a model absent from the advertised list and
+  its candidate is always taken from that list. The synthesis turn (actor
+  `subagent`, runner-authored), a runner-written continuation or retry
+  prompt queued for the completion, and a turn after the completion was
+  consumed owe nothing and stay ordinary, cancellable recoveries. A
+  genuine new message drops a stale record (a Stop
   can purge the queued replay) and re-arms the one-retry allowance —
   GENUINE meaning user-origin: a kind-tagged recovery requeue of the
   user's own words (a pre-output process failure re-queueing the turn)

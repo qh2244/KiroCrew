@@ -27,18 +27,24 @@ from kiro_crew.config.loader import (
     CRED_SLACK_APP_TOKEN,
     CRED_SLACK_BOT_TOKEN,
     ConfigReadError,
+    EnvFileWideEncodingError,
     _default_workspace_base,
     _workspace_dir_file,
     config_path,
+    env_bom_prefix,
     env_path,
+    normalize_workspace_path,
+    read_config_text,
+    read_env_text,
     unsandboxed_exec_declared,
     unsandboxed_exec_platform_default,
     update_config_locked,
 )
-from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
+from kiro_crew.constants import MIN_NODE_VERSION, format_node_version
 from kiro_crew.dashboard.urls import _resolve_hostname_bounded
 from kiro_crew.sandbox import unavailable_kind
 from kiro_crew.secrets.migrate import _env_lock_path
+from kiro_crew.security import redact
 from kiro_crew.sel import sel
 from kiro_crew.skills import remove_retired_conductor_skill
 from kiro_crew.validation import USER_ID_RE
@@ -148,7 +154,7 @@ def _ensure_prerequisites() -> bool:
     if not shutil.which("node"):
         _header()
         print(
-            f"  ⚠️  node not found on PATH — install Node.js >= {MIN_NODE_MAJOR} from https://nodejs.org\n"
+            f"  ⚠️  node not found on PATH — install Node.js >= v{format_node_version(MIN_NODE_VERSION)} from https://nodejs.org\n"
         )
 
     # kiro-cli is the agent backend. Note its absence so the user can install it.
@@ -216,7 +222,9 @@ def _setup_electron() -> None:
         timeout=120,
     )
     if npm_install.returncode != 0:
-        print(f"  ❌ npm install failed: {npm_install.stderr.strip()[:200]}")
+        # npm / electron-builder print the failing error LAST: redact the whole
+        # stream (it can echo registry URLs with tokens), then keep the tail.
+        print(f"  ❌ npm install failed: {redact(npm_install.stderr.strip())[-200:]}")
         return
 
     build = subprocess.run(
@@ -227,7 +235,7 @@ def _setup_electron() -> None:
         timeout=300,
     )
     if build.returncode != 0:
-        print(f"  ❌ Electron build failed: {build.stderr.strip()[:200]}")
+        print(f"  ❌ Electron build failed: {redact(build.stderr.strip())[-200:]}")
         return
 
     arch = "mac-arm64" if platform.machine() == "arm64" else "mac"
@@ -291,7 +299,6 @@ def _setup_impl(
         return
 
     print("Kiro Crew Setup 👻\n")
-    print(f"  {DATA_WARNING.replace(chr(10), chr(10) + '  ')}\n")
 
     # Report on optional prerequisites.
     _ensure_prerequisites()
@@ -375,7 +382,7 @@ def _setup_impl(
         print("  The dashboard works without any messaging credentials.")
         print("  Connect Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat,")
         print("  WhatsApp, or iMessage (macOS only)")
-        print("  later from the dashboard (Settings → Channels) or run")
+        print("  later from the dashboard (Settings → Messaging Channels) or run")
         print("  'kirocrew setup --slack' or 'kirocrew setup --whatsapp' for a")
         print("  guided setup.\n")
 
@@ -460,7 +467,7 @@ def _setup_workspace_dir() -> None:
     if _workspace_dir_file().is_file():
         configured = _workspace_dir_file().read_text(encoding="utf-8").strip()
         if configured:
-            default = Path(configured)
+            default = normalize_workspace_path(configured)
             label = "Configured"
     print("── Workspace Directory ──\n")
     print("  LLM sessions and task output are stored in a workspace directory.")
@@ -469,8 +476,10 @@ def _setup_workspace_dir() -> None:
     # traceback out of the wizard — this step runs FIRST, so a bare input() here
     # made `kirocrew setup < /dev/null` fail before any later guard could help.
     answer = _input_or_skip(f"  Workspace path [{default}]: ") or ""
-    chosen = default if answer.lower() in ("", "y", "yes") else Path(answer).expanduser()
+    chosen = default if answer.lower() in ("", "y", "yes") else normalize_workspace_path(answer)
     try:
+        if not chosen.is_absolute():
+            raise OSError("not an absolute path")
         chosen.mkdir(parents=True, exist_ok=True)
         _workspace_dir_file().parent.mkdir(parents=True, exist_ok=True)
         _workspace_dir_file().write_text(str(chosen) + "\n", encoding="utf-8")
@@ -630,15 +639,38 @@ def _prompt_verified_slack_value(
     return None, ""
 
 
+def _read_env_pairs(cred_path: Path) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` lines of *cred_path*; ``{}`` when it does not exist.
+
+    Raises :class:`EnvFileWideEncodingError` for a UTF-16 or UTF-32 file,
+    which the caller reports instead of rewriting.
+    """
+    pairs: dict[str, str] = {}
+    if cred_path.exists():
+        for line in read_env_text(cred_path, encoding="utf-8").splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                pairs[k.strip()] = v.strip()
+    return pairs
+
+
+def _print_wide_env_remedy(cred_path: Path, exc: EnvFileWideEncodingError) -> None:
+    print(
+        f"  ❌ {cred_path} is saved as {exc.wide_encoding}, which Kiro Crew cannot read. "
+        "Re-save it as UTF-8 and run 'kirocrew setup --slack' again. "
+        "Nothing was changed.\n",
+        file=sys.stderr,
+    )
+
+
 def _setup_slack_tokens() -> None:
     """Prompt for Slack tokens and owner ID, write to config_dir/.env."""
     cred_path = env_path()
-    existing: dict[str, str] = {}
-    if cred_path.exists():
-        for line in cred_path.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                existing[k.strip()] = v.strip()
+    try:
+        existing = _read_env_pairs(cred_path)
+    except EnvFileWideEncodingError as exc:
+        _print_wide_env_remedy(cred_path, exc)
+        return
 
     print("── Slack Credentials ──\n")
     print("  See docs/guides/slack-setup.md for how to create a Slack app.\n")
@@ -746,12 +778,13 @@ def _setup_slack_tokens() -> None:
     try:
         # Re-read fresh under the lock, then merge the just-collected tokens on
         # top so a concurrent write that landed during the prompts is preserved.
-        merged: dict[str, str] = {}
-        if cred_path.exists():
-            for line in cred_path.read_text(encoding="utf-8").splitlines():
-                if "=" in line and not line.startswith("#"):
-                    k, _, v = line.partition("=")
-                    merged[k.strip()] = v.strip()
+        try:
+            merged = _read_env_pairs(cred_path)
+        except EnvFileWideEncodingError as exc:
+            # Re-saved as UTF-16 or UTF-32 while the prompts ran: never
+            # overwrite it.
+            _print_wide_env_remedy(cred_path, exc)
+            return
         merged[CRED_SLACK_APP_TOKEN] = app_token
         merged[CRED_SLACK_BOT_TOKEN] = bot_token
         if owner_id:
@@ -793,7 +826,7 @@ def _setup_slack_tokens() -> None:
         # wizard instead of aborting after the user typed their tokens.
         atomic_write(
             cred_path,
-            "\n".join(lines) + "\n",
+            env_bom_prefix(cred_path) + "\n".join(lines) + "\n",
             restrict_to_owner=True,
             restrict_on_error="warn",
         )
@@ -849,19 +882,19 @@ def _setup_whatsapp() -> None:
         print(f"  ✅ A paired session store already exists: {store}")
     else:
         print("  ℹ️  Not paired yet. Pairing is a QR scan from the dashboard:")
-        print("     Settings → Channels → WhatsApp, with the gateway running.")
+        print("     Settings → Messaging Channels → WhatsApp, with the gateway running.")
     print()
 
     answer = _input_or_skip("  Enable the WhatsApp channel? [y/N]: ")
     if not answer or answer.lower() not in ("y", "yes"):
-        print("  ⏭  Left disabled. Enable it later from Settings → Channels.\n")
+        print("  ⏭  Left disabled. Enable it later from Settings → Messaging Channels.\n")
         return
 
     cfg_file = config_path()
     cfg: dict = {}
     if cfg_file.exists():
         try:
-            loaded = json.loads(cfg_file.read_text(encoding="utf-8"))
+            loaded = json.loads(read_config_text(cfg_file))
         except Exception as exc:
             print(f"  ⚠️  Could not read {cfg_file}: {exc}\n")
             return
@@ -904,14 +937,14 @@ def _setup_whatsapp() -> None:
         return
     except OSError as exc:
         print(f"  ⚠️  Could not write {cfg_file}: {exc}")
-        print("     Nothing was enabled. Enable it from Settings → Channels instead.\n")
+        print("     Nothing was enabled. Enable it from Settings → Messaging Channels instead.\n")
         return
     if section_clash:
         print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
         return
     print("  ✅ Recorded: whatsapp.enabled = true")
     print("     Next: start the gateway, then scan the QR from")
-    print("     Settings → Channels → WhatsApp.\n")
+    print("     Settings → Messaging Channels → WhatsApp.\n")
 
 
 _CUSTOM_DOMAIN = "kirocrew.localhost"
@@ -1002,9 +1035,12 @@ def _setup_slash_command() -> None:
     cfg: dict = {}
     if cfg_file.exists():
         try:
-            cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+            cfg = json.loads(read_config_text(cfg_file))
         except Exception as exc:
             print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+            return
+        if not isinstance(cfg, dict):
+            print(f"  ⚠️  {cfg_file} is not a JSON object; leaving config untouched.")
             return
 
     print("── Slash Command ──\n")
@@ -1185,7 +1221,7 @@ def _setup_sandbox_consent() -> None:
     cfg: dict = {}
     if cfg_file.exists():
         try:
-            loaded = json.loads(cfg_file.read_text(encoding="utf-8"))
+            loaded = json.loads(read_config_text(cfg_file))
         except Exception as exc:
             print(f"  ⚠️  Could not read {cfg_file}: {exc}")
             return
@@ -1352,9 +1388,12 @@ def _setup_timezone() -> None:
     data: dict = {}
     if cfg_file.exists():
         try:
-            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            data = json.loads(read_config_text(cfg_file))
         except Exception as exc:
             print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+            return
+        if not isinstance(data, dict):
+            print(f"  ⚠️  {cfg_file} is not a JSON object; leaving config untouched.")
             return
     current = data.get("timezone", "")
 

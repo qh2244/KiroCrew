@@ -340,9 +340,9 @@ class TestFollowUpDelivery:
         assert ok
         info.done = True  # run completes; watcher proceeds to the busy dispatch
         await asyncio.sleep(0.1)  # watcher enters the busy-retry sleep
-        assert info.pending_followups == ["important correction"], (
-            "the queue must not be drained before the outcome settles"
-        )
+        assert info.pending_followups == [
+            "important correction"
+        ], "the queue must not be drained before the outcome settles"
         await mgr.cancel_all()
         # The shutdown sweep announced the still-queued message.
         assert len(announced) == 1

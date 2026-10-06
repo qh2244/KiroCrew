@@ -181,6 +181,7 @@ def test_the_contract_declares_every_seam_this_suite_covers():
         "pod_home_remap",
         "reads_markdown_agent_specs",
         "client_meta_settings",
+        "opens_external_urls",
         "verifies_agent_activation",
         "protocol_version",
         "client_capabilities",
@@ -326,7 +327,9 @@ def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
     """Opposite actions on the same variable, which is why this is a seam.
 
     A harness that inherited the other's answer would either withhold the key
-    kiro-cli needs or hand KAS a credential of the wrong token type.
+    kiro-cli needs or let an ambient key override a Crew-owned KAS relay's
+    vault credential. A caller that does not name the auth owner gets the
+    Crew-owned strip.
     """
     from kiro_crew.config import loader as loader_mod
 
@@ -340,7 +343,37 @@ def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
 
     harness_for(ACP_BACKEND_KIRO).apply_spawn_env({})
     harness_for(ACP_BACKEND_KAS).apply_spawn_env({})
-    assert calls == ["inject", "strip"]
+    harness_for(ACP_BACKEND_KAS).apply_spawn_env({}, cli_owned_auth=False)
+    assert calls == ["inject", "strip", "strip"]
+
+
+def test_cli_owned_kas_relay_is_handed_the_api_key(monkeypatch, tmp_path):
+    """A cli-owned relay authenticates itself, and the key IS a kiro-cli sign-in.
+
+    kiro-cli keeps no stored record of an API-key login -- the variable is the
+    whole login -- so stripping it leaves an API-key-only host's relay dying at
+    the launcher's "You are not logged in". Driven through the real loader, so
+    the inherited value and the data home's ``.env`` fallback are both covered.
+    """
+    from kiro_crew.config import loader as loader_mod
+
+    harness = harness_for(ACP_BACKEND_KAS)
+
+    inherited = {"KIRO_API_KEY": "inherited-key"}
+    harness.apply_spawn_env(inherited, cli_owned_auth=True)
+    assert inherited["KIRO_API_KEY"] == "inherited-key"
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("KIRO_API_KEY=file-key\n", encoding="utf-8")
+    monkeypatch.setattr(loader_mod, "env_path", lambda: env_file)
+    from_file: dict[str, str] = {}
+    harness.apply_spawn_env(from_file, cli_owned_auth=True)
+    assert from_file["KIRO_API_KEY"] == "file-key"
+
+    # The Crew-owned relay still loses it, inherited or not.
+    crew_owned = {"KIRO_API_KEY": "inherited-key"}
+    harness.apply_spawn_env(crew_owned, cli_owned_auth=False)
+    assert "KIRO_API_KEY" not in crew_owned
 
 
 # ── Seam 2: initialize ──
@@ -366,17 +399,21 @@ def test_client_capabilities_are_the_shared_constants():
     assert harness_for(ACP_BACKEND_KAS).client_capabilities == KAS_CLIENT_CAPABILITIES
 
 
-def test_kas_capabilities_open_only_the_settings_channel():
-    """KAS's extra capability is the settings channel and nothing else.
+def test_kas_capabilities_open_only_settings_and_external_urls():
+    """KAS's extra capabilities are the settings channel and ``openExternalUrl``.
 
+    ``openExternalUrl`` is answered by the runtime for an MCP sign-in it started.
     Every other ``_meta.kiro`` capability is a callback Crew does not implement,
-    so declaring one would invite a request with no handler. The channel is
+    so declaring one would invite a request with no handler; ``secretStorage`` in
+    particular would make Crew the store of MCP tokens. The settings channel is
     declared EMPTY here: the runtime fills it at spawn from the operator's
     settings (``client_meta_settings``), so the constant stays the pristine shape
     every host's handshake is compared against.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
-    assert kas["_meta"] == {"kiro": {"settings": {}}}
+    assert kas["_meta"] == {"kiro": {"settings": {}, "openExternalUrl": True}}
+    assert harness_for(ACP_BACKEND_KAS).opens_external_urls is True
+    assert harness_for(ACP_BACKEND_KIRO).opens_external_urls is False
     assert {k: v for k, v in kas.items() if k != "_meta"} == ACP_CLIENT_CAPABILITIES
 
 
@@ -409,7 +446,7 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
     monkeypatch.setattr(
         kas_agents_mod,
         "build_kas_custom_agents",
-        lambda d, a, spec, *, stub_server_names, member_dispatch, session_key="": projected,
+        lambda d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="": projected,
     )
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
     assert extras.custom_agents == projected
@@ -448,7 +485,7 @@ async def test_kas_projection_refuses_an_untranslatable_spec(
     from kiro_crew.acp.kas_agents import KasAgentTranslationError
     from kiro_crew.acp.session_handle import AcpRuntimeError
 
-    def _boom(d, a, spec, *, stub_server_names, member_dispatch, session_key=""):
+    def _boom(d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key=""):
         raise KasAgentTranslationError("unreadable spec")
 
     monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _boom)
@@ -470,7 +507,7 @@ async def test_kas_projection_survives_an_unreadable_overlay(
     def _boom(overlay, agent):
         raise OSError("overlay unreadable")
 
-    def _build(d, a, spec, *, stub_server_names, member_dispatch, session_key=""):
+    def _build(d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key=""):
         seen.append(frozenset(stub_server_names))
         return [{"name": a}]
 
@@ -494,7 +531,7 @@ async def test_kas_member_dispatch_subtracts_the_dashboard_server(
 
     seen: list[frozenset] = []
 
-    def _build(d, a, spec, *, stub_server_names, member_dispatch, session_key=""):
+    def _build(d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key=""):
         seen.append(frozenset(stub_server_names))
         return []
 
